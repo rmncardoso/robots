@@ -37,9 +37,10 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy as np
 
-from strands_robots.simulation.base import SimEngine, unknown_kwargs_error
+from strands_robots.simulation.base import SimEngine, unknown_kwargs_error, unknown_model_msg
 from strands_robots.simulation.isaac.config import IsaacConfig
 from strands_robots.simulation.isaac.joint_names import demangle_usd_joint_names, urdf_joint_names
+from strands_robots.simulation.isaac.mjcf_assets import MJCF_EXTENSIONS, convert_mjcf_to_usd
 from strands_robots.simulation.isaac.motion_primitives import IsaacMotionPrimitivesMixin
 from strands_robots.simulation.isaac.recording import IsaacRecordingMixin
 from strands_robots.simulation.models import registered, registry_entry
@@ -284,6 +285,55 @@ class SimulationAppLaunchConfig(TypedDict, total=False):
 # throughout the docs; it normalizes to the canonical ``"box"`` (see #88).
 # A unit test pins this mapping so docs and code can't drift apart again.
 _SHAPE_ALIASES: dict[str, str] = {"cuboid": "box"}
+
+
+def _resolve_registry_description(data_config: str | None, lookup_name: str) -> tuple[str | None, str | None]:
+    """Resolve a robot name to a description on disk. Returns ``(path, error)``.
+
+    Exactly one of the two is ever set. The resolver is
+    :func:`~strands_robots.simulation.model_registry.resolve_model` - the same one
+    the MuJoCo backend's ``add_robot`` uses - so both backends read one file for
+    one name and their joint vocabularies cannot drift apart. That is the whole
+    point: what this replaced was a hardcoded dataclass whose joint names
+    disagreed with MuJoCo's for every robot it claimed to know.
+
+    The returned path may be an MJCF *or* a URDF, because that resolver consults
+    user-registered URDFs before the Menagerie assets. The caller dispatches on
+    the extension rather than assuming, since routing a URDF through the MJCF
+    importer would fail on a file the URDF branch beside it loads correctly.
+
+    A miss is reported with the shared
+    :func:`~strands_robots.simulation.base.unknown_model_msg`, which distinguishes
+    a typo from a hardware-only entry from an asset that is simply not downloaded
+    - three conditions with three different remedies. ``lookup_name`` is what was
+    resolved (``data_config`` when given, else the robot's ``name``), and it is
+    what the message names, so a caller is told the key that actually failed
+    rather than the label they happened to pick.
+
+    Module-level rather than a method because it reads no instance state, and
+    because the cross-backend parity suites drive ``add_robot`` with a
+    ``types.SimpleNamespace`` as ``self`` - an attribute of ``IsaacSimulation``
+    is not in scope for those, so reaching this through ``self`` would make every
+    one of them raise ``AttributeError`` out of the structured envelope
+    ``add_robot`` documents as its only failure channel.
+    """
+    try:
+        from strands_robots.simulation.model_registry import resolve_model
+    except ImportError as exc:  # pragma: no cover - the registry ships with the package
+        return None, (
+            f"add_robot: cannot resolve robot '{lookup_name}' because the model registry is "
+            f"unavailable ({exc}). Pass usd_path= or urdf_path= with an explicit asset."
+        )
+
+    resolved = resolve_model(lookup_name)
+    if resolved:
+        return resolved, None
+
+    # The name resolved to nothing. Lead with the shared diagnosis, then name the
+    # escapes this signature has, because that message's own advice is written
+    # for a tool surface rather than for these parameters.
+    hint = "" if data_config else " Or pass data_config=<registered model>, usd_path= or urdf_path=."
+    return None, f"add_robot: {unknown_model_msg(lookup_name)}{hint}"
 
 
 def _mesh_path_error(method: str, mesh_path: Any) -> str | None:
@@ -1693,8 +1743,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         Parameters
         ----------
         name : str
-            Robot identifier (also used for procedural lookup). Must be a
-            non-empty string with no NUL, on the shared
+            Robot identifier, and the registry key resolved when no asset path
+            and no ``data_config`` is given. Must be a non-empty string with no
+            NUL, on the shared
             :func:`~strands_robots.utils.entity_name_error` domain the MuJoCo
             and Newton backends' ``add_robot`` enforces, so a robot name one
             backend refuses is refused by all three. This backend has no
@@ -1703,17 +1754,21 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         urdf_path : str, optional
             Path to URDF file.
         mjcf_path : str, optional
-            Path to an MJCF file. The Isaac backend has no MJCF importer for
-            robots (it loads USD natively and converts URDF via the Omniverse
-            URDF importer), so a non-None value is rejected with an actionable
-            error rather than being silently ignored -- previously a name that
-            also matched the procedural registry would silently spawn the
-            procedural stub instead. Convert the MJCF to URDF/USD, or use
-            create_simulation(backend="mujoco") to load MJCF directly.
+            Path to an MJCF file, converted to USD once via Isaac Sim's own
+            ``isaacsim.asset.importer.mjcf`` extension and cached
+            content-addressed, then loaded by the native USD path. This was
+            refused outright until recently, on the stated grounds that the
+            backend "has no MJCF importer" - an assertion this package made in
+            three places and measured in none. See
+            :mod:`strands_robots.simulation.isaac.mjcf_assets`.
         usd_path : str, optional
             Path to USD file (native Isaac format).
         data_config : str, optional
-            Named data config for procedural lookup.
+            Registry key naming the *model* to load, where ``name`` is only the
+            instance label. Resolved through
+            :func:`~strands_robots.simulation.model_registry.resolve_model`, the
+            same resolver the MuJoCo backend uses, so one name means one
+            description file on both backends.
         position : list[float], optional
             Base position [x, y, z].
         orientation : list[float], optional
@@ -1804,20 +1859,45 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     }
                 ],
             }
-        if mjcf_path is not None:
+        # Refuse two asset paths rather than picking one. Each of the three is
+        # loaded by a different route, so a call naming two is a caller who
+        # believes something false about which asset will be on the stage - and
+        # the loser is dropped with nothing said. There was no such combination to
+        # refuse while ``mjcf_path`` was rejected outright and the other two were
+        # ordered by an ``elif``; now all three are live, so the ambiguity is
+        # reachable. AGENTS.md: a silently dropped argument is a bug masquerading
+        # as a feature.
+        _named_assets = {
+            "urdf_path": urdf_path,
+            "mjcf_path": mjcf_path,
+            "usd_path": usd_path,
+        }
+        _given = sorted(key for key, value in _named_assets.items() if value is not None)
+        if len(_given) > 1:
             return {
                 "status": "error",
                 "content": [
                     {
                         "text": (
-                            f"add_robot: mjcf_path={mjcf_path!r} is not supported on the Isaac "
-                            "backend (it has no MJCF robot importer; it loads USD natively and "
-                            "converts URDF). Convert the MJCF to URDF/USD and pass urdf_path/"
-                            "usd_path, or use create_simulation(backend='mujoco') to load MJCF."
+                            f"add_robot: pass at most one asset path, got {len(_given)} "
+                            f"({', '.join(f'{key}={_named_assets[key]!r}' for key in _given)}). "
+                            f"Each is loaded by a different route, so naming several would silently "
+                            f"drop all but one. Omit every asset path to resolve '{data_config or name}' "
+                            f"from the registry instead."
                         )
                     }
                 ],
             }
+
+        # ``mjcf_path`` used to be refused here, on the stated grounds that the
+        # Isaac backend "has no MJCF robot importer". That was an assertion this
+        # repository made in three places and measured in none: Isaac Sim 6.0.1
+        # registers ``isaacsim.asset.importer.mjcf`` (exposing ``MJCFImporter`` /
+        # ``MJCFImporterConfig``, plus the ``MJCFCreateAsset`` Kit command), and
+        # converting a Menagerie description through it and loading the result
+        # yields a live articulation whose joint names match MuJoCo's exactly.
+        # See :mod:`strands_robots.simulation.isaac.mjcf_assets`.
+        #
         # Validate the pose vectors on the shared ``coerce_pose_vector`` domain the
         # MuJoCo backend's ``add_robot`` and this backend's own ``add_camera`` already
         # use, so a pose one backend refuses is refused by all of them - the
@@ -1927,50 +2007,71 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             pos = [0.0, 0.0, 0.0] if position is None else position
             prim_path = f"{self._config.stage_path}/Robots/{name}"
 
-            # Procedural lookup is a *fallback*: an explicit usd_path /
-            # urdf_path always wins (parity with the MuJoCo backend and
-            # least-surprise for a caller passing a concrete asset). The
-            # lookup still runs unconditionally (a cheap dict read), but
-            # the procedural branch below is only taken when no explicit
-            # asset path was given (#152). Without the usd_path/urdf_path
-            # guard on that branch, any name colliding with the procedural
-            # registry (franka->panda, so100, g1, ...) would silently
-            # shadow an explicit usd_path/urdf_path.
+            # An explicit asset path always wins, and registry resolution is the
+            # fallback - the MuJoCo backend's precedence, and least-surprise for a
+            # caller who passed a concrete asset.
+            #
+            # What used to sit here was a "procedural" branch that built a robot
+            # from a hardcoded dataclass. Its comment read "Build procedurally via
+            # USD API" and it made no USD call at all: it reported success while
+            # creating zero prims, leaving ``_RobotState.articulation`` as ``None``
+            # and ``get_observation()`` empty for the whole lifecycle, reset or no
+            # reset. Its joint names also disagreed with the MuJoCo backend's for
+            # the same robot name - ``so100`` was reported as ``shoulder_pan``,
+            # ``shoulder_lift``, ... against MuJoCo's ``Rotation``, ``Pitch``, ...,
+            # and ``panda`` as 7 joints against MuJoCo's 9 - so the parity these
+            # docs promise was false as metadata as well as absent as physics.
+            #
+            # Both halves are answered by loading the description MuJoCo loads.
+            # ``resolve_model`` is the same resolver its ``add_robot`` uses, so the
+            # two backends read one file and the joint vocabulary cannot diverge:
+            # measured on Isaac Sim 6.0.1, this path reproduces MuJoCo's names
+            # exactly (9 of 9 for ``panda``, 6 of 6 for ``so100``).
             lookup_name = data_config or name
-            try:
-                from strands_robots.simulation.isaac.procedural import get_procedural_robot
+            if usd_path is None and urdf_path is None and mjcf_path is None:
+                resolved, resolve_error = _resolve_registry_description(data_config, lookup_name)
+                if resolve_error is not None:
+                    return {"status": "error", "content": [{"text": resolve_error}]}
+                # Dispatch on what was actually resolved. ``resolve_model``
+                # consults user-registered URDFs before the Menagerie MJCF
+                # assets, so the same call can hand back either format, and each
+                # has a loader of its own already. A ``.usd*`` file is possible
+                # too - a user may register one - and needs no conversion at all.
+                resolved_ext = os.path.splitext(resolved or "")[1].lower()
+                if resolved_ext in MJCF_EXTENSIONS:
+                    mjcf_path = resolved
+                elif resolved_ext == ".urdf":
+                    urdf_path = resolved
+                else:
+                    usd_path = resolved
 
-                procedural = get_procedural_robot(lookup_name)
-            except ImportError:
-                procedural = None
+            # An MJCF is converted to USD once, cached, and then loaded by the
+            # native USD branch below - so this backend gains MJCF support without
+            # a second copy of the reference/initialize/pose logic that path
+            # already owns. ``source_mjcf`` survives only to keep the report
+            # honest about where the USD came from.
+            source_mjcf: str | None = None
+            if mjcf_path is not None and usd_path is None and urdf_path is None:
+                source_mjcf = mjcf_path
+                try:
+                    usd_path = convert_mjcf_to_usd(mjcf_path)
+                except (RuntimeError, ValueError, OSError, ImportError) as e:
+                    logger.error("add_robot: converting MJCF %r for robot %r failed: %s", mjcf_path, name, e)
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"add_robot: converting the MJCF description {mjcf_path!r} to USD "
+                                    f"failed ({type(e).__name__}: {e}). Pass usd_path=/urdf_path= with an "
+                                    f"already-converted asset, or use create_simulation(backend='mujoco') "
+                                    f"to load the MJCF directly."
+                                )
+                            }
+                        ],
+                    }
 
-            if procedural is not None and usd_path is None and urdf_path is None:
-                # Build procedurally via USD API
-                joint_names = procedural.joint_names
-                self._prim_registry.append(prim_path)
-
-                robot_state = _RobotState(
-                    name=name,
-                    prim_path=prim_path,
-                    joint_names=joint_names,
-                    data_config=data_config,
-                )
-                self._robots[name] = robot_state
-
-                logger.info("Added robot '%s' (procedural, %d joints)", name, len(joint_names))
-                return {
-                    "status": "success",
-                    "content": [
-                        {
-                            "text": (
-                                f"Robot '{name}' added (procedural: {procedural.name}, "
-                                f"{len(joint_names)} joints: {joint_names})"
-                            )
-                        }
-                    ],
-                }
-
-            elif usd_path is not None:
+            if usd_path is not None:
                 # Load from USD (native Isaac format).
                 # Phase 2 wiring (#14): _load_usd_robot now actually
                 # references the USD into the stage, constructs an
@@ -2010,26 +2111,34 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 self._robots[name] = robot_state
 
                 logger.info(
-                    "Added robot '%s' (USD: %s, %d joints, articulation=%s)",
+                    "Added robot '%s' (USD: %s, %d joints, articulation=%s, mjcf=%s)",
                     name,
                     usd_path,
                     len(joint_names),
                     "wired" if articulation is not None else "phase1",
+                    source_mjcf or "-",
                 )
+                # Name the MJCF when the USD was derived from one: the cached USD
+                # path is a content digest, so on its own it tells a caller
+                # nothing about which description they actually loaded.
+                origin = f"MJCF: {source_mjcf} -> USD: {usd_path}" if source_mjcf else f"USD: {usd_path}"
+                payload: dict[str, Any] = {
+                    "name": name,
+                    "prim_path": prim_path,
+                    "usd_path": usd_path,
+                    "joint_names": joint_names,
+                    "joint_count": len(joint_names),
+                    "position": pos,
+                    "articulation_wired": articulation is not None,
+                }
+                if source_mjcf is not None:
+                    payload["mjcf_path"] = source_mjcf
                 return {
                     "status": "success",
                     "content": [
                         {
-                            "text": (f"Robot '{name}' added (USD: {usd_path}, {len(joint_names)} joints)"),
-                            "json": {
-                                "name": name,
-                                "prim_path": prim_path,
-                                "usd_path": usd_path,
-                                "joint_names": joint_names,
-                                "joint_count": len(joint_names),
-                                "position": pos,
-                                "articulation_wired": articulation is not None,
-                            },
+                            "text": (f"Robot '{name}' added ({origin}, {len(joint_names)} joints)"),
+                            "json": payload,
                         }
                     ],
                 }
@@ -2101,14 +2210,27 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 }
 
             else:
+                # Not reachable through any argument: the resolution above either
+                # sets one of the three paths or returns its own refusal, and two
+                # paths are refused before the lock. Kept rather than dropped
+                # because falling off the end of a method whose contract is a
+                # status dict would return ``None`` to a caller reading
+                # ``result["status"]``, and this says which invariant broke
+                # instead of raising ``TypeError`` one frame away.
+                logger.error(
+                    "add_robot: no asset path after resolution for robot %r (lookup %r) - "
+                    "resolution should have set one or refused",
+                    name,
+                    lookup_name,
+                )
                 return {
                     "status": "error",
                     "content": [
                         {
                             "text": (
-                                f"Robot '{lookup_name}' not found in procedural registry "
-                                "and no usd_path/urdf_path provided. "
-                                "Available procedural robots: so100, panda, unitree_g1"
+                                f"add_robot: internal error - no asset path resolved for "
+                                f"'{lookup_name}' and none was refused. Pass usd_path=, urdf_path= "
+                                f"or mjcf_path= explicitly."
                             )
                         }
                     ],

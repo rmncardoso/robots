@@ -1,11 +1,12 @@
 """Robot description file loaders -> :class:`ProceduralRobot`.
 
 Follow-up to the R7 Phase 1 procedural-builder slice (robots-sim#46): instead of
-hardcoding ``_build_so100`` / ``_build_panda`` / ``_build_unitree_g1`` in
+hardcoding one Python builder per robot in
 :mod:`strands_robots.simulation.isaac.procedural`, drive the same
-``ProceduralRobot`` dataclass from existing
-robot description files (URDF, MJCF, USD) so the code path becomes a generic
-loader rather than a per-robot Python builder.
+``ProceduralRobot`` dataclass from existing robot description files (URDF, MJCF,
+USD) so the code path is a generic loader. Those three builders have since been
+deleted outright - they described no real robot and nothing turned them into one
+- so this module is now the only producer of a ``ProceduralRobot``.
 
 Supported formats:
     * **URDF** - ``load_urdf(path)``. Parsed with stdlib
