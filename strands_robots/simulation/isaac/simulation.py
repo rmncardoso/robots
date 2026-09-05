@@ -945,14 +945,34 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
 
             return False, not_importable_reason()
 
-        # Isaac requires CUDA
+        # Isaac Sim's own runtime is PhysX + Warp and does NOT require torch, so
+        # an ABSENT torch is evidence of nothing and must not produce a verdict.
+        # Measured on ``nvcr.io/nvidia/isaac-sim:6.0.1`` -- the image
+        # ``_install.ISAAC_SIM_DOCKER_IMAGE`` names -- which ships no torch at
+        # all: ``import isaacsim`` and ``from isaacsim import SimulationApp``
+        # both succeed, ``create_world`` steps physics, ``send_action`` drives a
+        # joint to its target and ``render`` returns RTX pixels, while this
+        # method reported ``(False, "PyTorch not installed ...")``. ``[sim-isaac]``
+        # does not declare torch either, so the requirement was unsatisfiable by
+        # the extra that is supposed to enable this backend.
+        #
+        # Where torch IS importable it stays a useful signal: a torch that
+        # reports no CUDA device is real evidence there is no usable GPU. Only
+        # its absence is uninformative.
+        #
+        # The import sits alone in the ``try`` because this handler exists to
+        # classify one operation. With ``torch.cuda.is_available()`` inside it
+        # too, an ``ImportError`` from CUDA initialisation (a broken driver, a
+        # partially installed toolkit) was reported as "PyTorch not installed" -
+        # the wrong diagnosis for a torch that is installed and cannot reach the
+        # GPU.
         try:
             import torch
-
-            if not torch.cuda.is_available():
-                return False, ("CUDA device not detected. Isaac Sim requires an NVIDIA GPU with CUDA support.")
         except ImportError:
-            return False, ("PyTorch not installed. Isaac Sim requires torch with CUDA support.")
+            return True, None
+
+        if not torch.cuda.is_available():
+            return False, ("CUDA device not detected. Isaac Sim requires an NVIDIA GPU with CUDA support.")
 
         return True, None
 
