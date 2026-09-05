@@ -104,7 +104,7 @@ from strands_robots.simulation import create_simulation
 # Kwargs flow into IsaacConfig. "isaac" resolves as a built-in backend.
 sim = create_simulation("isaac", render_mode="rtx_realtime", headless=True)
 sim.create_world()
-sim.add_robot("so100")                          # procedural; no asset files needed
+sim.add_robot("so100")                          # resolves the same description MuJoCo loads
 sim.add_object(name="cube", shape="cuboid",
                position=[0.4, 0.0, 0.05], scale=[0.05, 0.05, 0.05])
 sim.add_camera(name="front", position=[1.2, 0.0, 0.6], target=[0.0, 0.0, 0.1])
@@ -188,9 +188,30 @@ open a window.
 
 - **World & lifecycle** - `create_world`, `destroy`, `reset`, `step`,
   `get_state`, `cleanup`.
-- **Robots** - `add_robot` (procedural builders, or USD via `usd_path=`, or
-  URDF), `remove_robot`, `list_robots`, `robot_joint_names`, `send_action`,
-  `get_observation`.
+- **Robots** - `add_robot`, `remove_robot`, `list_robots`, `robot_joint_names`,
+  `send_action`, `get_observation`. `add_robot` takes an explicit `usd_path=`,
+  `urdf_path=` or `mjcf_path=`, and with none of them resolves the robot name (or
+  `data_config=`) through the **same** registry resolver the MuJoCo backend uses,
+  so both backends load one description file for one name. An MJCF is converted
+  to USD once via Isaac's own `isaacsim.asset.importer.mjcf` extension and cached
+  under `$STRANDS_BASE_DIR/asset_cache/usd_robots/`, content-addressed over the
+  description *and every file its directory holds* (an MJCF `<include>`s bodies
+  and references a `meshdir`, so keying on the named file alone would serve a
+  stale conversion). The cached USD is then referenced by the native USD path, so
+  a name, an MJCF, a URDF and a USD all converge on one loader.
+
+  A robot the registry cannot resolve is refused with the same three-way
+  diagnosis the MuJoCo backend gives - a typo (with close matches), a
+  hardware-only registry entry, or an asset that is simply not downloaded - since
+  both backends now share that message rather than each spelling its own.
+
+  There was previously a fourth route here: a "procedural builder" for `so100`,
+  `panda` and `unitree_g1` that needed no asset files. It has been deleted. It
+  reported success while creating no prims at all, left the articulation
+  unwired and `get_observation()` empty for the whole lifecycle, and reported
+  joint names that disagreed with this backend's own parity claim - `so100` as
+  `shoulder_pan`/`shoulder_lift`/... against MuJoCo's `Rotation`/`Pitch`/..., and
+  `panda` as 7 joints against MuJoCo's 9.
 - **Objects** - `add_object` (`cuboid` / `sphere` / `cylinder` / `capsule` /
   `mesh`, dynamic or static), `remove_object`. A `shape="mesh"` add takes a
   `mesh_path` to an STL/OBJ/MSH asset (converted to USD once and cached under
@@ -239,7 +260,15 @@ open a window.
   counted as an actuated DOF by `num_joints`.
 
 Because the joint-name and observation contract matches the MuJoCo backend,
-policies and observation mappings transfer unchanged between backends.
+policies and observation mappings transfer unchanged between backends. That holds
+for a shared reason rather than by coincidence: for a robot named rather than
+pathed, both backends resolve the same description file through the same
+resolver, so the joint names are read from one asset. Measured on Isaac Sim
+6.0.1, `panda` reports `joint1`..`joint7` plus `finger_joint1`/`finger_joint2`
+(9 of 9 matching MuJoCo) and `so100` reports `Rotation`, `Pitch`, `Elbow`,
+`Wrist_Pitch`, `Wrist_Roll`, `Jaw` (6 of 6). Passing an explicit `usd_path=` opts
+out of that guarantee, since nothing then ties your asset to the one MuJoCo would
+have loaded.
 
 Mesh-bearing scenes get the same treatment for their *visuals*: `load_scene`
 renders each scene object with its real mesh (bowls, plates - the assets a
@@ -272,9 +301,9 @@ USD prim path (`{stage_path}/Robots/{name}`), so an unaddressable name does not
 just produce an entity you cannot look up - `add_robot("")` resolved to
 `/World/Robots/`, the *container* scope for every robot, and `remove_robot`
 prunes its cleanup registry by that prefix. Unlike the MuJoCo backend there is
-no "derive a label from the model" short form: `name` is also the procedural
-lookup key, so `None` / `""` are refused rather than replaced with a generated
-label.
+no "derive a label from the model" short form: `name` is also the key the registry
+resolution falls back to when no `data_config=` is given, so `None` / `""` are
+refused rather than replaced with a generated label.
 
 The one deliberate difference in that list is `mass=0`. The Newton backend
 documents it as an alternative spelling of `is_static=True` and honours it, so it
