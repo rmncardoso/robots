@@ -1214,6 +1214,56 @@ def non_negative_count_error(value: Any, param: str, context: str) -> str | None
     return None
 
 
+def declared_count(value: object) -> int | None:
+    """The count a dataset's ``meta/info.json`` declares, or ``None`` for none.
+
+    Read-side counterpart of :func:`non_negative_count_error`, and the same type
+    and floor rule: that domain grades a count a CALLER passed and reports why it
+    was refused, while this one grades a count a FILE declares, where the only
+    answers a reader can act on are the count itself and the absence of one.
+    Every reader of a LeRobot header count asks that question of the same file -
+    the parquet cross-check in
+    :func:`~strands_robots.dataset_recorder.read_dataset_episode_indices`, the
+    metadata-drift check in
+    :func:`~strands_robots.verify_dataset.verify_dataset`, the validation-split
+    denominator in ``strands_robots.training.lerobot``, and the episode count the
+    ``lerobot_train`` tool splits - so the answer lives here: one file, one
+    value, one verdict.
+
+    A declaration outside the domain is ``None`` (the header declares no count),
+    never a nearby number, because every alternative is silently destructive at
+    surfaces that certify datasets:
+
+    * ``int(2.5)`` truncates to ``2``, which is exactly the count a two-episode
+      parquet holds - so a header no writer could have produced reads as
+      agreement between the two independent metadata sources.
+    * ``int(1e400)`` raises ``OverflowError``. ``1e400`` is a well-formed JSON
+      number (RFC 8259 bounds no range) that ``json.load`` parses to ``inf``, so
+      a perfectly readable file raises out of readers whose documented answer for
+      an unusable header is "unknown", and past a tool envelope.
+    * ``bool`` is an ``int`` subclass, so a bare type test reads ``true`` as a
+      one-episode dataset; the neighbouring ``total_tasks`` reader in
+      ``strands_robots.tools.lerobot_train`` already excludes it for that reason.
+    * A ``str`` digit and an integral ``float`` are refused rather than coerced,
+      because coercing is what let the readers disagree: one accepted ``"2"`` as
+      two episodes while another refused it as unusable.
+
+    A reader that must report an unusable declaration rather than pass it over
+    compares against the raw value it read: ``None`` here with the key present
+    means the file declares something that is not a count.
+
+    Args:
+        value: The value the metadata file carried under the count's key, or
+            ``None`` when the key is absent.
+
+    Returns:
+        The declared count, or ``None`` when the file declares no usable one.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def step_cadence_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable cadence in training steps.
 
@@ -2628,6 +2678,42 @@ def published_string_error(value: Any, param: str, context: str) -> str | None:
         f"({type(value).__name__}); this tool publishes '{param}' as a string and "
         "every agent-tool call carries it as one."
     )
+
+
+def stale_output_dir_is_clearable(output_dir: str) -> bool:
+    """True when ``output_dir`` exists and holds nothing, so clearing it is free.
+
+    Both LeRobot training entry points clear a stale ``output_dir`` on a fresh
+    (non-resuming) start, because lerobot's own ``TrainPipelineConfig.validate``
+    refuses a pre-existing one unless ``resume=True``. This is the single owner
+    of the bound on that hygiene, so the two cannot disagree about what a fresh
+    start is allowed to remove.
+
+    Emptiness is the bound because the removal is a recursive
+    ``shutil.rmtree(..., ignore_errors=True)``: it reports neither what it took
+    nor a partial failure, and nothing it takes is recoverable. A directory with
+    nothing in it is the only one where that is free.
+
+    Emptiness also SUBSUMES the "no resumable checkpoint" test, so this needs no
+    checkpoint probe: a directory holding a checkpoint is not empty, whatever
+    layout the checkpoint is in. That matters because a checkpoint is not always
+    visible to a resume probe - lerobot's ``save_checkpoint`` writes
+    ``model.safetensors`` before ``train_config.json``, so a run interrupted
+    between the two leaves the trained weights on disk under a checkpoint no
+    resume probe reports, and a checkpoint-keyed bound clears exactly that.
+
+    Args:
+        output_dir: Path a run is about to write checkpoints into.
+
+    Returns:
+        ``True`` only when the path is an existing directory with no entries.
+        ``False`` for a path that does not exist (there is nothing to clear), is
+        not a directory, or holds anything at all.
+    """
+    path = Path(output_dir)
+    if not path.is_dir():
+        return False
+    return not any(path.iterdir())
 
 
 def validation_split_fraction(val_episodes: int, total_episodes: int) -> float:
