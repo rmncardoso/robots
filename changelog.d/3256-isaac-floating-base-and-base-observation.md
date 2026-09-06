@@ -1,0 +1,61 @@
+### Added: a floating base on the Isaac backend, and the `base_*` observation entries it makes meaningful
+
+Two halves of one defect, because neither is usable alone.
+
+**Nothing on this backend could have a floating base.** `fix_base = True` was
+hardcoded at *both* URDF import paths - the modern `URDFImporterConfig` and the
+legacy `_urdf.ImportConfig` - with no way for a caller to change it. Every URDF
+robot was welded to the world, so a humanoid could not fall, a quadruped could not
+walk, and nothing said so.
+
+**And the four `base_*` observation entries were absent.** The
+`SimEngine.get_observation` schema requires that a robot whose root is a 6-DoF free
+joint surface `base_pos`, `base_quat`, `base_lin_vel` and `base_ang_vel` rather
+than reporting the free joint as a scalar. MuJoCo emits all four
+(`mujoco/rendering.py`) and Newton emits all four (`newton/simulation.py`); across
+all 11 files of the Isaac package there were **zero** occurrences. A locomotion
+policy reading `base_lin_vel` - the base twist every walking controller is
+conditioned on - got nothing on this backend and a value on the other two, which is
+what made the documented "policies and observation mappings transfer unchanged
+between backends" false for a legged robot.
+
+The two are one change because the absence was *consistent*: with every base
+welded, those four keys would have reported four constants.
+
+```python
+sim.add_robot("g1", urdf_path="g1.urdf", position=[0, 0, 1.2], fix_base=False)
+sim.step(120)
+sim.get_observation("g1")["base_pos"]        # -> [0.0, 0.0, 0.05]
+```
+
+Verified on `nvcr.io/nvidia/isaac-sim:6.0.1` (A10G): the same robot goes
+`z 1.2 -> 1.1898 -> 0.9786 -> 0.2245 -> 0.05` over 120 steps and settles on the
+ground at its base half-height, while `fix_base=True` holds `z 0.0 -> 0.0`. A
+welded base emits no `base_*` keys and a floating one emits all four, with the
+values the articulation reports.
+
+`fix_base` is a parameter rather than something read out of the file because URDF
+cannot answer it. The format has a `floating` joint type, but the universal
+convention for a mobile robot is a root link with no parent joint - byte-identical
+to how a bolted-down arm declares its base - so the consumer chooses. That is why
+Isaac's own importer takes the flag, and why MuJoCo and Newton, which read MJCF's
+`<freejoint>`, have no equivalent parameter. `True` remains the default: it is the
+existing behaviour, the shipped LIBERO Franka depends on it, and a fixed-base arm
+is the common case here.
+
+It applies to `urdf_path` only. A USD asset carries its own articulation root and a
+procedural build authors its own prims, so `fix_base=False` on those paths is
+refused with a message naming `urdf_path` as the remedy, rather than accepted and
+ignored - which would leave the caller believing they had a floating base and the
+observation keys believing the opposite. The flag itself is checked on the shared
+`boolean_flag_error` domain, so `fix_base="false"` is refused rather than read as
+truthy and silently welding the base of a caller who asked for the opposite.
+
+**Known limitation, measured rather than worked around:** a `reset()` does not
+preserve a floating base's spawn height. A robot added at `z=1.2` reads `base_pos`
+z `1.2` immediately and `0.0402` after a reset, because `world.reset()` re-applies
+each registered prim's default state on `post_reset` - the same mechanism
+`load_scene` deliberately avoids a reset for (#1802). Recording the spawn pose via
+the articulation's `set_default_state` was tried and does not change that reading,
+so `add_robot`'s docstring states it: to drop a robot from a height, step from the
+pose `add_robot` leaves rather than resetting first.
