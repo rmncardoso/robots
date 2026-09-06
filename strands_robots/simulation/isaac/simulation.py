@@ -58,6 +58,7 @@ from strands_robots.utils import (
     non_negative_whole_number_error,
     partial_construction_repr,
     positive_count_error,
+    positive_finite_number_error,
     positive_whole_number_error,
     step_aborted_msg,
 )
@@ -283,6 +284,39 @@ class SimulationAppLaunchConfig(TypedDict, total=False):
 # throughout the docs; it normalizes to the canonical ``"box"`` (see #88).
 # A unit test pins this mapping so docs and code can't drift apart again.
 _SHAPE_ALIASES: dict[str, str] = {"cuboid": "box"}
+
+
+#: Where Isaac Sim's ``World`` puts its physics scene. At the STAGE ROOT, not under
+#: ``stage_path`` - measured on Isaac Sim 6.0.1, where the only ``UsdPhysics.Scene``
+#: prim is ``/physicsScene`` and ``/World/physicsScene`` does not exist. Used only
+#: as the fallback when the stage cannot be searched; the search runs first, because
+#: a hardcoded path is exactly what got this wrong.
+_DEFAULT_PHYSICS_SCENE_PATH = "/physicsScene"
+
+
+def _physics_scene_path(stage: Any) -> str:
+    """The stage's ``UsdPhysics.Scene`` prim path, discovered rather than assumed.
+
+    ``GridCloner.filter_collisions`` needs it, and an incorrect path raises
+    ``RuntimeError: Accessed schema on invalid prim``. On the collision-filtering
+    path that is caught and demoted to "the environments will collide with each
+    other", so a wrong constant here does not fail the clone - it silently degrades
+    the fleet into one where every environment pushes its neighbours around. That is
+    why this searches the stage rather than naming a path: measured on 6.0.1,
+    ``/World/physicsScene`` (the intuitive spelling, under the configured
+    ``stage_path``) is invalid and ``/physicsScene`` is where it lives.
+    """
+    try:
+        from pxr import UsdPhysics  # type: ignore[import-not-found]
+
+        for prim in stage.Traverse():
+            if prim.IsA(UsdPhysics.Scene):
+                return str(prim.GetPath().pathString)
+    except (ImportError, AttributeError, TypeError):
+        # No pxr, or a stage stand-in that cannot answer ``IsA``. The fallback is
+        # the measured location rather than a guess.
+        pass
+    return _DEFAULT_PHYSICS_SCENE_PATH
 
 
 def _mesh_path_error(method: str, mesh_path: Any) -> str | None:
@@ -5813,20 +5847,66 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
 
     # --- Isaac-specific: Fleet Replication -----------------------------------
 
-    def replicate(self, num_envs: int | None = None) -> dict[str, Any]:
-        """Replicate the current scene into parallel environments.
+    def replicate(self, num_envs: int | None = None, spacing: float = 1.5) -> dict[str, Any]:
+        """Clone the current scene into a grid of parallel environments.
 
-        Uses ``omni.isaac.cloner.Cloner`` for GPU-efficient replication.
+        Every registered robot and object is cloned into ``{stage_path}/envs/env_i``
+        for ``i`` in ``1..num_envs-1``, laid out on a square grid with ``spacing``
+        metres between neighbours. The scene you already built is environment 0, so
+        ``num_envs`` counts it: ``replicate(64)`` produces the source plus 63
+        clones. Cloning is done by Isaac Sim's own
+        ``isaacsim.core.cloner.GridCloner``, which is what makes it a GPU-side
+        fabric operation rather than N Python-side prim constructions.
+
+        **What this does NOT do**, because nothing here implements it: give you a
+        per-environment observation or action API. ``get_observation`` and
+        ``send_action`` address the *source* environment's robot, which is the only
+        one carrying an ``Articulation`` handle. Physics advances in every
+        environment, and the clones are what a renderer and a domain-randomisation
+        pass see; driving each one independently needs an articulation view across
+        environments, which is not built. The result envelope says so rather than
+        leaving it to be discovered.
+
+        This used to be a stub. It reported ``"Replicated to N environments.
+        Build time: 0ms."`` while calling no cloner at all - the body was a comment
+        reading "In full implementation: use ``omni.isaac.cloner.Cloner``" between
+        two ``time.perf_counter()`` reads, so the build time it quoted was the
+        duration of two assignments. Measured on Isaac Sim 6.0.1, ``replicate(64)``
+        left the stage's prim count unchanged at 69, made ``get_state()`` report
+        ``num_envs: 64``, and set ``_replicated``, which permanently refuses
+        ``add_robot`` - so the no-op also locked the caller out of the scene. The
+        module it named does not exist on 6.x either (``omni.isaac.cloner`` ->
+        ``ModuleNotFoundError``); the cloner lives at ``isaacsim.core.cloner``.
 
         Parameters
         ----------
         num_envs : int, optional
-            Number of environments. Defaults to config.num_envs.
+            Total number of environments including the source, on the shared
+            :func:`~strands_robots.utils.positive_whole_number_error` domain.
+            Defaults to ``config.num_envs``. ``1`` is an accepted no-op: the scene
+            is already one environment, so there is nothing to clone, and this
+            deliberately leaves the sim un-replicated so ``add_robot`` keeps
+            working rather than being refused for a call that did nothing.
+        spacing : float, optional
+            Grid spacing in metres between neighbouring environments, on the
+            shared :func:`~strands_robots.utils.positive_finite_number_error`
+            domain. Defaults to 1.5 m, which clears the largest robot this
+            registry ships. Too small and neighbouring environments interpenetrate,
+            which reads as a physics bug rather than a layout one.
 
         Returns
         -------
         dict
-            Status dict with replication info.
+            ``status`` is ``"error"`` when no world exists, no robot has been
+            added, ``num_envs``/``spacing`` is outside its domain, the cloner
+            extension is unavailable, or the clone itself fails. On success the
+            payload carries what was actually built - ``num_envs``,
+            ``clones_created``, ``prims_created``, ``build_time_ms``,
+            ``physics_replicated`` and ``collisions_filtered`` - so a caller can
+            tell a real fleet from a partial one instead of reading a number back
+            that this method was merely handed.
+
+        Concurrency: main-thread affine, like every other stage mutation here.
         """
         with self._lock:
             if not self._world_created:
@@ -5838,29 +5918,225 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     "content": [{"text": "Add at least one robot first."}],
                 }
 
-            n = num_envs or self._config.num_envs
+            # Guarded before any stage work and before ``_replicated`` is touched.
+            # ``IsaacConfig`` validates its own ``num_envs`` at construction, but
+            # this argument bypassed that entirely: a negative count reported
+            # success having built nothing, and a float or a bool sailed through
+            # into ``get_state()``'s ``num_envs``.
+            requested = num_envs if num_envs is not None else self._config.num_envs
+            if error := positive_whole_number_error(requested, "num_envs", "replicate"):
+                return {"status": "error", "content": [{"text": error}]}
+            n = int(requested)
+            if error := positive_finite_number_error(spacing, "spacing", "replicate"):
+                return {"status": "error", "content": [{"text": error}]}
+            grid_spacing = float(spacing)
+
+            if n == 1:
+                # Deliberately not an error, and deliberately not a replication:
+                # one environment is what the scene already is. Leaving
+                # ``_replicated`` alone is the load-bearing half - setting it
+                # would refuse every later ``add_robot`` on the strength of a call
+                # that cloned nothing, which is exactly what the stub did.
+                logger.info("replicate(1): the scene is already one environment; nothing to clone")
+                return {
+                    "status": "success",
+                    "content": [
+                        {
+                            "text": (
+                                "replicate: num_envs=1 is the scene you already have, so nothing "
+                                "was cloned and the simulation is not marked replicated (add_robot "
+                                "still works). Pass num_envs>1 to build a fleet."
+                            ),
+                            "json": {
+                                "num_envs": 1,
+                                "clones_created": 0,
+                                "prims_created": 0,
+                                "build_time_ms": 0.0,
+                                "physics_replicated": False,
+                                "collisions_filtered": False,
+                            },
+                        }
+                    ],
+                }
+
+            try:
+                from isaacsim.core.cloner import GridCloner  # type: ignore[import-not-found]
+            except ImportError as exc:
+                # Refuse rather than report a fleet nobody built. This is the
+                # single behaviour this method used to get wrong.
+                msg = (
+                    f"replicate: Isaac Sim's cloner extension (isaacsim.core.cloner) is "
+                    f"unavailable ({exc}), so {n} environments cannot be created. It is a Kit "
+                    f"extension, so it resolves only inside a running Isaac Sim application. "
+                    f"The simulation is unchanged and still has one environment."
+                )
+                logger.error("IsaacSimulation.replicate: %s", msg)
+                return {"status": "error", "content": [{"text": msg}]}
+
+            env_root = f"{self._config.stage_path}/envs"
+            # ``root_path`` is the per-environment path PREFIX and is mandatory
+            # whenever ``replicate_physics`` is set - the cloner refuses with
+            # ``ValueError: root_path needs to be specified!`` otherwise, which is
+            # not something the signature's ``root_path: str = None`` default
+            # suggests. ``base_env_path`` is the container the environments hang
+            # under, and the two are different strings.
+            env_prefix = f"{env_root}/env"
+            # env_0 is the scene already on the stage, so only 1..n-1 are built.
+            targets = [f"{env_prefix}_{i}" for i in range(1, n)]
+            sources = [state.prim_path for state in self._robots.values()]
+            sources += [state.prim_path for state in self._objects.values()]
 
             t0 = time.perf_counter()
-            # In full implementation: use omni.isaac.cloner.Cloner
-            # to replicate the scene N times
+            physics_replicated = False
+            collisions_filtered = False
+            try:
+                import omni.usd  # type: ignore[import-not-found]
+
+                stage = omni.usd.get_context().get_stage()
+                before = sum(1 for _ in stage.Traverse())
+
+                cloner = GridCloner(spacing=grid_spacing)
+                cloner.define_base_env(env_root)
+
+                # Define each environment scope BEFORE cloning into it. The cloner
+                # writes a clone at a path whose parent already exists and
+                # otherwise does nothing at all - measured, and measured silently:
+                # across six flag combinations (with and without
+                # ``replicate_physics``, ``copy_from_source``, ``base_env_path``
+                # and ``root_path``) ``clone`` returned without raising and created
+                # zero environment prims whenever the target's parent scope was
+                # absent, while ``define_base_env`` still added its own one prim.
+                # That one prim is why a guard comparing stage counts is not enough
+                # here, and why the check below reads the paths instead.
+                for target in targets:
+                    stage.DefinePrim(target, "Xform")
+
+                expected: list[str] = []
+                for source in sources:
+                    leaf = source.rsplit("/", 1)[-1]
+                    clone_paths = [f"{target}/{leaf}" for target in targets]
+                    expected += clone_paths
+                    cloner.clone(
+                        source_prim_path=source,
+                        prim_paths=clone_paths,
+                        replicate_physics=True,
+                        base_env_path=env_root,
+                        root_path=env_prefix,
+                        copy_from_source=False,
+                    )
+                physics_replicated = True
+
+                # Without this every environment collides with its neighbours, so
+                # a fleet rollout is not N independent episodes. Best-effort and
+                # REPORTED: a fleet whose environments interact is a materially
+                # different thing from one whose environments do not, so the
+                # caller is told which they got rather than left to infer it from
+                # the trajectories.
+                try:
+                    cloner.filter_collisions(
+                        physicsscene_path=_physics_scene_path(stage),
+                        collision_root_path=f"{env_root}/collisions",
+                        prim_paths=[f"{env_prefix}_0", *targets],
+                    )
+                    collisions_filtered = True
+                except (RuntimeError, ValueError, AttributeError, TypeError, KeyError) as exc:
+                    logger.warning(
+                        "replicate: inter-environment collision filtering failed (%s: %s); the %d "
+                        "environments will collide with each other",
+                        type(exc).__name__,
+                        exc,
+                        n,
+                    )
+
+                after = sum(1 for _ in stage.Traverse())
+                # Which CLONES are actually on the stage. Two things make this the
+                # check rather than a count, and both were measured the hard way.
+                # ``define_base_env`` alone adds the one ``{stage_path}/envs``
+                # prim, so a cloner that creates nothing still grows the stage by
+                # 1 - a guard comparing counts reported "7 clones" over an empty
+                # env root. And the environment scopes above are defined by this
+                # method, so their presence is evidence of nothing either. What has
+                # to exist is the cloned prim at each expected path.
+                on_stage = {prim.GetPath().pathString for prim in stage.Traverse()}
+                missing = [path for path in expected if path not in on_stage]
+            except (RuntimeError, ValueError, OSError, AttributeError, TypeError, ImportError) as exc:
+                # Same cleanup-clause shape as the other stage mutations here. The
+                # sim is left un-replicated so a retry is possible and so
+                # ``add_robot`` is not refused on the strength of a failed clone.
+                msg = (
+                    f"replicate: cloning the scene into {n} environments failed "
+                    f"({type(exc).__name__}: {exc}). The simulation is left un-replicated."
+                )
+                logger.error("IsaacSimulation.replicate: %s", msg)
+                return {"status": "error", "content": [{"text": msg}]}
+
+            elapsed = time.perf_counter() - t0
+            prims_created = after - before
+
+            if missing:
+                # The cloner returned without raising and the environments are not
+                # there. Reporting success here is the whole defect this method
+                # had, so it is refused instead - and the sim stays un-replicated,
+                # so ``add_robot`` is not locked out over a fleet that does not
+                # exist. The refusal names the paths, because "cloning failed" with
+                # no error from the cloner is otherwise undiagnosable.
+                shown = ", ".join(missing[:4]) + (f", ... (+{len(missing) - 4} more)" if len(missing) > 4 else "")
+                msg = (
+                    f"replicate: the cloner reported no error but {len(missing)} of the {len(expected)} "
+                    f"expected clone prims are not on the stage ({shown}). The stage gained "
+                    f"{prims_created} prim(s), which are the environment scopes this call defined "
+                    f"rather than any clone. Refusing to report a fleet that was not built; the "
+                    f"simulation is left un-replicated."
+                )
+                logger.error("IsaacSimulation.replicate: %s", msg)
+                return {"status": "error", "content": [{"text": msg}]}
+
             self._replicated = True
             self._num_envs_active = n
-            elapsed = time.perf_counter() - t0
 
-            logger.info("Replicated to %d envs in %.2fs", n, elapsed)
+            logger.info(
+                "Cloned the scene into %d environments (%d clones, %d prims) in %.2fs "
+                "at %.2fm spacing; physics_replicated=%s collisions_filtered=%s",
+                n,
+                len(targets),
+                prims_created,
+                elapsed,
+                grid_spacing,
+                physics_replicated,
+                collisions_filtered,
+            )
 
+            collision_note = (
+                ""
+                if collisions_filtered
+                else " WARNING: inter-environment collision filtering failed, so the environments "
+                "will collide with each other."
+            )
             return {
                 "status": "success",
                 "content": [
                     {
                         "text": (
-                            f"Replicated to {n} environments. "
-                            f"Build time: {elapsed * 1000:.0f}ms. "
-                            f"Device: {self._config.device}."
+                            f"Cloned the scene into {n} environments ({len(targets)} clones of "
+                            f"{len(sources)} source prim(s) plus the source as env_0, "
+                            f"{prims_created} prims) in {elapsed * 1000:.0f}ms at "
+                            f"{grid_spacing:.2f}m spacing on {self._config.device}."
+                            f"{collision_note} "
+                            f"NOTE: get_observation/send_action address env_0 only - there is no "
+                            f"per-environment action API, so the clones advance under physics but "
+                            f"cannot be driven or read individually."
                         ),
                         "json": {
                             "num_envs": n,
+                            "clones_created": len(targets),
+                            "source_prims": len(sources),
+                            "prims_created": prims_created,
                             "build_time_ms": elapsed * 1000,
+                            "spacing": grid_spacing,
+                            "env_root": env_root,
+                            "physics_replicated": physics_replicated,
+                            "collisions_filtered": collisions_filtered,
+                            "per_env_action_api": False,
                         },
                     }
                 ],
