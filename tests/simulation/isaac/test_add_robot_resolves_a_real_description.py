@@ -107,11 +107,20 @@ def loaded(monkeypatch) -> dict[str, Any]:
         seen["converted"].append(mjcf_path)
         return f"/cache/usd_robots/deadbeef/{os.path.basename(mjcf_path)}.usda"
 
-    def fake_load_usd(self: Any, prim_path: str, usd_path: str, position: list[float]) -> tuple[list[str], Any]:
+    def fake_load_usd(
+        self: Any, prim_path: str, usd_path: str, position: list[float], *args: Any, **kwargs: Any
+    ) -> tuple[list[str], Any]:
         seen["usd"].append((prim_path, usd_path, list(position)))
         return list(MUJOCO_SO100_JOINTS), _Articulation(MUJOCO_SO100_JOINTS)
 
-    def fake_load_urdf(self: Any, prim_path: str, urdf_path: str, position: list[float]) -> tuple[list[str], Any]:
+    def fake_load_urdf(
+        self: Any, prim_path: str, urdf_path: str, position: list[float], *args: Any, **kwargs: Any
+    ) -> tuple[list[str], Any]:
+        # ``*args, **kwargs`` because this stands in for a PRIVATE method whose
+        # signature grows: pinning its arity here makes an unrelated parameter
+        # addition fail as "Failed to load URDF robot" - a production-looking
+        # error from a stand-in. What these tests are about is which loader the
+        # dispatch picks and with which path, so only those are captured.
         seen["urdf"].append((prim_path, urdf_path, list(position)))
         return ["j0"], _Articulation(["j0"])
 
