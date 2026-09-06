@@ -285,6 +285,78 @@ class SimulationAppLaunchConfig(TypedDict, total=False):
 _SHAPE_ALIASES: dict[str, str] = {"cuboid": "box"}
 
 
+def _translate_contact_report(
+    headers: Any,
+    data: Any,
+    decode_path: Any,
+    path_to_name: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Translate a PhysX contact report into ``get_contacts`` records.
+
+    One record per reported PAIR (a header), in the shape the predicate DSL and
+    the MuJoCo backend already speak: ``geom1`` / ``geom2`` are names a caller
+    can match on - the registered object name when the actor path belongs to a
+    registered object, else the path's leaf segment - ``dist`` is the minimum
+    separation over the pair's contact points (negative = penetrating),
+    ``pos`` is the first point's position, and ``active`` is whether PhysX
+    reported the pair as touching this step (``CONTACT_FOUND`` /
+    ``CONTACT_PERSIST``; a ``CONTACT_LOST`` event is the pair separating, so it
+    is reported with ``active=False`` exactly once and then disappears).
+
+    Pure so it is unit-testable without Kit: ``headers`` / ``data`` are the two
+    sequences ``omni.physx``'s ``get_contact_report()`` returns, where each
+    header consumes its ``num_contact_data`` entries from ``data`` in order,
+    and ``decode_path`` is ``PhysicsSchemaTools.intToSdfPath`` (an actor id is
+    an encoded path, not an index).
+    """
+
+    def _name_of(encoded: Any) -> str:
+        path = str(decode_path(encoded))
+        if path in path_to_name:
+            return path_to_name[path]
+        return path.rsplit("/", 1)[-1] or path
+
+    contacts: list[dict[str, Any]] = []
+    offset = 0
+    for header in headers:
+        n_points = int(getattr(header, "num_contact_data", 0) or 0)
+        points = list(data[offset : offset + n_points])
+        offset += n_points
+        event = str(getattr(header, "type", ""))
+        separations = [float(pt.separation) for pt in points if hasattr(pt, "separation")]
+        # The solver's own touch signal, mirroring what MuJoCo's ``active``
+        # (mjContact.exclude == 0) means: a pair carrying FORCE. PhysX's event
+        # type alone is not that - a speculative pair inside the contact offset
+        # arrives as CONTACT_PERSIST at a plainly positive separation (measured
+        # live: a cube resting on ANOTHER cube reported a "persisting" pair
+        # with the ground plane 0.12 m below it), so event-only ``active``
+        # answers "touching" for bodies visibly apart - the exact
+        # proximity-for-touch substitution the flag exists to prevent. A
+        # resting contact's per-point impulse is small but decisively nonzero
+        # (~3e-3 N*s measured); a speculative pair's is zero.
+        impulse = 0.0
+        for pt in points:
+            vec = getattr(pt, "impulse", None)
+            if vec is not None:
+                impulse = max(impulse, float(sum(float(v) ** 2 for v in vec)) ** 0.5)
+        active = event.endswith(("FOUND", "PERSIST")) and impulse > 0.0
+        first_pos: list[float] = []
+        if points and hasattr(points[0], "position"):
+            first_pos = [float(v) for v in points[0].position]
+        contacts.append(
+            {
+                "geom1": _name_of(header.actor0),
+                "geom2": _name_of(header.actor1),
+                "dist": min(separations) if separations else 0.0,
+                "pos": first_pos,
+                "active": active,
+                "impulse": impulse,
+                "n_points": len(points),
+            }
+        )
+    return contacts
+
+
 def _mesh_path_error(method: str, mesh_path: Any) -> str | None:
     """Refusal text for a ``mesh_path`` this backend cannot realize, else ``None``.
 
@@ -2371,6 +2443,32 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 handle=handle,
             )
 
+            # Enroll the prim for PhysX contact reporting NOW, while the object
+            # is not yet simulating: measured on isaacsim 6.0.1, a
+            # PhysxContactReportAPI applied before the reset that builds the
+            # physics view produces per-pair headers with per-point
+            # position/separation/impulse, and one applied mid-simulation
+            # produces nothing at all - 0 headers over every subsequent step.
+            # A pair is reported when EITHER actor is enrolled, so enrolling
+            # objects covers object<->ground and object<->robot (a grasp)
+            # without touching robot prims. Threshold 0: report every contact,
+            # not just impulses above a force floor - get_contacts answers
+            # "touching?", not "hit hard?". Best-effort with a WARNING: an
+            # object without enrollment still simulates, it is just invisible
+            # to get_contacts, and the warning is the only trace of why.
+            try:
+                from pxr import PhysxSchema  # type: ignore[import-not-found]
+
+                report_api = PhysxSchema.PhysxContactReportAPI.Apply(handle.prim)
+                report_api.CreateThresholdAttr().Set(0.0)
+            except (ImportError, AttributeError, TypeError, RuntimeError) as e:
+                logger.warning(
+                    "add_object: could not enroll '%s' for contact reporting (%s); "
+                    "get_contacts will not see this object's contacts.",
+                    name,
+                    e,
+                )
+
             obj_info = {
                 "name": name,
                 "prim_path": prim_path,
@@ -3561,6 +3659,69 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         logger.debug("camera %r frame unavailable: %s", cam_name, e)
 
             return obs
+
+    def get_contacts(self) -> dict[str, Any]:
+        """Return the contact pairs PhysX reported at the current step.
+
+        The Isaac half of the cross-backend contact query: same envelope and
+        record shape as the MuJoCo backend (``{"json": {"contacts": [...]}}``,
+        records keyed ``geom1``/``geom2``/``dist``/``pos``/``active``), so the
+        predicate DSL's ``contact_*`` factories and ``success_fn="contact"``
+        read both backends through one code path.
+
+        Coverage is the pairs involving a registered OBJECT: ``add_object``
+        enrolls each object prim for PhysX contact reporting (a pair is
+        reported when either actor is enrolled, so object<->ground and
+        object<->robot - a grasp - are covered; robot-link<->robot-link is
+        not). Enrollment happens at add time because it must precede the reset
+        that builds the physics view - applied mid-simulation the report API
+        produces nothing, measured on isaacsim 6.0.1.
+
+        The report is consumed per step: PhysX hands the events once, so the
+        translated result is cached against ``_step_count`` and a second call
+        without an intervening ``step`` returns the same answer rather than an
+        empty one.
+
+        Returns:
+            The standard envelope; ``status="error"`` when no world exists or
+            the PhysX interface is unavailable.
+        """
+        with self._lock:
+            if not self._world_created or self._world is None:
+                return {"status": "error", "content": [{"text": "No world. Call create_world (or load_scene) first."}]}
+            cache = getattr(self, "_contact_cache", None)
+            if cache is not None and cache[0] == self._step_count:
+                contacts = cache[1]
+            else:
+                try:
+                    from omni.physx import get_physx_simulation_interface  # type: ignore[import-not-found]
+                    from pxr import PhysicsSchemaTools  # type: ignore[import-not-found]
+                except ImportError as e:
+                    return {
+                        "status": "error",
+                        "content": [
+                            {
+                                "text": (
+                                    f"get_contacts: the PhysX contact-report interface is not importable "
+                                    f"({e}). Contacts need the Isaac Sim runtime this backend simulates in."
+                                )
+                            }
+                        ],
+                    }
+                headers, data = get_physx_simulation_interface().get_contact_report()
+                path_to_name = {st.prim_path: n for n, st in self._objects.items()}
+                contacts = _translate_contact_report(headers, data, PhysicsSchemaTools.intToSdfPath, path_to_name)
+                self._contact_cache = (self._step_count, contacts)
+
+        if contacts:
+            n_active = sum(1 for c in contacts if c["active"])
+            text = f"{len(contacts)} contacts ({n_active} touching)"
+            for c in contacts[:10]:
+                touch = "" if c["active"] else ", proximity only - no force"
+                text += f"\n  - {c['geom1']} <-> {c['geom2']} (d={c['dist']:.4f}{touch})"
+        else:
+            text = "No contacts."
+        return {"status": "success", "content": [{"text": text}, {"json": {"contacts": contacts}}]}
 
     def physics_timestep(self) -> float | None:
         """Return the fixed physics integration timestep in seconds.
