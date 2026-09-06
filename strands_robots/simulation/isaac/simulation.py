@@ -1473,7 +1473,11 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
 
                 # reset() clears every latched wrench, matching the MuJoCo
                 # contract ("reset() clears every latched wrench in the world").
-                self._applied_wrenches.clear()
+                # getattr for the same reason as the step loop's read: a
+                # __new__-built skeleton engine has no registry to clear.
+                wrenches = getattr(self, "_applied_wrenches", None)
+                if wrenches:
+                    wrenches.clear()
                 self._sim_time = 0.0
                 self._step_count = 0
 
@@ -1608,7 +1612,13 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         }
                     render = self._config.render_mode != "headless"
                     for _ in range(batch):
-                        if self._applied_wrenches:
+                        # ``getattr`` rather than a class-level default: two
+                        # dozen test modules build this engine with ``__new__``
+                        # and seed only what they exercise, and unlike the
+                        # boolean stale-view gate a CLASS-level ``{}`` here
+                        # would be one dict shared by every instance. An absent
+                        # registry reads as what it is - no latched wrenches.
+                        if getattr(self, "_applied_wrenches", None):
                             self._reapply_wrenches()
                         self._world.step(render=render)
                         self._sim_time += self._config.physics_dt
