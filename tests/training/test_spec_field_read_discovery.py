@@ -72,6 +72,13 @@ FIELD_SCOPED_GATES: dict[str, tuple[str, ...]] = {
     "_gradient_clip_problems": ("max_grad_norm",),
     "_loss_weight_problems": ("value_loss_coef", "entropy_coef"),
     "_clip_range_problems": ("clip_param",),
+    "_policy_delay_problems": ("policy_delay",),
+    "_td3_noise_problems": ("exploration_noise_std", "target_noise_std", "target_noise_clip"),
+    # The network-architecture gate. Its one field is a *sequence*, and it is
+    # scoped like the learning rate across the RL backends (all three build
+    # their actor and critics from it) while still being field-scoped overall,
+    # since a supervised backend takes its architecture from the checkpoint.
+    "_network_width_problems": ("hidden_dims",),
 }
 
 
@@ -184,10 +191,13 @@ class TestEveryFieldScopedGuardSeesBothFormsOfARead:
             "test_launch_topology_domain.py",
             "test_lora_hyperparameter_domain.py",
             "test_loss_weight_domain.py",
+            "test_network_width_domain.py",
             "test_optimization_epochs_domain.py",
+            "test_policy_delay_domain.py",
             "test_rl_run_size_domain.py",
             "test_rl_replay_domain.py",
             "test_seed_domain.py",
+            "test_td3_noise_domain.py",
             "test_temperature_learning_rate_domain.py",
             "test_validation_episodes_domain.py",
         }

@@ -181,6 +181,13 @@ class FastSacTrainer(BaseRLAlgo):
         # the update loop after the env, networks, optimizers and buffer are
         # built, and raises TypeError itself on a string or None.
         problems.extend(self._rl_replay_problems(spec))
+        # hidden_dims is the shape of every network this backend builds - the
+        # actor and the critics alike. The expansion loop judges nothing and
+        # nn.Linear accepts a width of zero, which makes the activation after it
+        # empty and the next layer's output its bias alone: the policy stops
+        # being a function of the observation, and the run reports success while
+        # exporting a deployable checkpoint whose actor is one fixed action.
+        problems.extend(self._network_width_problems(spec))
         if not 0.0 < spec.tau <= 1.0:
             problems.append(f"tau must be in (0, 1], got {spec.tau}")
         # learning_starts >= batch_size is a relation between two counts, so BOTH
@@ -412,7 +419,10 @@ class FastSacTrainer(BaseRLAlgo):
 
         Overrides the on-policy ``BaseRLAlgo.train``. ``spec`` MUST be an
         :class:`RLTrainSpec`; :meth:`validate` is called first and fails closed.
-        Updates run only after the buffer passes ``learning_starts``.
+        Updates run only after the buffer passes ``learning_starts``. The env
+        built by :meth:`setup` is closed in ``finally`` when the run leaves
+        this method - see :meth:`BaseRLAlgo._close_env` for the ownership rule
+        and why a later ``evaluate`` on the same instance still works.
         """
         if not isinstance(spec, RLTrainSpec):
             return TrainResult(
@@ -424,31 +434,34 @@ class FastSacTrainer(BaseRLAlgo):
         if problems:
             return TrainResult(status="error", job_id="", message="validation failed: " + "; ".join(problems))
 
-        self.setup(spec)
-        steps_per_iter = max(1, self.steps_per_iter)
-        num_iters = max(1, spec.total_timesteps // steps_per_iter)
+        try:
+            self.setup(spec)
+            steps_per_iter = max(1, self.steps_per_iter)
+            num_iters = max(1, spec.total_timesteps // steps_per_iter)
 
-        job_id = f"{self.provider_name}-{id(self):x}"
-        last_metrics: dict[str, Any] = {}
-        ckpt_dir: str | None = None
-        for it in range(num_iters):
-            rollout_metrics = self.collect_rollout()
-            loss_metrics = self.update() if self.buffer.size >= spec.learning_starts else {}
-            last_metrics = {**rollout_metrics, **loss_metrics, "iteration": it + 1}
-            if spec.log_interval and (it % spec.log_interval == 0 or it == num_iters - 1):
-                ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=it + 1)
-        if ckpt_dir is None:
-            ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=num_iters)
+            job_id = f"{self.provider_name}-{id(self):x}"
+            last_metrics: dict[str, Any] = {}
+            ckpt_dir: str | None = None
+            for it in range(num_iters):
+                rollout_metrics = self.collect_rollout()
+                loss_metrics = self.update() if self.buffer.size >= spec.learning_starts else {}
+                last_metrics = {**rollout_metrics, **loss_metrics, "iteration": it + 1}
+                if spec.log_interval and (it % spec.log_interval == 0 or it == num_iters - 1):
+                    ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=it + 1)
+            if ckpt_dir is None:
+                ckpt_dir = self.save_checkpoint(spec.output_dir, iteration=num_iters)
 
-        last_metrics.setdefault("latest_step", self._collected_steps)
-        return TrainResult(
-            status="success",
-            job_id=job_id,
-            checkpoint_dir=ckpt_dir,
-            exported_model=self.export(spec, ckpt_dir),
-            metrics=last_metrics,
-            message=f"{self.provider_name}: {num_iters} iterations x {steps_per_iter} steps complete",
-        )
+            last_metrics.setdefault("latest_step", self._collected_steps)
+            return TrainResult(
+                status="success",
+                job_id=job_id,
+                checkpoint_dir=ckpt_dir,
+                exported_model=self.export(spec, ckpt_dir),
+                metrics=last_metrics,
+                message=f"{self.provider_name}: {num_iters} iterations x {steps_per_iter} steps complete",
+            )
+        finally:
+            self._close_env()
 
     def _checkpoint_dir(self, output_dir: str) -> str:
         return os.path.join(output_dir, "checkpoints", "last")
