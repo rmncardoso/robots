@@ -47,6 +47,7 @@ from strands_robots.simulation.recording import undriven_robot_state
 from strands_robots.simulation.terrain import validate_difficulty
 from strands_robots.utils import (
     FREE_CAMERA_TOKENS,
+    boolean_flag_error,
     camera_fov_error,
     coerce_orientation_quaternion,
     coerce_pose_vector,
@@ -851,6 +852,14 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         self._sim_time = 0.0
         self._step_count = 0
 
+        # Latched external wrenches (apply_force): body name -> (force, torque,
+        # encoded body path). Reapplied every physics tick because PhysX's
+        # apply_force_at_pos acts for ONE step (measured: one 80 N call moved a
+        # resting cube 0.52 m over the following 10 steps and then stopped
+        # accelerating it), while the cross-backend apply_force contract is a
+        # LATCH - applied every step until replaced. reset() clears them.
+        self._applied_wrenches: dict[str, tuple[list[float], list[float], int]] = {}
+
         # Entity tracking
         self._robots: dict[str, _RobotState] = {}
         # Per-robot task-space action controllers (install_action_controller).
@@ -1462,6 +1471,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     # silent-empty mode (#1895).
                     self._revive_articulations_after_reset()
 
+                # reset() clears every latched wrench, matching the MuJoCo
+                # contract ("reset() clears every latched wrench in the world").
+                self._applied_wrenches.clear()
                 self._sim_time = 0.0
                 self._step_count = 0
 
@@ -1596,6 +1608,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         }
                     render = self._config.render_mode != "headless"
                     for _ in range(batch):
+                        if self._applied_wrenches:
+                            self._reapply_wrenches()
                         self._world.step(render=render)
                         self._sim_time += self._config.physics_dt
                         self._step_count += 1
@@ -3622,6 +3636,299 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         logger.debug("camera %r frame unavailable: %s", cam_name, e)
 
             return obs
+
+    def apply_force(
+        self,
+        body_name: str,
+        force: list[float] | None = None,
+        torque: list[float] | None = None,
+        point: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Apply an external force and/or torque to an object (latched).
+
+        The cross-backend contract is the MuJoCo backend's: the wrench is
+        LATCHED and applied on every subsequent physics step until the next
+        ``apply_force`` call for that body replaces it; wrenches on other
+        bodies are untouched, ``apply_force(body, force=[0, 0, 0])`` stops the
+        one body, and ``reset()`` clears them all. PhysX's own
+        ``apply_force_at_pos`` acts for ONE step (measured: one call
+        accelerated a resting cube for a single tick and then stopped), so the
+        latch is replayed into it each tick by the step loop.
+
+        ``force`` and ``torque`` are world-frame. A ``point`` away from the
+        body origin contributes its lever-arm torque, folded into the latched
+        torque at CALL time against the body's current world position -
+        matching how the MuJoCo backend folds ``point`` into ``xfrc_applied``
+        once rather than re-evaluating it as the body moves. The body origin
+        stands in for the centre of mass here; for the shipped primitives the
+        two coincide.
+
+        Targets are registered dynamic objects (``add_object``). A static
+        object has no rigid body to accelerate and is refused, not silently
+        ignored.
+
+        Args:
+            body_name: A registered object name.
+            force: [fx, fy, fz] in world frame (Newtons).
+            torque: [tx, ty, tz] in world frame (N*m).
+            point: [px, py, pz] world-frame point of force application;
+                defaults to the body's current position.
+
+        Returns:
+            The standard envelope; ``status="error"`` for no world, neither
+            vector supplied, a non-finite/boolean element, an unknown or
+            static body.
+        """
+        with self._lock:
+            if not self._world_created or self._world is None:
+                return {"status": "error", "content": [{"text": "No world. Call create_world (or load_scene) first."}]}
+            if force is None and torque is None:
+                return {
+                    "status": "error",
+                    "content": [
+                        {"text": "apply_force: specify at least one of 'force' or 'torque' (non-zero vector)."}
+                    ],
+                }
+            force, f_err = coerce_pose_vector("apply_force", "force", force, 3)
+            if f_err is not None:
+                return {"status": "error", "content": [{"text": f_err}]}
+            torque, t_err = coerce_pose_vector("apply_force", "torque", torque, 3)
+            if t_err is not None:
+                return {"status": "error", "content": [{"text": t_err}]}
+            point, p_err = coerce_pose_vector("apply_force", "point", point, 3)
+            if p_err is not None:
+                return {"status": "error", "content": [{"text": p_err}]}
+            if not registered(self._objects, body_name):
+                return {
+                    "status": "error",
+                    "content": [
+                        {"text": f"apply_force: unknown object '{body_name}'. Registered: {sorted(self._objects)}"}
+                    ],
+                }
+            state = self._objects[body_name]
+            if state.is_static:
+                return {
+                    "status": "error",
+                    "content": [
+                        {"text": f"apply_force: object '{body_name}' is static - it has no rigid body to accelerate."}
+                    ],
+                }
+
+            f_vec = [float(v) for v in (force if force is not None else (0.0, 0.0, 0.0))]
+            t_vec = [float(v) for v in (torque if torque is not None else (0.0, 0.0, 0.0))]
+            if point is not None and any(v != 0.0 for v in f_vec):
+                try:
+                    com = [float(v) for v in np.asarray(state.handle.get_world_pose()[0]).reshape(-1)]
+                except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+                    return {
+                        "status": "error",
+                        "content": [
+                            {"text": f"apply_force: could not read '{body_name}' pose to fold the lever arm ({e})."}
+                        ],
+                    }
+                lever = np.asarray(point, dtype=float) - np.asarray(com, dtype=float)
+                t_vec = [float(v) for v in (np.asarray(t_vec) + np.cross(lever, np.asarray(f_vec)))]
+
+            if not any(f_vec) and not any(t_vec):
+                self._applied_wrenches.pop(body_name, None)
+                return {
+                    "status": "success",
+                    "content": [{"text": f"apply_force: cleared the latched wrench on '{body_name}'."}],
+                }
+
+            try:
+                from pxr import PhysicsSchemaTools  # type: ignore[import-not-found]
+
+                body_int = PhysicsSchemaTools.sdfPathToInt(state.prim_path)
+            except ImportError as e:
+                return {
+                    "status": "error",
+                    "content": [{"text": f"apply_force: the PhysX interface is not importable ({e})."}],
+                }
+            self._applied_wrenches[body_name] = (f_vec, t_vec, int(body_int))
+            return {
+                "status": "success",
+                "content": [
+                    {
+                        "text": (
+                            f"apply_force: latched force={f_vec} N, torque={t_vec} N*m on '{body_name}' "
+                            f"(applied every step until replaced; force=[0,0,0] stops it, reset() clears all)."
+                        ),
+                        "json": {"body": body_name, "force": f_vec, "torque": t_vec},
+                    }
+                ],
+            }
+
+    def _reapply_wrenches(self) -> None:
+        """Replay every latched wrench into PhysX for the next tick.
+
+        Called from the step loop with ``self._lock`` held, once per physics
+        tick, because ``apply_force_at_pos`` acts for one step. The force is
+        applied at the body's CURRENT position (the latched torque already
+        carries any lever-arm fold from call time). A body whose reapply fails
+        - deleted prim, torn-down stage - has its latch dropped with an ERROR
+        log naming it: reapplying a failing wrench every tick would flood the
+        log, and keeping a latch that no longer acts would be a silent lie.
+        """
+        try:
+            import omni.usd  # type: ignore[import-not-found]
+            from omni.physx import get_physx_simulation_interface  # type: ignore[import-not-found]
+        except ImportError:
+            return
+        physx = get_physx_simulation_interface()
+        stage_id = omni.usd.get_context().get_stage_id()
+        for name in list(self._applied_wrenches):
+            f_vec, t_vec, body_int = self._applied_wrenches[name]
+            state = self._objects[name] if registered(self._objects, name) else None
+            try:
+                if any(f_vec):
+                    pos: tuple[float, ...] = (0.0, 0.0, 0.0)
+                    if state is not None and state.handle is not None:
+                        pos = tuple(float(v) for v in np.asarray(state.handle.get_world_pose()[0]).reshape(-1))
+                    physx.apply_force_at_pos(stage_id, body_int, tuple(f_vec), pos)
+                if any(t_vec):
+                    # Negated: measured on isaacsim 6.0.1, this binding spins a
+                    # body OPPOSITE to the right-handed world torque it is
+                    # handed - +0.3 z gave wz = -0.458 rad/s and -0.3 z gave
+                    # wz = +0.538, a clean mirror in both directions from rest.
+                    # The cross-backend contract (MuJoCo's xfrc_applied) is
+                    # right-handed world-frame, so the flip is applied here,
+                    # once, at the boundary to the binding that disagrees.
+                    physx.apply_torque(stage_id, body_int, tuple(-v for v in t_vec))
+            except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+                del self._applied_wrenches[name]
+                logger.error("apply_force: dropping the latched wrench on '%s' - reapply failed: %s", name, e)
+
+    def raycast(
+        self,
+        origin: list[float],
+        direction: list[float],
+        exclude_body: int = -1,
+        include_static: bool = True,
+    ) -> dict[str, Any]:
+        """Cast a ray and report the first hit, in the MuJoCo payload shape.
+
+        ``{"hit", "distance", "geom_id", "geom_name", "hit_point"}`` plus
+        ``collision_path``. ``geom_id`` is always ``None`` here: PhysX
+        addresses colliders by prim path, not by compiled-model id, and
+        inventing a number would invite cross-backend comparisons of ids that
+        mean nothing. ``geom_name`` is the registered object name when the hit
+        prim belongs to one, else the prim path's leaf.
+
+        ``exclude_body`` exists for signature parity with the MuJoCo backend,
+        where it is a compiled-model body id; this backend has no body ids, so
+        only the default ``-1`` (exclude nothing) is accepted and any other
+        value is refused with this explanation rather than silently ignored.
+
+        ``include_static=False`` skips hits whose prim carries no
+        ``UsdPhysics.RigidBodyAPI`` (the ground plane, a wall, a static
+        object) by re-casting past them, so a clearance check can ask about
+        the movable scene only - the MuJoCo semantics for the same flag.
+
+        Returns:
+            The standard envelope; ``status="error"`` for no world, a
+            malformed vector, a zero-length direction, a non-boolean
+            ``include_static``, or a non-default ``exclude_body``.
+        """
+        with self._lock:
+            if not self._world_created or self._world is None:
+                return {"status": "error", "content": [{"text": "No world. Call create_world (or load_scene) first."}]}
+            origin_v, o_err = coerce_pose_vector("raycast", "origin", origin, 3)
+            if o_err is not None or origin_v is None:
+                return {"status": "error", "content": [{"text": o_err or "raycast: 'origin' is required."}]}
+            direction_v, d_err = coerce_pose_vector("raycast", "direction", direction, 3)
+            if d_err is not None or direction_v is None:
+                return {"status": "error", "content": [{"text": d_err or "raycast: 'direction' is required."}]}
+            if text := boolean_flag_error(include_static, "include_static", "raycast"):
+                return {"status": "error", "content": [{"text": text}]}
+            if not isinstance(exclude_body, int) or isinstance(exclude_body, bool) or exclude_body != -1:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                f"raycast: exclude_body={exclude_body!r} is not supported on the Isaac "
+                                "backend - it is a MuJoCo compiled-model body id and PhysX addresses "
+                                "colliders by prim path. Pass the default -1, and filter the reported "
+                                "geom_name / collision_path instead."
+                            )
+                        }
+                    ],
+                }
+            norm = float(np.linalg.norm(np.asarray(direction_v, dtype=float)))
+            if norm < 1e-12:
+                return {
+                    "status": "error",
+                    "content": [{"text": "raycast: 'direction' vector is zero-length - supply a non-zero direction."}],
+                }
+            unit = [float(v) / norm for v in direction_v]
+
+            try:
+                import omni.usd  # type: ignore[import-not-found]
+                from omni.physx import get_physx_scene_query_interface  # type: ignore[import-not-found]
+            except ImportError as e:
+                return {
+                    "status": "error",
+                    "content": [{"text": f"raycast: the PhysX scene-query interface is not importable ({e})."}],
+                }
+            query = get_physx_scene_query_interface()
+            path_to_name = {st.prim_path: n for n, st in self._objects.items()}
+
+            def _is_static(prim_path: str) -> bool:
+                try:
+                    from pxr import UsdPhysics  # type: ignore[import-not-found]
+
+                    prim = omni.usd.get_context().get_stage().GetPrimAtPath(prim_path)
+                    return not (prim and prim.IsValid() and prim.HasAPI(UsdPhysics.RigidBodyAPI))
+                except (ImportError, AttributeError, TypeError):
+                    return False
+
+            start = [float(v) for v in origin_v]
+            travelled = 0.0
+            hit_info: dict[str, Any] | None = None
+            # Bounded re-cast past static hits when the caller asked for the
+            # movable scene only; 16 hops covers any real scene and prevents a
+            # pathological stack of coplanar static colliders from looping.
+            for _ in range(16):
+                result = query.raycast_closest(tuple(start), tuple(unit), 1.0e6)
+                if not result or not result.get("hit"):
+                    break
+                rigid = str(result.get("rigidBody") or result.get("collision") or "")
+                distance = float(result.get("distance", 0.0))
+                if include_static or not _is_static(rigid):
+                    hit_info = {"result": result, "distance": travelled + distance}
+                    break
+                travelled += distance + 1.0e-4
+                start = [s + u * (distance + 1.0e-4) for s, u in zip(start, unit)]
+
+        if hit_info is None:
+            payload: dict[str, Any] = {
+                "hit": False,
+                "distance": None,
+                "geom_id": None,
+                "geom_name": None,
+                "hit_point": None,
+            }
+            return {"status": "success", "content": [{"text": "No hit."}, {"json": payload}]}
+        result = hit_info["result"]
+        collision = str(result.get("collision") or result.get("rigidBody") or "")
+        name = path_to_name.get(collision, collision.rsplit("/", 1)[-1] or collision)
+        hit_point = [float(v) for v in result.get("position", (0.0, 0.0, 0.0))]
+        payload = {  # type: ignore[no-redef]
+            "hit": True,
+            "distance": float(hit_info["distance"]),
+            "geom_id": None,
+            "geom_name": name,
+            "hit_point": hit_point,
+            "collision_path": collision,
+        }
+        return {
+            "status": "success",
+            "content": [
+                {"text": f"Hit '{name}' at {hit_point} (distance {payload['distance']:.4f} m)."},
+                {"json": payload},
+            ],
+        }
 
     def physics_timestep(self) -> float | None:
         """Return the fixed physics integration timestep in seconds.
