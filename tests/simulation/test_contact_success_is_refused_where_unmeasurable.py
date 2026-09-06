@@ -180,11 +180,18 @@ class TestThePredicatesSayWhyTheyAnswerFalse:
 
 
 class TestTheShippedBackendsAdvertiseHonestly:
-    def test_isaac_no_longer_advertises_the_stubs(self) -> None:
+    def test_isaac_advertises_exactly_what_it_overrides(self) -> None:
+        """Derived from the override state rather than a snapshot of Isaac's
+        capability set: at the time this gate landed, Isaac inherited the
+        randomize / set_obs_noise / get_contacts stubs and had to stop
+        advertising them - and sibling branches then IMPLEMENTED those very
+        methods, which is precisely when a hardcoded "Isaac does not advertise
+        X" assertion turns a correct advertisement into a red test. What is
+        actually owed is the equivalence: advertised iff overridden."""
         pytest.importorskip("strands_robots.simulation.isaac")
-        from strands_robots.simulation.isaac.simulation import IsaacConfig, IsaacSimulation
-
         import threading
+
+        from strands_robots.simulation.isaac.simulation import IsaacConfig, IsaacSimulation
 
         engine = IsaacSimulation.__new__(IsaacSimulation)
         engine._lock = threading.RLock()
@@ -193,9 +200,14 @@ class TestTheShippedBackendsAdvertiseHonestly:
         engine._config = IsaacConfig()
         engine._world_created = False
         methods = engine.describe()["methods"]
-        for stub in ("randomize", "set_obs_noise", "get_contacts"):
-            assert stub not in methods, f"Isaac advertises {stub!r}, whose call raises NotImplementedError"
-        # load_scene is genuinely implemented there and must survive the gate.
+        for name in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
+            overridden = getattr(IsaacSimulation, name) is not getattr(SimEngine, name)
+            assert (name in methods) == overridden, (
+                f"{name!r}: advertised={name in methods} but overridden={overridden} - "
+                f"describe() must advertise exactly the capabilities whose calls do not raise"
+            )
+        # load_scene is genuinely implemented there, so the equivalence is not
+        # vacuously satisfied by four absences.
         assert "load_scene" in methods
 
     @pytest.mark.skipif(
