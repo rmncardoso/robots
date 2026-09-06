@@ -1254,6 +1254,20 @@ class SimEngine(ABC):
               keyed by the *short* joint name (e.g. ``"shoulder_pan"``).
               The schema is stable regardless of multi-robot namespacing
               at the physics-engine level.
+            - ``"<joint_name>.vel"`` (float): The same joint's velocity
+              (rad/s or m/s), one entry per scalar joint, additive beside the
+              position key so position-only consumers are unaffected.
+              Velocity-feedback controllers (WBC's balance loop, the
+              microduck and ProtoMotions observation packers, an RL env with
+              ``.vel`` in its ``actor_obs_keys``) read these to close the
+              loop; a backend that omits them feeds those consumers zeros or
+              a ``KeyError`` while the identical policy works elsewhere,
+              which is exactly the portability break this schema exists to
+              prevent. This entry was previously undocumented here and lived
+              only in the MuJoCo implementation, which is how two backends
+              shipped without it. A free-joint (floating) base is NOT a
+              scalar joint and reports its twist via ``base_lin_vel`` /
+              ``base_ang_vel`` below, never as ``"<name>.vel"``.
             - ``"<camera_name>"`` (np.ndarray): One RGB uint8 frame per
               camera associated with the robot, keyed by camera name.
               Shape ``(H, W, 3)``. A key MUST carry the view of the camera it
