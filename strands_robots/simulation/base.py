@@ -4932,149 +4932,164 @@ class SimEngine(ABC):
         Returns:
             Plain dict with keys: robots, cameras, methods, note.
         """
+        methods: dict[str, str] = {
+            "get_robot_state": "(robot_name: str) -> dict",
+            "get_observation": "(robot_name: str | None = None, *, skip_images: bool = False) -> dict",
+            "send_action": (
+                "(action: dict, robot_name: str | None = None, n_substeps: int = 1) -> dict"
+                "  # n_substeps must be a positive whole number; use step() to advance without commanding"
+            ),
+            "add_robot": (
+                "(name: str, urdf_path=None, data_config=None, position=None, "
+                "orientation=None) -> dict  # add a robot to the scene by "
+                "registry name (or urdf_path); the first scene-construction step. "
+                "position OFFSETS the model's own authored root pose (a locomotion "
+                "model is authored standing), so it is the world position only for "
+                "a model whose root declares pos 0 0 0; the result reports the "
+                "measured placement"
+            ),
+            "add_object": (
+                "(name: str, shape='box', position=None, orientation=None, "
+                "size=None, color=None, mass=0.1, is_static=None, mesh_path=None, "
+                "material=None) -> dict  # add a manipulable object "
+                "(cube/sphere/.../mesh) to the scene. material is an optional "
+                "dict for matte/textured surfaces: keys reflectance|specular|"
+                "shininess (0..1), texture (abs image path) OR builtin "
+                "(checker|gradient|flat) + rgb1/rgb2/texdim, texrepeat [u,v]; "
+                "any other key (or an empty dict) is rejected, never ignored"
+            ),
+            "remove_object": "(name: str) -> dict  # remove a previously added object",
+            "remove_robot": (
+                "(name: str) -> dict  # remove a robot (and every scene "
+                "element it introduced) from the world; the inverse of "
+                "add_robot, completing the add/remove pair alongside "
+                "remove_object"
+            ),
+            "run_policy": (
+                "(robot_name: str, policy_provider='mock', n_episodes=1, "
+                "reset_between=True, stop_when=None, ...) -> dict  # "
+                "stop_when: optional semantic early-return clause in the "
+                "benchmark success: predicate DSL - a single "
+                "{'predicate': <name>, ...} call or an {'all'/'any': "
+                "[...]} group - checked against the sim after every "
+                "applied action so the rollout ends as soon as the world "
+                "reaches the state; the result json reports "
+                "stopped_reason ('predicate'|'budget'|'cancelled'; "
+                "'error' on failures) + steps_used so a caller can decide "
+                "whether to retry"
+            ),
+            "start_policy": "(robot_name: str, policy_provider='mock', ...) -> dict",
+            "eval_policy": (
+                "(robot_name: str, policy_provider='mock', n_episodes=1, "
+                "max_steps=300, success_fn=None, ...) -> dict  # multi-episode "
+                "success-rate evaluation (the rollout sibling of run_policy)"
+            ),
+            "evaluate_benchmark": (
+                "(benchmark_name: str, robot_name=None, policy_provider='mock', "
+                "n_episodes=1, seed=None, video=None, ...) -> dict  # score a "
+                "registered benchmark's success/failure/dense-reward DSL over a "
+                "rollout (max_steps comes from the benchmark, not a parameter); "
+                "the DSL-scored sibling of eval_policy's success_fn"
+            ),
+            "list_benchmarks": (
+                "() -> dict  # enumerate registered benchmarks (names, "
+                "supported robots, default robot, max_steps) - the source of the "
+                "benchmark_name evaluate_benchmark expects"
+            ),
+            "register_benchmark_from_file": (
+                "(benchmark_name: str, spec_path: str) -> dict  # author a "
+                "declarative benchmark (success/failure/dense_reward predicate "
+                "DSL) as YAML/JSON at runtime and register it under benchmark_name"
+            ),
+            "register_builtin_benchmarks": (
+                "() -> dict  # register the shipped built-in velocity-tracking "
+                "locomotion benchmarks - the go2_walk_forward quadruped task and "
+                "the g1_walk_forward / t1_walk_forward humanoid tasks - so they "
+                "appear in list_benchmarks and can be run via evaluate_benchmark"
+            ),
+            "replay_episode": (
+                "(repo_id: str, robot_name=None, episode=0, root=None, "
+                "speed=1.0, action_key_map=None) -> dict  # replay a recorded "
+                "LeRobotDataset episode through the sim; action_key_map needs "
+                "one unique key per recorded action index (default: "
+                "robot_action_keys) and status='success' means every frame "
+                "reached the actuators"
+            ),
+            "list_robots": "() -> list[str]",
+            "get_features": (
+                "(robot_name: str | None = None) -> dict  # joint / "
+                "actuator / camera / robot names of the scene (scoped to "
+                "one robot when robot_name is given) - the source of truth "
+                "for the action keys a policy must emit; consult it when "
+                "run_policy reports unresolved keys"
+            ),
+            "render": "(camera_name='default', width=None, height=None) -> dict",
+            "create_world": (
+                "(timestep=None, gravity=None, ground_plane=True, terrain=None, "
+                "difficulty=1.0) -> dict  # create a fresh simulation world - the "
+                "world-lifecycle entry point that precedes add_robot / add_object. "
+                "gravity is [gx, gy, gz]; ground_plane lays a floor; terrain lays a "
+                "deterministic locomotion heightfield instead of the flat plane "
+                "('rough' value-noise bumps, 'stairs' step plateaus rising +x, "
+                "'pyramid' concentric steps rising to the centre, 'slope' a "
+                "constant-grade ramp); difficulty (finite, > 0; 1.0 = full height) "
+                "scales the terrain peak elevation for a curriculum without changing "
+                "the terrain kind. Backends without heightfield support reject a "
+                "non-None terrain rather than ignoring it"
+            ),
+            "destroy": (
+                "() -> dict  # tear down the world and release all resources "
+                "(joins any running background policy first); the inverse of "
+                "create_world, called at session end"
+            ),
+            "reset": "() -> dict  # during recording, flushes the buffered rollout as one episode before resetting",
+            "step": "(n_steps: int = 1) -> dict",
+            "get_state": (
+                "() -> dict  # snapshot of the live world: sim time, step "
+                "count, timestep, gravity, and robot / object / camera / "
+                "body / joint / actuator counts (the whole-world sibling of "
+                "get_robot_state / get_observation)"
+            ),
+            "load_scene": (
+                "(scene_path: str) -> dict  # load a complete scene from "
+                "an MJCF/URDF file; the alternative scene-construction "
+                "entry point to building it up with add_robot / add_object"
+            ),
+            "randomize": (
+                "(**kwargs) -> dict  # domain randomization (colors, "
+                "lighting, physics, positions); each backend defines its "
+                "own opt-in axes - see the backend describe() for the "
+                "concrete signature"
+            ),
+            "set_obs_noise": (
+                "(**kwargs) -> dict  # configure additive Gaussian sensor "
+                "noise on joint observations and rendered frames so a "
+                "policy is not evaluated on noise-free observations"
+            ),
+            "get_contacts": (
+                "() -> dict  # active contacts at the current step - the "
+                "physics-grounding read used to verify a grasp or detect "
+                "a collision instead of trusting a rendered caption"
+            ),
+        }
+        # A capability this base class owns only as a raising stub is advertised
+        # only where the subclass actually overrides it. ``describe()`` is the
+        # discovery surface an agent reads to decide what to call, so an entry
+        # for a method whose body is ``raise NotImplementedError`` is a false
+        # advertisement: the Isaac backend re-published all three of these for
+        # months, and the Newton backend only avoided it by building its
+        # ``describe()`` from scratch - a per-backend workaround for a base-class
+        # defect. Gated structurally (is the attribute still the base's?) rather
+        # than by a hand-kept list of which backend has what, so a backend that
+        # gains one of these starts advertising it with no second edit, and a
+        # fourth backend is held to the rule on arrival.
+        for optional in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
+            if getattr(type(self), optional, None) is getattr(SimEngine, optional):
+                methods.pop(optional, None)
         return {
             "robots": self.list_robots(),
             "cameras": [],  # backends override to list camera names
-            "methods": {
-                "get_robot_state": "(robot_name: str) -> dict",
-                "get_observation": "(robot_name: str | None = None, *, skip_images: bool = False) -> dict",
-                "send_action": (
-                    "(action: dict, robot_name: str | None = None, n_substeps: int = 1) -> dict"
-                    "  # n_substeps must be a positive whole number; use step() to advance without commanding"
-                ),
-                "add_robot": (
-                    "(name: str, urdf_path=None, data_config=None, position=None, "
-                    "orientation=None) -> dict  # add a robot to the scene by "
-                    "registry name (or urdf_path); the first scene-construction step. "
-                    "position OFFSETS the model's own authored root pose (a locomotion "
-                    "model is authored standing), so it is the world position only for "
-                    "a model whose root declares pos 0 0 0; the result reports the "
-                    "measured placement"
-                ),
-                "add_object": (
-                    "(name: str, shape='box', position=None, orientation=None, "
-                    "size=None, color=None, mass=0.1, is_static=None, mesh_path=None, "
-                    "material=None) -> dict  # add a manipulable object "
-                    "(cube/sphere/.../mesh) to the scene. material is an optional "
-                    "dict for matte/textured surfaces: keys reflectance|specular|"
-                    "shininess (0..1), texture (abs image path) OR builtin "
-                    "(checker|gradient|flat) + rgb1/rgb2/texdim, texrepeat [u,v]; "
-                    "any other key (or an empty dict) is rejected, never ignored"
-                ),
-                "remove_object": "(name: str) -> dict  # remove a previously added object",
-                "remove_robot": (
-                    "(name: str) -> dict  # remove a robot (and every scene "
-                    "element it introduced) from the world; the inverse of "
-                    "add_robot, completing the add/remove pair alongside "
-                    "remove_object"
-                ),
-                "run_policy": (
-                    "(robot_name: str, policy_provider='mock', n_episodes=1, "
-                    "reset_between=True, stop_when=None, ...) -> dict  # "
-                    "stop_when: optional semantic early-return clause in the "
-                    "benchmark success: predicate DSL - a single "
-                    "{'predicate': <name>, ...} call or an {'all'/'any': "
-                    "[...]} group - checked against the sim after every "
-                    "applied action so the rollout ends as soon as the world "
-                    "reaches the state; the result json reports "
-                    "stopped_reason ('predicate'|'budget'|'cancelled'; "
-                    "'error' on failures) + steps_used so a caller can decide "
-                    "whether to retry"
-                ),
-                "start_policy": "(robot_name: str, policy_provider='mock', ...) -> dict",
-                "eval_policy": (
-                    "(robot_name: str, policy_provider='mock', n_episodes=1, "
-                    "max_steps=300, success_fn=None, ...) -> dict  # multi-episode "
-                    "success-rate evaluation (the rollout sibling of run_policy)"
-                ),
-                "evaluate_benchmark": (
-                    "(benchmark_name: str, robot_name=None, policy_provider='mock', "
-                    "n_episodes=1, seed=None, video=None, ...) -> dict  # score a "
-                    "registered benchmark's success/failure/dense-reward DSL over a "
-                    "rollout (max_steps comes from the benchmark, not a parameter); "
-                    "the DSL-scored sibling of eval_policy's success_fn"
-                ),
-                "list_benchmarks": (
-                    "() -> dict  # enumerate registered benchmarks (names, "
-                    "supported robots, default robot, max_steps) - the source of the "
-                    "benchmark_name evaluate_benchmark expects"
-                ),
-                "register_benchmark_from_file": (
-                    "(benchmark_name: str, spec_path: str) -> dict  # author a "
-                    "declarative benchmark (success/failure/dense_reward predicate "
-                    "DSL) as YAML/JSON at runtime and register it under benchmark_name"
-                ),
-                "register_builtin_benchmarks": (
-                    "() -> dict  # register the shipped built-in velocity-tracking "
-                    "locomotion benchmarks - the go2_walk_forward quadruped task and "
-                    "the g1_walk_forward / t1_walk_forward humanoid tasks - so they "
-                    "appear in list_benchmarks and can be run via evaluate_benchmark"
-                ),
-                "replay_episode": (
-                    "(repo_id: str, robot_name=None, episode=0, root=None, "
-                    "speed=1.0, action_key_map=None) -> dict  # replay a recorded "
-                    "LeRobotDataset episode through the sim; action_key_map needs "
-                    "one unique key per recorded action index (default: "
-                    "robot_action_keys) and status='success' means every frame "
-                    "reached the actuators"
-                ),
-                "list_robots": "() -> list[str]",
-                "get_features": (
-                    "(robot_name: str | None = None) -> dict  # joint / "
-                    "actuator / camera / robot names of the scene (scoped to "
-                    "one robot when robot_name is given) - the source of truth "
-                    "for the action keys a policy must emit; consult it when "
-                    "run_policy reports unresolved keys"
-                ),
-                "render": "(camera_name='default', width=None, height=None) -> dict",
-                "create_world": (
-                    "(timestep=None, gravity=None, ground_plane=True, terrain=None, "
-                    "difficulty=1.0) -> dict  # create a fresh simulation world - the "
-                    "world-lifecycle entry point that precedes add_robot / add_object. "
-                    "gravity is [gx, gy, gz]; ground_plane lays a floor; terrain lays a "
-                    "deterministic locomotion heightfield instead of the flat plane "
-                    "('rough' value-noise bumps, 'stairs' step plateaus rising +x, "
-                    "'pyramid' concentric steps rising to the centre, 'slope' a "
-                    "constant-grade ramp); difficulty (finite, > 0; 1.0 = full height) "
-                    "scales the terrain peak elevation for a curriculum without changing "
-                    "the terrain kind. Backends without heightfield support reject a "
-                    "non-None terrain rather than ignoring it"
-                ),
-                "destroy": (
-                    "() -> dict  # tear down the world and release all resources "
-                    "(joins any running background policy first); the inverse of "
-                    "create_world, called at session end"
-                ),
-                "reset": "() -> dict  # during recording, flushes the buffered rollout as one episode before resetting",
-                "step": "(n_steps: int = 1) -> dict",
-                "get_state": (
-                    "() -> dict  # snapshot of the live world: sim time, step "
-                    "count, timestep, gravity, and robot / object / camera / "
-                    "body / joint / actuator counts (the whole-world sibling of "
-                    "get_robot_state / get_observation)"
-                ),
-                "load_scene": (
-                    "(scene_path: str) -> dict  # load a complete scene from "
-                    "an MJCF/URDF file; the alternative scene-construction "
-                    "entry point to building it up with add_robot / add_object"
-                ),
-                "randomize": (
-                    "(**kwargs) -> dict  # domain randomization (colors, "
-                    "lighting, physics, positions); each backend defines its "
-                    "own opt-in axes - see the backend describe() for the "
-                    "concrete signature"
-                ),
-                "set_obs_noise": (
-                    "(**kwargs) -> dict  # configure additive Gaussian sensor "
-                    "noise on joint observations and rendered frames so a "
-                    "policy is not evaluated on noise-free observations"
-                ),
-                "get_contacts": (
-                    "() -> dict  # active contacts at the current step - the "
-                    "physics-grounding read used to verify a grasp or detect "
-                    "a collision instead of trusting a rendered caption"
-                ),
-            },
+            "methods": methods,
             "note": (
                 "robot_name defaults to the sole robot when only one exists "
                 "for get_observation, send_action, get_robot_state, run_policy, "
