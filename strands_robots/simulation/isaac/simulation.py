@@ -41,6 +41,7 @@ from strands_robots.simulation.base import SimEngine, unknown_kwargs_error
 from strands_robots.simulation.isaac.config import IsaacConfig
 from strands_robots.simulation.isaac.joint_names import demangle_usd_joint_names, urdf_joint_names
 from strands_robots.simulation.isaac.motion_primitives import IsaacMotionPrimitivesMixin
+from strands_robots.simulation.isaac.randomization import IsaacRandomizationMixin
 from strands_robots.simulation.isaac.recording import IsaacRecordingMixin
 from strands_robots.simulation.models import registered, registry_entry
 from strands_robots.simulation.recording import undriven_robot_state
@@ -716,7 +717,7 @@ class _ObjectState:
         self.handle = handle
 
 
-class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine):
+class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, IsaacRecordingMixin, SimEngine):
     """GPU-native simulation backend built on NVIDIA Isaac Sim.
 
     Implements the ``SimEngine`` ABC. Provides photorealistic rendering,
@@ -805,6 +806,12 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         self._num_envs_active = 1
         self._sim_time = 0.0
         self._step_count = 0
+
+        # Domain randomization + sensor noise (IsaacRandomizationMixin).
+        # _dr_base holds the first-touch snapshots the axes measure from.
+        self._dr_base: dict[tuple[str, str], Any] = {}
+        self._obs_noise: dict[str, float] | None = None
+        self._obs_noise_rng: Any = None
 
         # Entity tracking
         self._robots: dict[str, _RobotState] = {}
@@ -3560,7 +3567,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     except (RuntimeError, ValueError, AttributeError, TypeError, IndexError) as e:
                         logger.debug("camera %r frame unavailable: %s", cam_name, e)
 
-            return obs
+            # Sensor noise last, over the assembled dict, so the pass sees the
+            # same shapes MuJoCo's does: position floats, ``.vel`` floats,
+            # camera frames. A no-op unless set_obs_noise configured some.
+            return self._apply_obs_noise(obs)
 
     def physics_timestep(self) -> float | None:
         """Return the fixed physics integration timestep in seconds.
