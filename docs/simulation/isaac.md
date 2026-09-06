@@ -249,8 +249,11 @@ open a window.
   camera prims are parented to the stage camera scope rather than to an
   articulation link.
 - **Loaders** - `load_urdf` / `load_mjcf` / `load_usd` resolve to a
-  `ProceduralRobot` dataclass. Both XML loaders report each link's pose in its
-  parent's frame. `load_mjcf` reads the rotation from whichever of MJCF's five
+  `ProceduralRobot` dataclass. These are the **description-introspection** API -
+  parse a robot file into a joints/bodies report, for tooling and for the
+  cross-backend parity tests - not the load path: `add_robot` builds
+  articulations through Isaac's own importers and does not call them. Both XML
+  loaders report each link's pose in its parent's frame. `load_mjcf` reads the rotation from whichever of MJCF's five
   spellings the body uses - `quat`, `euler`, `axisangle`, `xyaxes` or `zaxis` -
   under the model-global `<compiler angle>` and `<compiler eulerseq>`. The
   reported orientation is always a unit quaternion, the one MuJoCo's compiler
