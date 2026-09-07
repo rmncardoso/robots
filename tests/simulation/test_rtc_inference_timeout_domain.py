@@ -313,6 +313,10 @@ class TestEveryPublicSurfaceOwnsTheDomain:
         assert found == {
             "base.py": ["SimEngine.run_policy", "SimEngine.eval_policy"],
             "mujoco/simulation.py": ["MuJoCoSimEngine.run_policy"],
+            # Isaac's run_policy override (added to lower ``policy_running`` on
+            # exit) spells the shared parameter list out rather than taking
+            # ``**kwargs``, so it takes this deadline too and forwards it.
+            "isaac/simulation.py": ["IsaacSimulation.run_policy"],
             "policy_runner.py": ["PolicyRunner.run", "PolicyRunner.evaluate"],
         }, found
 

@@ -143,6 +143,24 @@ def main() -> None:
     )
     sim.apply_force("pushed", force=[0.0, 0.0, 0.0])
 
+    # policy_running gates move_to / rotate_wrist / set_gripper, because a
+    # primitive and the policy loop would race on the articulation's PD targets.
+    # The recording hook raises it and, before run_policy grew its finally,
+    # nothing on this path lowered it - so one rollout refused every later
+    # primitive on that robot for good. Driven here with the real rollout.
+    robot = sim._robots["arm"]
+    roll = sim.run_policy("arm", policy_provider="mock", n_steps=8, control_frequency=20.0)
+    print(f"  run_policy -> {roll.get('status')}: {str(roll)[:160]}", flush=True)
+    check("run_policy completes", roll.get("status") == "success", str(roll)[:160])
+    print(f"  policy_running after the rollout: {robot.policy_running}", flush=True)
+    check("run_policy releases the robot", robot.policy_running is False, f"policy_running={robot.policy_running}")
+    _n, _r, guard_err = sim._primitive_resolve_robot("move_to", "arm")
+    check(
+        "a primitive is allowed after the rollout",
+        guard_err is None,
+        "" if guard_err is None else " ".join(b.get("text", "") for b in guard_err["content"])[:150],
+    )
+
     sim.destroy()
 
 
