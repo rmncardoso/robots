@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import types
 from typing import Any
 
@@ -64,6 +65,23 @@ class _SlowArticulation:
         return [0.0]
 
 
+class _MutatingArticulation:
+    """Runs a callback from inside the joint read - i.e. inside the walk itself."""
+
+    def __init__(self, on_read) -> None:
+        self._on_read = on_read
+
+    def get_joint_positions(self) -> list[float]:
+        self._on_read()
+        return [0.0]
+
+    def set_joint_positions(self, arr: Any) -> None:
+        return None
+
+    def set_joint_velocities(self, arr: Any) -> None:
+        return None
+
+
 class _Camera:
     def __init__(self) -> None:
         self.handle = object()
@@ -83,7 +101,11 @@ def _engine(*, cameras: bool = False) -> Any:
     engine._pump_cameras = cameras
     engine._idle_converge = 1
     engine._converge_render = lambda n: None
-    engine._grab_frame = lambda name, handle: None
+    # The frame grab must take real time, or the camera walk finishes before any
+    # mutation can land and the camera tests pass with the snapshot REMOVED -
+    # measured: 15/15 either way with an instant stub. The robot walk races only
+    # because _SlowArticulation sleeps; the camera walk needs the same.
+    engine._grab_frame = lambda name, handle: (time.sleep(0.002), None)[1]
     for i in range(_ROBOT_COUNT):
         engine._robots[f"r{i}"] = types.SimpleNamespace(articulation=_SlowArticulation(), joint_names=["j"])
         if cameras:
@@ -143,16 +165,132 @@ class TestAWorkerMayAddARobotMidPump:
 
 
 class TestAWorkerMayAddACameraMidPump:
-    """The second walk, which is reached only on the idle render path."""
+    """The second walk, reached on the idle render path.
 
-    @pytest.mark.parametrize("trial", range(4))
-    def test_pump_does_not_raise(self, trial: int) -> None:
+    The mutation is triggered from INSIDE the frame grab rather than from a timed
+    worker thread. A timed thread cannot reach this walk: pump() does the robot
+    walk first, and with 200 slow articulations that takes ~400 ms, so a mutator
+    sleeping 10 ms has finished long before the camera loop starts. Measured, that
+    made the whole class pass with the camera snapshot REMOVED - it advertised a
+    pin it did not hold. Mutating from the grab callback lands the change during
+    the iteration by construction, with no timing assumption at all.
+    """
+
+    def _engine_mutating_during_the_camera_walk(self) -> Any:
         engine = _engine(cameras=True)
-        thread = _mutate_after(engine, "_cameras", _Camera)
-        try:
-            engine.pump(render=True)
-        finally:
-            thread.join()
+        # One robot, so the robot walk does not dominate the run.
+        engine._robots = {"r0": types.SimpleNamespace(articulation=_SlowArticulation(0.0), joint_names=["j"])}
+        added = {"done": False}
+
+        def _grab(name: str, handle: Any) -> Any:
+            if not added["done"]:
+                added["done"] = True
+                for i in range(20):
+                    engine._cameras[f"late{i}"] = _Camera()
+            return None
+
+        engine._grab_frame = _grab
+        return engine
+
+    def test_pump_does_not_raise(self) -> None:
+        engine = self._engine_mutating_during_the_camera_walk()
+
+        engine.pump(render=True)
+
+    def test_the_mutation_really_happened(self) -> None:
+        """Otherwise the test above passes because nothing was added at all."""
+        engine = self._engine_mutating_during_the_camera_walk()
+        before = len(engine._cameras)
+
+        engine.pump(render=True)
+
+        assert len(engine._cameras) == before + 20
+
+    def test_a_removal_during_the_camera_walk_does_not_raise(self) -> None:
+        engine = _engine(cameras=True)
+        engine._robots = {"r0": types.SimpleNamespace(articulation=_SlowArticulation(0.0), joint_names=["j"])}
+        removed = {"done": False}
+
+        def _grab(name: str, handle: Any) -> Any:
+            if not removed["done"]:
+                removed["done"] = True
+                for i in range(_ROBOT_COUNT // 2):
+                    engine._cameras.pop(f"c{i}", None)
+            return None
+
+        engine._grab_frame = _grab
+
+        engine.pump(render=True)
+
+
+class TestTheConvergeRenderWalkIsSnapshottedToo:
+    """pump() calls ``_converge_render`` at step 2, and it walks ``_robots`` too.
+
+    This is the walk a snapshot added only inside ``pump`` misses: it sits two
+    lines ABOVE the loops that were fixed, in a helper, on the idle preview path
+    ``run_pump_forever`` takes by default. The class above stubs
+    ``_converge_render`` to a no-op - correct for testing pump's own loops, and
+    exactly why it cannot see this one - so these drive the REAL helper.
+
+    The mutation is triggered from inside ``world.step``, which
+    ``_converge_render`` calls once per convergence tick, so it lands during the
+    walk by construction rather than by timing.
+    """
+
+    def _engine_mutating_during_converge(self, *, remove: bool = False) -> Any:
+        engine = _engine()
+        engine._converge_render = IsaacSimulation._converge_render.__get__(engine, IsaacSimulation)
+        engine._idle_converge = 4
+        fired = {"done": False}
+
+        def _mutate() -> None:
+            if fired["done"]:
+                return
+            fired["done"] = True
+            if remove:
+                for i in range(_ROBOT_COUNT // 2):
+                    engine._robots.pop(f"r{i}", None)
+            else:
+                for i in range(60):
+                    engine._robots[f"late{i}"] = types.SimpleNamespace(
+                        articulation=_MutatingArticulation(lambda: None), joint_names=["j"]
+                    )
+
+        # Fired from INSIDE the walk, not from world.step. _converge_render's
+        # shape is `for _ in range(n): for r in <registry>: ...; world.step()`,
+        # so a mutation at world.step lands BETWEEN outer iterations - and an
+        # unsnapshotted `self._robots.values()` is a fresh view each iteration,
+        # which never sees a size change mid-walk and never raises. Measured: the
+        # world.step version passed 17/17 with the snapshot removed. The per-robot
+        # read is the only hook actually inside the iteration.
+        first = _MutatingArticulation(_mutate)
+        engine._robots = {"r0": first}
+        engine._robots = {
+            f"r{i}": types.SimpleNamespace(articulation=first if i == 0 else _SlowArticulation(0.0), joint_names=["j"])
+            for i in range(_ROBOT_COUNT)
+        }
+        engine._world = types.SimpleNamespace(step=lambda render=True: None)
+        return engine, fired
+
+    def test_an_add_during_converge_does_not_raise(self) -> None:
+        engine, fired = self._engine_mutating_during_converge()
+
+        engine.pump(render=True)
+
+        assert fired["done"], "world.step never ran, so nothing was mutated mid-walk"
+
+    def test_a_removal_during_converge_does_not_raise(self) -> None:
+        engine, fired = self._engine_mutating_during_converge(remove=True)
+
+        engine.pump(render=True)
+
+        assert fired["done"]
+
+    def test_the_helper_is_the_real_one(self) -> None:
+        """A stub here would make both tests above vacuous."""
+        engine, _ = self._engine_mutating_during_converge()
+
+        assert engine._converge_render.__func__ is IsaacSimulation._converge_render
 
 
 class TestThePumpStillDoesItsWork:
@@ -168,7 +306,7 @@ class TestThePumpStillDoesItsWork:
 
     def test_the_frame_cache_is_populated_on_the_idle_path(self) -> None:
         engine = _engine(cameras=True)
-        engine._grab_frame = lambda name, handle: f"frame-{name}"
+        engine._grab_frame = lambda name, handle: (time.sleep(0.001), f"frame-{name}")[1]
 
         engine.pump(render=True)
 

@@ -7161,7 +7161,12 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 if r is not None and link_name:
                     prim = self._find_robot_link_prim(stage, r, link_name, Sdf, Usd, UsdGeom)
             else:
-                for r in self._robots.values():
+                # Snapshotted: get_body_state runs this INLINE on the calling
+                # thread whenever no pump is engaged, so a worker reading a body
+                # while another thread calls add_robot walked a mutating dict.
+                with self._lock:
+                    robots_snapshot = list(self._robots.values())
+                for r in robots_snapshot:
                     prim = self._find_robot_link_prim(stage, r, body_name, Sdf, Usd, UsdGeom)
                     if prim is not None:
                         break
@@ -7345,8 +7350,17 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         """
         if not self._world_created or self._world is None:
             return
+        # Snapshotted for the same reason as pump()'s own two walks, and this one
+        # is the easier to miss: pump() calls this helper at step 2, on the idle
+        # preview path run_pump_forever takes by default, so a snapshot added
+        # only inside pump() leaves the crash reachable two lines above it.
+        # Taken once outside the convergence loop - re-reading it per iteration
+        # would take the lock n times for a set that a mid-render add cannot
+        # usefully change anyway.
+        with self._lock:
+            robots_snapshot = list(self._robots.values())
         for _ in range(max(1, n)):
-            for r in self._robots.values():
+            for r in robots_snapshot:
                 if r.articulation is None:
                     continue
                 try:
