@@ -186,6 +186,31 @@ def main() -> None:
         # the fix, so it is reported rather than silently passing.
         check("a registry humanoid loads", False, str(r)[:200])
 
+    # The device fix: IsaacConfig.device was validated as CUDA-only, reported as
+    # cuda:0 by every surface, and never passed to World() - whose own default
+    # resolves to 'cpu'. So PhysX solved on the CPU while every report said
+    # otherwise. Read the PHYSICS CONTEXT here, not the config, because reading
+    # the config is exactly what hid it.
+    pc = sim._world.get_physics_context()
+    print(f"  physics_context: device={pc.device!r} gpu_pipeline={pc.use_gpu_pipeline}", flush=True)
+    check("PhysX resolved the configured CUDA device", str(pc.device).startswith("cuda"), f"device={pc.device!r}")
+    check("the GPU physics pipeline is on", bool(pc.use_gpu_pipeline), f"use_gpu_pipeline={pc.use_gpu_pipeline}")
+    st = sim.get_state()["content"][0]["json"]
+    print(f"  get_state: device={st.get('device')!r} requested={st.get('device_requested')!r}", flush=True)
+    check(
+        "get_state reports the resolved device, not the request",
+        st.get("device") == str(pc.device) and st.get("device_requested") is not None,
+        f"device={st.get('device')!r} requested={st.get('device_requested')!r}",
+    )
+
+    # reset(env_ids=...) is refused rather than full-resetting and calling it partial.
+    r = sim.reset(env_ids=[0])
+    check("reset refuses a partial it cannot perform", r.get("status") == "error", str(r)[:140])
+
+    # A registered object whose pose cannot be read is not reported "not found".
+    r = sim.get_body_state("definitely_not_a_body")
+    check("an unknown body still says not found", "not found" in str(r), str(r)[:120])
+
     sim.destroy()
 
 
