@@ -21,7 +21,10 @@ on Python 3.12, or out-of-band (see below).
 - You want USD-native scenes (real CAD assets, Nucleus, IsaacLab compatibility).
 - You want RTX metric depth alongside RGB, for depth-aware compositing
   (`get_frame` returns an `(H, W) float32` buffer in metres).
-- You want fleet RL on PhysX GPU with 1024+ parallel environments.
+- You want to clone a scene into many parallel environments on PhysX GPU - see
+  [Fleet replication](#fleet-replication-isaaclab-style), and note that the
+  per-environment action/observation API is not implemented, so this is not yet
+  fleet RL.
 
 On macOS / Apple Silicon or CPU-only hosts, install the lightweight default
 [`strands-robots`](https://github.com/strands-labs/robots) and use the MuJoCo
@@ -179,7 +182,7 @@ rejected eagerly. The commonly used fields:
 
 | Kwarg | Type | Default | Description |
 |-------|------|---------|-------------|
-| `num_envs` | `int` | `1` | Parallel environments. Set to `1024`+ for fleet RL. A positive integer - the same domain `replicate(num_envs=...)` takes. |
+| `num_envs` | `int` | `1` | Default environment count for `replicate()`, which is what actually clones them. Setting it alone creates nothing. A positive integer - the same domain `replicate(num_envs=...)` takes. |
 | `device` | `str` | `"cuda:0"` | CUDA device (`cuda:N`). Must be a CUDA device. |
 | `headless` | `bool` | `True` | Run without a GUI (required for cloud/CI). |
 | `physics_dt` | `float` | `1/120` | Physics timestep (seconds). Positive and finite - the domain `create_world()` applies to the effective dt, and the one the legacy `IsaacSimulation(default_timestep=...)` shortcut that writes this field takes as well. |
@@ -371,16 +374,53 @@ whose render entry points resolve those tokens to one, so for them it is a
 degradation rather than a mistake. Registering a camera under one of those names
 is accepted here and renders normally, since nothing on this backend routes them.
 
-## Fleet (IsaacLab-style) preview
+## Fleet replication (IsaacLab-style)
+
+`replicate()` clones the scene you have built into a grid of parallel
+environments using Isaac Sim's own `isaacsim.core.cloner.GridCloner`. The scene
+already on the stage is environment 0, so `num_envs` counts it - `replicate(64)`
+produces the source plus 63 clones under `{stage_path}/envs/env_1 .. env_63`:
 
 ```python
-sim = create_simulation("isaac", num_envs=1024, headless=True,
+sim = create_simulation("isaac", num_envs=64, headless=True,
                         render_mode="headless")
 sim.create_world()
 sim.add_robot(name="panda", usd_path="/path/to/franka.usda")
-# ... RL training loop ...
+
+result = sim.replicate(64, spacing=1.5)   # or replicate() to use config.num_envs
+# {"status": "success", ... "Cloned the scene into 64 environments (63 clones of
+#  1 source prim(s) plus the source as env_0, 1197 prims) in 1840ms at 1.50m
+#  spacing on cuda:0. NOTE: get_observation/send_action address env_0 only ..."}
+
 sim.destroy()
 ```
+
+Physics is replicated across every environment and inter-environment collisions
+are filtered, so the clones do not push each other around. The result payload
+reports what was actually built - `clones_created`, `prims_created`,
+`build_time_ms`, `physics_replicated`, `collisions_filtered` - rather than echoing
+the count you passed in.
+
+**What is not implemented: a per-environment observation or action API.**
+`get_observation` and `send_action` address environment 0's robot, which is the
+only one carrying an `Articulation` handle. The clones advance under physics and
+are what a renderer and a domain-randomisation pass see, but they cannot be driven
+or read individually; that needs an articulation view across environments, which
+this backend does not build. The success message says so on every call, so a
+`num_envs: 64` in the payload is not mistaken for 64 drivable robots.
+
+Two boundaries worth knowing. `replicate(1)` is an accepted no-op - the scene is
+already one environment - and deliberately does *not* mark the simulation
+replicated, so `add_robot` keeps working; `replicate(n)` for `n > 1` does mark it,
+and `add_robot` is refused from then on because the clones were built from the
+scene as it stood. And `num_envs` / `spacing` are validated on the shared numeric
+domains, so a negative count or a NaN spacing is refused rather than reported as a
+fleet.
+
+Until recently this method was a stub: it reported
+`"Replicated to N environments. Build time: 0ms."` while calling no cloner at all,
+left the stage untouched, made `get_state()` report the fabricated count, and set
+the flag that refuses `add_robot` - so the no-op also locked you out of the scene.
 
 ## Where to go next
 
