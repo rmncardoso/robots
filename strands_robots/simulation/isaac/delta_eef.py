@@ -84,7 +84,9 @@ def _to_scalar(value: Any, key: str, *, strict: bool, default: float = 0.0) -> f
     * Scalar input -> ``float(value)``
     * Non-empty list / tuple / ndarray -> ``float(value[0])``
     * Unreadable: raises under ``strict``, else ``default`` after a WARNING.
-    * Non-finite: **always** raises, in both modes.
+    * ``NaN``: **always** raises, in both modes.
+    * ``+-inf``: accepted; it saturates to the maximum per-step delta, which is
+      this controller's documented clip-then-scale behaviour.
 
     Only ever called for a channel the action actually carries. An ABSENT
     channel is a documented default resolved by the caller and never reaches
@@ -106,16 +108,22 @@ def _to_scalar(value: Any, key: str, *, strict: bool, default: float = 0.0) -> f
     entirely, so a grasp or a release silently did nothing and the fingers held
     their previous target.
 
-    A **non-finite** channel has no such reading, so ``strict=False`` does not
-    reach it. ``float("nan")`` coerces successfully, the finiteness guard in
+    A **NaN** channel has no such reading, so ``strict=False`` does not reach it.
+    ``float("nan")`` coerces successfully, the finiteness guard in
     ``_solve_arm_targets`` covers only the injected callables, and the solve
-    returned ``{"j1": nan, "j2": nan, ...}`` - non-finite targets for *every*
-    arm joint, not a held axis. Those reach PhysX, which reports them from a
-    LATER step as "Illegal BroadPhaseUpdateData - non-finite bounds", attributed
-    to whatever is running by then rather than to this action. It is also the
-    one case the pre-existing test for this branch could not have caught while
+    returned ``{"j1": nan, "j2": nan, ...}`` - non-finite targets for *every* arm
+    joint, not a held axis. Those reach PhysX, which reports them from a LATER
+    step as "Illegal BroadPhaseUpdateData - non-finite bounds", attributed to
+    whatever is running by then rather than to this action. It is also the one
+    case the pre-existing test for this branch could not have caught while
     asserting what it asserts: it requires ``all(np.isfinite(...))`` of the
     targets and never passed a ``nan`` in.
+
+    ``+-inf`` is a different matter and is **accepted**. ``np.clip(+-inf, -1, 1)``
+    is ``+-1.0``, so it saturates to the maximum per-step delta - exactly the
+    clip-then-scale contract. Measured against clean main, ``x=+inf`` produced a
+    finite ``{"j1": 0.0499, ...}``. Refusing it would convert a correct saturation
+    into a hard failure for any policy head that saturates.
 
     Args:
         value: The channel's value, as the policy delivered it.
@@ -154,15 +162,24 @@ def _to_scalar(value: Any, key: str, *, strict: bool, default: float = 0.0) -> f
             default,
         )
         return default
-    if not np.isfinite(scalar):
-        # Not governed by strict: there is no degraded reading of a non-finite
-        # delta. It solves to non-finite targets for every arm joint.
+    if np.isnan(scalar):
+        # NaN only, and not governed by strict: there is no degraded reading of it.
+        #
+        # +-inf is deliberately NOT refused here. It is well defined all the way
+        # through: np.clip(+-inf, -1, 1) is +-1.0, so an infinite channel saturates
+        # to the maximum per-step delta, which is precisely the documented
+        # clip-then-scale semantics this controller implements. Measured against
+        # clean main, x=+inf produced {"j1": 0.0499, ...} - a finite, saturated
+        # target - while x=nan produced {"j1": nan, "j2": nan}. Refusing inf would
+        # turn a correct saturation into a hard failure for any policy head that
+        # saturates, so only the value with no coherent reading is refused.
         raise ValueError(
-            f"IsaacDeltaEEFController: action channel {key!r} = {value!r} is not finite. A "
-            f"non-finite delta solves to non-finite targets for every arm joint, which PhysX "
-            f"reports from a later step as 'Illegal BroadPhaseUpdateData - non-finite bounds' - "
-            f"attributed to whatever is running by then rather than to this action. Omit the "
-            f"channel to hold that axis. strict=False does not relax this."
+            f"IsaacDeltaEEFController: action channel {key!r} = {value!r} is NaN. It solves to "
+            f"non-finite targets for every arm joint, which PhysX reports from a LATER step as "
+            f"'Illegal BroadPhaseUpdateData - non-finite bounds' - attributed to whatever is "
+            f"running by then rather than to this action. Omit the channel to hold that axis. "
+            f"strict=False does not relax this. (+-inf is accepted and saturates to the maximum "
+            f"per-step delta, which is this controller's documented clip-then-scale behaviour.)"
         )
     return scalar
 
