@@ -1274,6 +1274,38 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 # surface drift on neighbouring physics-context calls).
                 # Programming bugs (NameError, ImportError-not-already-
                 # caught above) propagate.
+                #
+                # Tear the World down, do not merely drop the reference.
+                # ``World`` registers itself as ``SimulationContext.instance()``,
+                # a process-wide singleton, so ``self._world = None`` releases
+                # nothing: measured on an A10G, after ``del`` plus a gc pass the
+                # instance is still alive, and the caller's natural next move -
+                # fix the config and call create_world() again - gets the SAME
+                # object back with its FIRST arguments intact:
+                #
+                #   World(physics_dt=1/60)   -> instance registered
+                #   del w1; gc.collect()     -> instance still alive
+                #   World(physics_dt=1/120)  -> same object, get_physics_dt() 1/60
+                #   clear_instance(); World(physics_dt=1/120) -> 1/120
+                #
+                # So a retry silently ran the FAILED attempt's physics, while the
+                # new result echoed the new value - world_info is built from the
+                # config and the arguments, never read back off the world. That
+                # made a leak into a wrong answer.
+                #
+                # Same teardown as destroy(), with the same narrow handler: stop()
+                # and clear_instance() can themselves raise on a half-built world,
+                # and this path already has an error to report, so a cleanup
+                # failure is logged rather than allowed to replace it.
+                try:
+                    if self._world is not None:
+                        self._world.stop()
+                        self._world.clear_instance()
+                except (RuntimeError, OSError, AttributeError) as cleanup_exc:
+                    logger.warning(
+                        "World cleanup after a failed create_world raised (the original failure is reported): %s",
+                        cleanup_exc,
+                    )
                 self._world = None
                 logger.error("Failed to create Isaac world: %s", e)
                 return {
