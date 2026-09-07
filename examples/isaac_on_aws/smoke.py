@@ -86,7 +86,9 @@ def main() -> None:
 
     r = sim.get_contacts()
     contacts = next((b["json"]["contacts"] for b in r["content"] if "json" in b), [])
-    check("get_contacts: the resting cube touches something", any(c["active"] for c in contacts), f"{len(contacts)} pairs")
+    check(
+        "get_contacts: the resting cube touches something", any(c["active"] for c in contacts), f"{len(contacts)} pairs"
+    )
 
     r = sim.raycast([0.5, 0.0, 2.0], [0.0, 0.0, -1.0])
     payload = next((b["json"] for b in r["content"] if "json" in b), {})
@@ -102,8 +104,28 @@ def main() -> None:
     sim.step(5)
     rgb, depth = sim.get_frame("cam")
     real_pixels = float(np.asarray(rgb).std()) > 1.0
-    check("RTX frame carries real pixels", real_pixels, f"shape={np.asarray(rgb).shape} std={np.asarray(rgb).std():.1f}")
+    check(
+        "RTX frame carries real pixels", real_pixels, f"shape={np.asarray(rgb).shape} std={np.asarray(rgb).std():.1f}"
+    )
     check("RTX depth carries geometry", depth is not None and bool(np.isfinite(depth).any()))
+
+    # policy_running gates move_to / rotate_wrist / set_gripper, because a
+    # primitive and the policy loop would race on the articulation's PD targets.
+    # The recording hook raises it and, before run_policy grew its finally,
+    # nothing on this path lowered it - so one rollout refused every later
+    # primitive on that robot for good. Driven here with the real rollout.
+    robot = sim._robots["arm"]
+    roll = sim.run_policy("arm", policy_provider="mock", n_steps=8, control_frequency=20.0)
+    print(f"  run_policy -> {roll.get('status')}: {str(roll)[:160]}", flush=True)
+    check("run_policy completes", roll.get("status") == "success", str(roll)[:160])
+    print(f"  policy_running after the rollout: {robot.policy_running}", flush=True)
+    check("run_policy releases the robot", robot.policy_running is False, f"policy_running={robot.policy_running}")
+    _n, _r, guard_err = sim._primitive_resolve_robot("move_to", "arm")
+    check(
+        "a primitive is allowed after the rollout",
+        guard_err is None,
+        "" if guard_err is None else " ".join(b.get("text", "") for b in guard_err["content"])[:150],
+    )
 
     sim.destroy()
 

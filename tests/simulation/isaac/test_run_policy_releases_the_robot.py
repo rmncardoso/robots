@@ -134,7 +134,12 @@ class TestTheFlagIsLoweredWhateverTheRolloutDid:
         result = engine.run_policy("arm", duration=1.0)
 
         assert result == {"status": "success", "content": [{"text": "rollout done"}]}
-        assert base_returns == [{"robot_name": "arm", "duration": 1.0}]
+        # Every parameter is forwarded explicitly (see the signature test below),
+        # so the base sees the full set; what matters is that the caller's value
+        # arrives and the robot is named.
+        assert len(base_returns) == 1
+        assert base_returns[0]["robot_name"] == "arm"
+        assert base_returns[0]["duration"] == 1.0
 
     def test_kwargs_reach_the_base_verbatim(self, base_returns: Any) -> None:
         engine = _engine()
@@ -217,9 +222,17 @@ class TestTheOverrideExistsForTheReasonStated:
     def test_it_delegates_rather_than_reimplementing(self) -> None:
         """A 549-line rollout must not be forked to add a ``finally``."""
         src = inspect.getsource(IsaacSimulation.run_policy)
+        base_src = inspect.getsource(SimEngine.run_policy)
         assert "super().run_policy(" in src
         assert "finally:" in src
-        assert len(src.splitlines()) < 80, "this should be a wrapper, not a second rollout"
+        # Measured against the shared implementation rather than a magic number:
+        # the point is that the 500-plus-line rollout is NOT forked to add a
+        # ``finally``. A signature this wide makes the wrapper long on its own, so
+        # an absolute threshold would either be meaningless or need bumping every
+        # time the shared parameter list grows.
+        assert len(src.splitlines()) < len(base_src.splitlines()) / 2, (
+            "this should be a thin wrapper, not a second rollout"
+        )
 
     def test_start_policy_is_covered_without_its_own_override(self) -> None:
         """The shared ``start_policy`` ends in ``return self.run_policy(...)``, so
@@ -233,6 +246,36 @@ class TestTheOverrideExistsForTheReasonStated:
         itself, this override becomes redundant and should go, rather than both
         doing it."""
         assert "policy_running" not in inspect.getsource(SimEngine.run_policy)
+
+    def test_the_signature_is_the_shared_one_and_not_a_kwargs_sink(self) -> None:
+        """A ``**kwargs`` sink here is a correctness bug, not a style choice.
+
+        It accepts EVERY keyword, so ``run_policy(instrction="pick")`` binds
+        silently instead of raising ``TypeError`` and the typo surfaces as a
+        rollout that ignored the instruction. It also disables a repository-wide
+        grader: ``tests/test_docs_python_examples_are_callable.py`` reads a
+        candidate's accepted keywords off its signature and treats a sink as
+        "accepts anything", so with one here a planted bad keyword in the
+        documentation can no longer be reported - which is exactly how an
+        interim version of this override was caught.
+        """
+        base = inspect.signature(SimEngine.run_policy).parameters
+        own = inspect.signature(IsaacSimulation.run_policy).parameters
+
+        assert not any(p.kind is p.VAR_KEYWORD for p in own.values()), (
+            "run_policy must not absorb keywords into **kwargs"
+        )
+        assert list(own) == list(base), "the override must expose the shared parameter list"
+        assert all(own[n].default == base[n].default for n in base if n != "self"), (
+            "a default that differs from the shared one would silently change behaviour"
+        )
+
+    def test_a_misspelled_keyword_is_refused(self) -> None:
+        """The consequence the explicit signature buys back."""
+        engine = _engine()
+
+        with pytest.raises(TypeError):
+            engine.run_policy("arm", instrction="pick the cube")
 
     def test_run_multi_policy_still_lowers_it_itself(self) -> None:
         """The one Isaac path that always did. Left alone deliberately: it drives

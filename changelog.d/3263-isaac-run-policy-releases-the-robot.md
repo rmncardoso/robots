@@ -48,3 +48,14 @@ implementation ends in `return self.run_policy(...)`. `eval_policy` is deliberat
 neither backend, so a primitive is not refused during an eval on MuJoCo either.
 That makes it a shared question about the eval path rather than an Isaac release
 defect, and it is pinned as out of scope rather than fixed quietly.
+
+Every parameter is spelled out and forwarded rather than absorbed by a `**kwargs`
+sink. That is a correctness requirement: a sink accepts *every* keyword, so
+`run_policy(instrction="pick")` would bind silently instead of raising
+`TypeError`, and the typo would surface as a rollout that ignored the
+instruction. It also disabled a repository-wide check: the documentation graders read a
+candidate's accepted keywords off its signature and treat a sink as "accepts
+anything", so with one here a planted bad keyword in a documented call could no
+longer be reported - for every documented call of this method, not just this
+backend's. An interim version of this override had the sink, and that check is
+what caught it. The MuJoCo backend's override spells them out for the same reason.
