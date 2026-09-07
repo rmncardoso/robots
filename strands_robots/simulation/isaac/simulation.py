@@ -4947,9 +4947,21 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     # robots-sim#61's add_camera enables it post-initialize, but
                     # an older sim or a manually-attached Phase-1 camera
                     # state may not). Surface a zero-depth array sized to
-                    # rgb so callers see a stable shape, plus a WARNING
-                    # so misconfigured cameras don't silently produce
+                    # rgb so the ENVELOPE path sees a stable shape, plus a
+                    # WARNING so misconfigured cameras don't silently produce
                     # zero-depth telemetry.
+                    #
+                    # ``depth_is_real`` is what keeps that substitution from
+                    # reaching a numeric consumer. ``render`` only needs pixels,
+                    # so zeros are a fair degradation there; ``get_frame`` feeds
+                    # the compositor, whose per-pixel rule discards any pixel
+                    # with ``fg_depth <= depth_epsilon`` as sky - so an all-zero
+                    # buffer makes EVERY foreground pixel lose and composites a
+                    # frame with the simulated robot entirely absent. The
+                    # ``SimEngine.get_frame`` contract forbids exactly this
+                    # ("Backends must never substitute silently wrong pixels --
+                    # failures raise"), and a WARNING in a log the compositor
+                    # does not read is not that.
                     logger.warning(
                         "Camera '%s': get_depth() returned None (depth annotator not enabled). "
                         "Returning zero-depth array; "
@@ -4957,8 +4969,45 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         camera_name,
                     )
                     depth = np.zeros(rgb.shape[:2], dtype=np.float32)
+                    depth_is_real = False
                 else:
-                    depth = np.asarray(depth_raw)
+                    try:
+                        depth = np.asarray(depth_raw)
+                    except ValueError as conv_exc:
+                        # A ragged buffer raises here, BEFORE the shape guard
+                        # below can see it, so the guard alone does not cover
+                        # this case. Unwrapped, the handler reports NumPy's
+                        # "setting an array element with a sequence. The
+                        # requested array has an inhomogeneous shape ..." as a
+                        # generic "Failed to render camera", naming neither the
+                        # depth buffer nor what shape was expected.
+                        raise ValueError(
+                            f"camera {camera_name!r} returned a depth buffer NumPy cannot read as "
+                            f"an array ({conv_exc}); the RTX depth annotator produces a 2-D "
+                            f"(H, W) frame of equal-length rows."
+                        ) from conv_exc
+                    depth_is_real = True
+                    # Shape-guard depth the way RGB is guarded above. It was not,
+                    # and the asymmetry is the defect: a malformed RGB buffer is
+                    # refused by shape with the shape named, while a malformed
+                    # depth buffer either passed straight through to a consumer
+                    # promised ``(H, W)`` - a 0-D scalar, or an ``(H, W, 4)``
+                    # annotator frame - or, if ragged, raised a bare NumPy
+                    # ``ValueError`` ("inhomogeneous shape") that the handler
+                    # below reports as a generic render failure, naming neither
+                    # the buffer nor its shape.
+                    if depth.ndim < 2 or depth.shape[0] == 0 or depth.shape[1] == 0:
+                        raise ValueError(
+                            f"camera {camera_name!r} returned a malformed depth buffer "
+                            f"(shape {depth.shape}); the RTX depth annotator produces a 2-D "
+                            f"(H, W) frame once the render product has accumulated a sample."
+                        )
+                    if depth.shape[:2] != rgb.shape[:2]:
+                        raise ValueError(
+                            f"camera {camera_name!r} returned a depth buffer whose size "
+                            f"{depth.shape[:2]} does not match its RGB frame's {rgb.shape[:2]}; "
+                            f"the two annotators must render at one resolution."
+                        )
             except (RuntimeError, ValueError, OSError, AttributeError, TypeError, IndexError) as e:
                 # Cleanup-clause shape mirrors create_world (#52
                 # precedent). The Camera handle's ``get_rgba`` /
@@ -4978,6 +5027,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 "prim_path": cam.prim_path,
                 "resolution": [int(rgb.shape[1]), int(rgb.shape[0])],
                 "render_mode": self._config.render_mode,
+                # Whether the depth buffer came from the annotator or was
+                # substituted above. Read by ``get_frame``, which must refuse a
+                # substituted buffer rather than hand a compositor zeros.
+                "depth_is_real": depth_is_real,
             }
             return (
                 rgb,
@@ -5025,7 +5078,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
 
         Raises:
             RuntimeError: no world, headless render mode, camera without an
-                RTX handle, or an RTX render failure.
+                RTX handle, a camera carrying no depth annotator (so the only
+                depth available would be a substituted zero buffer), or an RTX
+                render failure - including a malformed or size-mismatched depth
+                buffer, which ``_render_frame`` refuses by shape.
             KeyError: unknown camera name.
             ValueError: ``width``/``height`` is not a positive integer, or
                 differs from the camera's native render resolution.
@@ -5060,6 +5116,27 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             rgb, depth, meta = self._render_frame(camera_name)
         if rgb is None:
             raise RuntimeError(str(meta.get("error", f"Failed to render camera '{camera_name}'")))
+        # Refuse a depth buffer this backend manufactured. ``_render_frame``
+        # substitutes zeros when the camera carries no depth annotator, which is a
+        # fair degradation for the envelope path it also serves - but this method
+        # documents that it raises on every degraded path precisely "so a
+        # compositing consumer can never silently receive black pixels with zero
+        # depth", and the ``SimEngine.get_frame`` contract says backends "must
+        # never substitute silently wrong pixels". It did: the zeros were returned
+        # here, with only a WARNING in a log the consumer does not read.
+        #
+        # The consequence is not a wrong tint. ``HybridCompositor`` discards every
+        # pixel whose ``fg_depth <= depth_epsilon`` as sky, so an all-zero buffer
+        # loses EVERY foreground pixel and composites a frame with the simulated
+        # robot entirely absent - a plausible-looking image of the backdrop alone.
+        if depth is not None and meta.get("json", {}).get("depth_is_real") is False:
+            raise RuntimeError(
+                f"Camera '{camera_name}' has no depth annotator, so no metric depth exists for "
+                f"this frame. Refusing to return a substituted zero-depth buffer: a compositor "
+                f"reads zero depth as sky and would drop every foreground pixel. Re-add the "
+                f"camera via add_camera() (which enables the annotator), or use render() if you "
+                f"only need RGB pixels."
+            )
         depth_arr = None if depth is None else np.asarray(depth, dtype=np.float32)
         return np.asarray(rgb, dtype=np.uint8), depth_arr
 
