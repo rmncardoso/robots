@@ -234,13 +234,21 @@ class TestARefusedCountIsNotPartiallyApplied:
         assert stub._replicated is False
 
     def test_the_scene_is_not_locked_against_further_robots(self) -> None:
-        """``add_robot`` refuses once ``_replicated`` latches, so it must not latch."""
+        """``add_robot`` refuses once ``_replicated`` latches, so it must not latch.
+
+        Reached through ``usd_path=`` with the USD loader stood in. It used to go
+        through ``data_config="panda"``, which resolved a *procedural builder* -
+        a route since deleted for reporting success while creating no prims. What
+        is graded is unchanged: a refused ``replicate`` must leave the scene open
+        to further robots.
+        """
         stub = _stub()
+        stub._load_usd_robot = lambda prim_path, usd_path, position: (["j0"], None)
 
         IsaacSimulation.replicate(stub, num_envs=2.7)  # type: ignore[arg-type]
-        added = IsaacSimulation.add_robot(stub, "second", data_config="panda")  # type: ignore[arg-type]
+        added = IsaacSimulation.add_robot(stub, "second", usd_path="/assets/arm.usda")  # type: ignore[arg-type]
 
-        assert added["status"] == "success"
+        assert added["status"] == "success", added
 
     def test_a_later_usable_request_still_replicates(self) -> None:
         stub = _stub()
