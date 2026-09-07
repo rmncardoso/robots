@@ -187,8 +187,26 @@ class FastTd3Trainer(BaseRLAlgo):
         # being a function of the observation, and the run reports success while
         # exporting a deployable checkpoint whose actor is one fixed action.
         problems.extend(self._network_width_problems(spec))
-        if not 0.0 < spec.tau <= 1.0:
-            problems.append(f"tau must be in (0, 1], got {spec.tau}")
+        # device is spent by torch.device itself, which judges nothing: every
+        # network, buffer and rollout tensor is placed on the result. "gpu" and
+        # "cuda:abc" raise out of setup after the preflight passed, and a
+        # non-str ordinal constructs on any host and then dies at the first
+        # .to() with "invalid device ordinal" - the same spec training fine on a
+        # box with more GPUs.
+        problems.extend(self._spec_device_problems(spec))
+        # tau is the rate at which the target critics track the online ones,
+        # spent as tp.mul_(1.0 - spec.tau).add_(spec.tau * p) per mirrored pair,
+        # so it decides whether a separate target network exists at all. A bare
+        # interval comparison could not carry that: bool is an int subclass, so
+        # True read as the interval's maximum - the hard update tp = p, a target
+        # network that is a copy of the online one, measured as an exactly zero
+        # online-to-target gap in the checkpoint of a run that reported success -
+        # and a numeric string, None or a list raised TypeError out of the
+        # comparison itself, from a validate documented to return its problems.
+        # The interval is unchanged, and is the one the on-policy gamma and lam
+        # gates cite as the precedent they generalize; it is now shared with them
+        # rather than duplicated between this backend and its sibling.
+        problems.extend(self._polyak_coefficient_problems(spec))
         # learning_starts >= batch_size is a relation between two counts, so BOTH
         # operands are asked of the shared count domain and the relation only of
         # two values that are counts - a non-finite learning_starts makes ``<``
@@ -213,6 +231,15 @@ class FastTd3Trainer(BaseRLAlgo):
                 f"learning_starts ({spec.learning_starts}) must be >= batch_size ({spec.batch_size}) "
                 "so the first gradient step can sample a full batch"
             )
+        # log_interval is this loop's checkpoint cadence - the modulus of the one
+        # test that decides whether an intermediate checkpoint is written - so it
+        # answers the same question save_freq does for a supervised run and takes
+        # the same shared domain. The modulus judges it not at all: nan never
+        # satisfies it and silently keeps only the final checkpoint of a
+        # successful run, True writes one every iteration, a fraction is a
+        # silently different cadence, and a str raises out of the loop after
+        # setup has built the env, the networks and the optimizers.
+        problems.extend(self._rl_checkpoint_interval_problems(spec))
         return problems
 
     def setup(self, spec: RLTrainSpec) -> None:

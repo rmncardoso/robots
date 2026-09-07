@@ -1058,7 +1058,7 @@ def step_aborted_msg(completed: int, requested: int, *, context: str = "step") -
 def positive_count_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable positive integer count.
 
-    Shared domain for three families of discrete quantity:
+    Shared domain for four families of discrete quantity:
 
     * The knobs that count iterations of a control or rollout loop - the
       simulation's ``n_episodes`` / ``max_steps`` / ``control_substeps`` /
@@ -1076,6 +1076,14 @@ def positive_count_error(value: Any, param: str, context: str) -> str | None:
       ``truncation=True``. The tokenizer takes it as a slice bound over the
       encoded instruction, so a count below one silently produces an EMPTY
       prompt rather than an error.
+    * A count of things to be built and run in parallel - the ``num_envs`` of
+      ``RLTrainSpec`` and of every RL backend that acts on it (the from-scratch
+      PPO / FastTD3 / FastSAC trainers, :class:`~strands_robots.training.rl.vec_env.VecSimEnv`,
+      the Isaac backend's ``replicate``), and the ``max_workers`` sizing the one
+      thread pool a vectorized env steps its sub-envs through. Each is spent
+      building live resources - a physics engine per environment, an OS thread
+      per worker - so a count the caller did not mean is not a bad number but
+      the wrong number of engines.
 
     It lives here rather than beside one of its callers because those callers
     sit in different layers (:mod:`strands_robots.hardware_robot` must not
@@ -1159,6 +1167,136 @@ def tcp_port_error(value: Any, param: str, context: str) -> str | None:
     """
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         return f"{context}: invalid {param}: {_refusal_repr(value)} (expected 1-65535)"
+    return None
+
+
+# Characters that end the host inside ``<scheme>://<host>:<port>``. Each one
+# starts a later URI component, so a host carrying one does not name a bad host -
+# it names a different URI. ``:`` is in the set because the port follows it, and a
+# bracketed IPv6 literal (``[::1]``) is the one place it belongs to the host.
+_URI_COMPONENT_DELIMITERS = frozenset("/?#@:[]\\")
+
+
+def _read_uri_host(value: str) -> tuple[tuple[str, str, list[str]] | None, str | None]:
+    """The host as a plain string, its body and its delimiters - or why it did not read.
+
+    :func:`dial_host_error`'s verdict is computed from the caller's own string
+    operations - ``startswith``, a slice, and a character scan - and a ``str``
+    subclass owes none of them an answer. That makes this the :func:`_read_name_list`
+    case rather than the :func:`_read_to_quote` one: the read *is* the verdict, so a
+    read that fails becomes one, and the guard refuses a host it could not inspect
+    instead of raising out of the path whose whole purpose is to answer an unusable
+    value with text.
+
+    A bracketed IPv6 literal is unwrapped here because the brackets decide whether
+    ``:`` belongs to the host, which is part of reading it rather than of judging it.
+
+    Args:
+        value: The caller-supplied host, already known to be a ``str``.
+
+    Returns:
+        ``((spelling, body, delimiters), None)`` when the read finished - ``spelling``
+        a plain ``str`` copy the refusal can interpolate, ``body`` unbracketed and
+        ``delimiters`` sorted - or ``(None, description)`` when it did not. Exactly
+        one side is ever populated.
+    """
+    try:
+        spelling = str(value)
+        bracketed = value.startswith("[") and value.endswith("]")
+        body = str(value[1:-1] if bracketed else value)
+        own = frozenset(":") if bracketed else frozenset()
+        bad = sorted(
+            {c for c in body if (c in _URI_COMPONENT_DELIMITERS and c not in own) or not c.isprintable() or c.isspace()}
+        )
+        return (spelling, body, bad), None
+    except Exception as exc:
+        return None, _describe_failed_read(exc)
+
+
+def dial_host_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` cannot address the host half of a websocket URI.
+
+    The other half of :func:`tcp_port_error`. Every caller-supplied port this
+    package dials is held to that shared domain, for the reason its consumers
+    record: an unusable port is not refused by the transport, it is *applied*,
+    and surfaces much later as an unreachable server that implicates the service
+    the caller was trying to reach. The host beside it is interpolated into the
+    same expression - ``ws://{host}:{port}`` - and was held to nothing, so the
+    URI parse resolved a value that is not a host instead of refusing it:
+
+    * A URI delimiter re-cuts the URI, and the validated port is the component
+      it takes. ``host="127.0.0.1/foo"`` parses as host ``127.0.0.1``, path
+      ``/foo:<port>`` and port **80**, so the client dials a port nobody
+      configured - the port domain cannot see this, because it is the host half
+      that discards the port. ``host="ws://127.0.0.1"``, the shape a caller who
+      pastes a URI supplies, parses as host ``ws`` on port 80.
+    * ``""`` builds no URI at all: the parse reports "hostname isn't provided"
+      and raises ``InvalidURI``, which is not an ``OSError`` and so escapes the
+      channel these clients convert into their actionable "could not reach the
+      server" hint.
+    * A non-string is carried by the f-string verbatim. ``None`` reaches the
+      resolver as the DNS name ``"none"`` and an ``int`` as its digits, so the
+      client dials a name the caller never wrote.
+    * A resolver silently repairs some values rather than reporting them: a tab
+      inside a host is dropped, and a trailing NUL truncates the lookup.
+
+    Only the shape a URI and a resolver can be *given* is decided here. Whether
+    the host resolves, and whether anything is listening on it, are facts about
+    the network a constructor cannot know and that the connect path already
+    reports.
+
+    ``"0.0.0.0"`` stays accepted: it is the documented way to reach a server
+    bound on every interface, it interpolates and dials cleanly, and readiness
+    probes special-case it. ``""`` means the same thing to a ``bind`` call and
+    nothing to a URI, so the refusal for it names ``"0.0.0.0"`` as the spelling
+    that works.
+
+    A ZMQ endpoint is deliberately not held to this domain. ``tcp://`` is not a
+    URI, and ``zmq``'s own address parse refuses every delimiter spelling above
+    at ``connect`` with the whole address in the message, so the transport there
+    reports what this function would.
+
+    Args:
+        value: The caller-supplied host.
+        param: The field or parameter name it came from, used in the message.
+        context: Message prefix identifying the surface that received it.
+
+    Returns:
+        An error message, or ``None`` when the value can address a host.
+    """
+    shown = _refusal_repr(value)
+    if not isinstance(value, str):
+        return (
+            f"{context}: {param} must be a string hostname or IP literal, got {shown} "
+            f"({type(value).__name__}). It is interpolated into the websocket URI the client "
+            "dials (ws://<host>:<port>), which carries it verbatim, so the client dials a name "
+            "nobody wrote rather than reporting the value."
+        )
+    read, unreadable = _read_uri_host(value)
+    if read is None:
+        return (
+            f"{context}: {param} could not be read as a host ({unreadable}), got {shown}; "
+            "a value whose own string operations do not answer cannot be checked against the "
+            "host half of the websocket URI it would be interpolated into (ws://<host>:<port>). "
+            "Pass a plain hostname or IP literal, e.g. '127.0.0.1'."
+        )
+    spelling, body, bad = read
+    would_be = _refusal_repr(f"ws://{spelling}:<port>")
+    if not body:
+        return (
+            f"{context}: {param} must name a host to dial, got {shown}; "
+            f'{would_be} is not a URI (the parse reports "hostname isn\'t provided"). '
+            "Use '0.0.0.0' to reach a server bound on every interface, or '127.0.0.1' for a local one."
+        )
+    if bad:
+        hint = " Pass a bracketed literal for IPv6 (e.g. '[::1]')." if ":" in bad else ""
+        return (
+            f"{context}: {param} must be a bare hostname or IP literal, got {shown}; "
+            f"{_refusal_container_repr(bad)} cannot appear in the host half of the websocket URI it "
+            f"is interpolated into (ws://<host>:<port>), so {would_be} names a different URI rather "
+            "than a host - a '/' puts the validated port in the path and the client dials :80 "
+            f"instead.{hint}"
+        )
     return None
 
 
@@ -1315,6 +1453,82 @@ def step_cadence_error(value: Any, param: str, context: str) -> str | None:
             "A fractional, non-finite, boolean or non-numeric cadence cannot be honored - it is "
             "used as the modulus of a step % cadence test; pass a whole number of steps, or a "
             "non-positive one to disable periodic saving."
+        )
+    return None
+
+
+def torch_device_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` is not a device string torch can parse.
+
+    Shared domain for every caller-supplied torch device this package spends. It
+    reaches torch from three surfaces that cannot be reconciled after the fact:
+    the ``lerobot_train`` tool interpolates it into ``--policy.device=`` in the
+    argv of a DETACHED process; :class:`~strands_robots.training.lerobot.LerobotTrainer`
+    assigns it onto ``policy_cfg.device`` for the same pipeline in-process; and
+    the from-scratch RL backends hand
+    :attr:`~strands_robots.training.rl.base_algo.RLTrainSpec.device` straight to
+    ``torch.device`` in :meth:`setup`. The domain lives here for the reason
+    :func:`step_cadence_error` gives for the cadence beside it in that same argv:
+    those callers sit in different layers, and the same device must not be
+    refused by one and accepted by another that wraps the identical pipeline.
+
+    The admitted set is torch's own, read by handing the value to
+    ``torch.device`` rather than by comparing against a copied list of device
+    types. A torch build that gains a backend is admitted here with no edit, and
+    torch's own exception enumerates the types it accepts, so a refusal names the
+    admitted set without restating it.
+
+    Only the *spelling* is graded, never availability. ``torch.device("cuda")``
+    constructs on a CPU-only box and must stay accepted, because a queued or
+    containerised run legitimately names a device the dispatching machine does
+    not have. That is also why a non-``str`` is refused before torch is
+    consulted at all: ``torch.device(0)`` reads the accelerator inventory, so
+    asking torch about it would make one spec validate on a GPU box and fail on a
+    CPU box - and an ordinal that does resolve is worse than one that does not,
+    because ``torch.device(1)`` constructs on any host and then fails at the
+    first ``.to()`` with ``CUDA error: invalid device ordinal``, from a
+    ``torch/nn/modules/module.py`` frame that names neither the parameter nor the
+    run that supplied it.
+
+    Whether an *unstated* device is refused belongs to the caller, not here: a
+    surface that documents a falsy value as "resolve the default" replaces it
+    before asking, and one that writes the value into an argv verbatim asks about
+    it as given. This function grades the value it is handed.
+
+    When torch is not importable the domain is unknown and the value passes
+    through unguarded, which is the posture every live-sourced domain in this
+    module takes when its source cannot be read.
+
+    The refused value is rendered through :func:`_refusal_repr`, as every scalar
+    guard here is: ``repr`` can itself raise - on an ``int`` wider than
+    :func:`sys.get_int_max_str_digits`, or from any third-party ``__repr__`` - and
+    a guard that raises while building a refusal fails on exactly the path that
+    exists so it does not.
+
+    Args:
+        value: The caller-supplied device.
+        param: Field name, quoted in the message so the refusal names the knob.
+        context: Public surface or provider name, prefixed to the message.
+
+    Returns:
+        An error message naming *context* and *param*, or ``None`` when torch can
+        parse the value.
+    """
+    if not isinstance(value, str):
+        return (
+            f"{context}: {param} must be a torch device string, got {type(value).__name__}. "
+            "Pass a device type, optionally with an index (e.g. 'cuda', 'cuda:0', 'cpu', 'mps')."
+        )
+    try:
+        import torch
+    except Exception:  # noqa: BLE001 - torch missing -> domain unknown, pass through
+        return None
+    try:
+        torch.device(value)
+    except (RuntimeError, ValueError) as e:
+        return (
+            f"{context}: {param}={_refusal_repr(value)} is not a torch device string ({e}). "
+            "Pass a device type, optionally with an index (e.g. 'cuda', 'cuda:0', 'cpu', 'mps')."
         )
     return None
 
