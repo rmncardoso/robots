@@ -66,3 +66,17 @@ it, so a text scan for the attribute would have reported that wheeled base as
 floating. Reading the parsed tree gets it right for free, because ElementTree
 discards comments - both cases are pinned.
 
+Driven end to end on an A10G under Isaac Sim 6.0.1 against the real Unitree G1
+from `mujoco_menagerie`, whose root body `pelvis` carries
+`<freejoint name="floating_base_joint"/>` - the *named* spelling, which is the one
+a reader checking only for a bare `<freejoint/>` would miss:
+
+```
+add_robot(unitree_g1) -> success   (MJCF /sr/assets/unitree_g1/scene.xml -> USD)
+recorded fixed_base=False
+base_* keys: ['base_ang_vel', 'base_lin_vel', 'base_pos', 'base_quat']
+```
+
+`examples/isaac_on_aws/smoke.py` carries both assertions, so the fix is graded on
+hardware rather than only against fixtures.
+

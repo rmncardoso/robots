@@ -66,3 +66,19 @@ id and region are in `.instance.json` next to these scripts.
 - **Exit code 134 after a successful summary**: Isaac Sim's known atexit
   segfault, harmless - `smoke.py` already reports its verdict and exits
   through `os._exit` before it can matter.
+- **`add_robot` says a registered robot's "model file is not on disk"**: the
+  asset was never fetched, and the two reasons are both properties of the NGC
+  image rather than of your setup. It ships **no git**, and the registry
+  resolver for the 57 entries naming a `robot_descriptions` module works by
+  importing it, which clones on first use - so in-container the fetch dies as
+  `FileNotFoundError: [Errno 2] No such file or directory: 'git'`. And it runs
+  as **uid 1234 (`isaac-sim`), not root**, so `apt-get` cannot supply git
+  either (`E: Unable to acquire the dpkg frontend lock ... are you root?`).
+  Both surface two errors downstream of the cause, as a merely missing file.
+  `run_smoke.sh` therefore clones on the host, copies with `cp -rL` (the
+  resolver's own symlink is absolute and would dangle inside the container),
+  and mounts the result via `STRANDS_ASSETS_DIR`.
+
+  If you add a robot to the smoke, fetch it the same way. Do not reach for a
+  `pip install` of the asset inside the container - there is nothing to
+  install; the assets are a git clone.
