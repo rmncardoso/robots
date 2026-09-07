@@ -40,6 +40,7 @@ import numpy as np
 from strands_robots.simulation.base import SimEngine, unknown_kwargs_error, unknown_model_msg
 from strands_robots.simulation.isaac.config import IsaacConfig
 from strands_robots.simulation.isaac.joint_names import demangle_usd_joint_names, urdf_joint_names
+from strands_robots.simulation.isaac.loaders import mjcf_declares_floating_base
 from strands_robots.simulation.isaac.mjcf_assets import MJCF_EXTENSIONS, convert_mjcf_to_usd
 from strands_robots.simulation.isaac.motion_primitives import IsaacMotionPrimitivesMixin
 from strands_robots.simulation.isaac.randomization import IsaacRandomizationMixin
@@ -2312,8 +2313,29 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             # already owns. ``source_mjcf`` survives only to keep the report
             # honest about where the USD came from.
             source_mjcf: str | None = None
+            # False for a plain USD asset: this backend did not import it, so the
+            # caller's ``fix_base`` describes nothing about it and the asset's own
+            # articulation root is the only truth - which is why ``add_robot``
+            # refuses ``fix_base=False`` on that path rather than recording a claim
+            # it cannot check.
+            mjcf_floating_base = False
             if mjcf_path is not None and usd_path is None and urdf_path is None:
                 source_mjcf = mjcf_path
+                # MJCF can declare a floating base and URDF cannot, which is why
+                # ``fix_base`` is the caller's flag on the URDF path and is read out
+                # of the file here. Resolved from the description the caller named
+                # rather than from the converted USD, whose articulation-root
+                # spelling is the importer's business.
+                #
+                # Without this the USD branch below recorded the ``_RobotState``
+                # default of ``fixed_base=True`` for every converted MJCF - so a
+                # registry humanoid or quadruped landed on the stage with a
+                # genuinely free root and was reported as bolted down, and
+                # ``get_observation`` omitted all four ``base_*`` keys for exactly
+                # the robots whose base is what a locomotion policy reads. 18 of
+                # the shipped registry's 64 MJCF robots are humanoids, plus 9
+                # mobile bases and 2 aerial.
+                mjcf_floating_base = mjcf_declares_floating_base(mjcf_path)
                 try:
                     usd_path = convert_mjcf_to_usd(mjcf_path)
                 except (RuntimeError, ValueError, OSError, ImportError) as e:
@@ -2373,6 +2395,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     # the stage, and move_to's IK solve prefers it over a
                     # registry lookup. None for a plain USD asset.
                     description_path=source_mjcf,
+                    # Read from the source MJCF when this USD was converted from
+                    # one; a plain USD asset keeps the fixed-base default. See the
+                    # note where ``mjcf_floating_base`` is resolved.
+                    fixed_base=not mjcf_floating_base,
                 )
                 self._robots[name] = robot_state
 
