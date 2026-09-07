@@ -8188,11 +8188,19 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         on the pump thread - where the queued-action handler swallows it after
         this method has already answered ``status="success"``.
 
+        Threading
+        ---------
+        On the ``SimulationApp``-owning thread the write is applied inline. Off
+        it, the write is queued for :meth:`pump`, which is the only consumer -
+        so it is refused when no pump is engaged, rather than stranded in a queue
+        nobody drains and reported as applied.
+
         Returns
         -------
         dict
             Standard ``{"status", "content"}`` envelope; ``error`` for an
-            unknown/uninitialized robot or a value outside the domain above.
+            unknown/uninitialized robot, a value outside the domain above, or a
+            call from a worker thread with no main-thread pump running.
         """
         with self._lock:
             if not self._world_created or not self._robots:
@@ -8287,6 +8295,44 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             if self._on_main_thread():
                 _apply()
                 return {"status": "success", "content": [{"text": "Set joint positions (main)."}]}
+
+            # Queuing is only a write if something drains the queue. ``pump`` is
+            # the sole consumer and ``run_pump_forever`` is what runs it, so with
+            # no pump engaged this put stranded the action in a queue nobody
+            # reads - and answered status="success", text "Set joint positions
+            # (queued).", while the articulation kept its previous pose. Measured
+            # from a worker thread with no pump: success reported, joints
+            # unchanged, one action left in the queue.
+            #
+            # That is the shape this method's own docstring says it avoids for
+            # bad VALUES ("a rejected value is reported to the caller rather than
+            # raised on the pump thread - where the queued-action handler swallows
+            # it after this method has already answered status='success'"). The
+            # same reasoning applies to a queue with no consumer, where there is
+            # not even a swallowed exception to find.
+            #
+            # An error dict rather than the RuntimeError that
+            # _marshal_main_thread_affine raises for reset/step: this surface's
+            # contract is the envelope throughout, and unlike those it cannot
+            # deadlock - it returns promptly having done nothing, which is
+            # precisely why the silence needed closing.
+            if not self._pump_running:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "set_joint_positions: called from a worker thread with no main-thread "
+                                "pump running. The write can only be applied on the thread that owns "
+                                "SimulationApp, so it would sit in a queue nobody drains and never "
+                                "reach the robot. Either call it from the owning thread, or have that "
+                                "thread run run_pump_forever(stop_event=...) and submit from the "
+                                "worker (see docs/simulation/isaac.md for the agent-driven shape). "
+                                "The pose was validated and NOT applied."
+                            )
+                        }
+                    ],
+                }
             self._action_q.put(_apply)
             return {"status": "success", "content": [{"text": "Set joint positions (queued)."}]}
 
