@@ -747,6 +747,26 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
     ...     sim.destroy()
     """
 
+    #: Whether the scene changed since the last ``world.reset()``, leaving PhysX's
+    #: tensor simulation view no longer covering it. Declared on the CLASS, not
+    #: only assigned in ``__init__``, because 24 test modules build a skeleton
+    #: engine with ``IsaacSimulation.__new__`` and hand-seed only the state they
+    #: exercise; a field that existed solely as an instance attribute made
+    #: ``step`` and ``get_observation`` raise ``AttributeError`` on every one of
+    #: them. A class default is the honest form of that tolerance -- the class
+    #: states its own initial state, where a ``getattr(self, ..., False)`` at each
+    #: read site would let a genuinely half-built engine read "not stale" with
+    #: nothing recording that it never answered the question. ``False`` is right
+    #: for a skeleton too: it drives a stub world with no PhysX view to
+    #: invalidate. ``__init__`` still assigns it explicitly, so a real engine
+    #: never depends on this default.
+    #:
+    #: It does NOT reach the cross-backend parity stubs, which pass a
+    #: ``types.SimpleNamespace`` as ``self`` rather than an instance of this
+    #: class, so no attribute of it is in scope. Those seed the field themselves
+    #: and say why.
+    _physics_view_stale: bool = False
+
     def __init__(self, config: IsaacConfig | None = None, **kwargs: Any) -> None:
         # Merge shortcut kwargs into config. Unknown kwargs are rejected
         # eagerly (rather than silently dropped) so a typo like
@@ -850,6 +870,45 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         self._num_envs_active = 1
         self._sim_time = 0.0
         self._step_count = 0
+
+        # PhysX builds its tensor simulation view at ``world.reset()``, and
+        # adding or DELETING a physics-body prim afterwards invalidates it.
+        # Isaac says so itself on the delete path -- "prim '/World/Objects/b1'
+        # was deleted while being used by a shape in a tensor view class. The
+        # physics.tensors simulationView was invalidated" -- and the add path
+        # simply leaves the new body outside the view.
+        #
+        # Every symptom measured on nvcr.io/nvidia/isaac-sim:6.0.1 (A10G)
+        # traces to stepping while that view is stale, and every one of them is
+        # SILENT:
+        #
+        #   * ``add_object`` then ``step(90)`` leaves the body at its spawn
+        #     height forever while ``step`` reports "Stepped 90x ... 33
+        #     steps/sec". Measured: a cube spawned at z=0.600 was still at
+        #     z=0.600 afterwards, and fell to z=0.025 once the same step ran
+        #     after a ``reset()``.
+        #   * the same call empties an existing robot's ``get_observation``. On
+        #     a 2-joint URDF arm it went 2 keys -> 0, and back to 2 after
+        #     ``reset()``.
+        #   * ``remove_object`` then reading that robot RAISES out of
+        #     ``SingleArticulation.get_joint_positions`` -- a bare ``Exception``
+        #     ("Failed to get DOF positions from backend", under an omni.physx
+        #     log line reading "Simulation view object is invalidated and cannot
+        #     be used again to call getDofPositions") -- through a method the
+        #     ABC documents as returning a dict.
+        #
+        # ``reset()`` repairs all three. Which mutations invalidate the view was
+        # measured rather than assumed: ``add_camera``, ``remove_camera``,
+        # ``move_object``, ``add_robot`` and ``remove_robot`` each left that arm
+        # reporting both its keys, so they do NOT set this flag.
+        #
+        # Note when re-measuring: the three PROCEDURAL builders (``so100``,
+        # ``panda``, ``unitree_g1``) leave ``_RobotState.articulation`` as
+        # ``None`` and report 0 observation keys at every point in the
+        # lifecycle, reset or no reset -- a separate defect. Neither the drop
+        # nor the raise is observable on one, so the observation half of this
+        # has to be measured on a URDF or USD robot.
+        self._physics_view_stale = False
 
         # Entity tracking
         self._robots: dict[str, _RobotState] = {}
@@ -1229,6 +1288,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 self._world.reset()
 
                 self._world_created = True
+                # This reset built the tensor view, so a fresh world is not stale.
+                self._physics_view_stale = False
                 self._sim_time = 0.0
                 self._step_count = 0
 
@@ -1482,6 +1543,11 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     # silent-empty mode (#1895).
                     self._revive_articulations_after_reset()
 
+                # ``world.reset()`` rebuilds the PhysX tensor view, which is what
+                # makes a body added or deleted since the last reset simulate at
+                # all. Cleared here rather than at the top so a reset that failed
+                # to reach this point leaves the scene marked stale.
+                self._physics_view_stale = False
                 self._sim_time = 0.0
                 self._step_count = 0
 
@@ -1585,6 +1651,30 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
 
             if self._world is None:
                 return {"status": "error", "content": [{"text": "World not initialized."}]}
+
+            # Refuse rather than tick a stale tensor view. Stepping it is the
+            # single silent failure this backend had: the world reported
+            # "Stepped 90x ... 33 steps/sec" while nothing moved, so a caller's
+            # only evidence was a body that never fell. A refusal naming the
+            # remedy is the whole point - the operation is one call away from
+            # correct, and MuJoCo needs no equivalent because its step reads the
+            # compiled model directly.
+            if self._physics_view_stale:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "step: the scene changed since the last reset(), so PhysX's tensor "
+                                "view no longer covers it. Stepping now would advance the clock "
+                                "without simulating the added or removed bodies, and would leave "
+                                "every robot's get_observation() empty. Call reset() first, then "
+                                "step(). add_object/remove_object are the mutations that require "
+                                "it; add_camera, move_object, add_robot and remove_robot do not."
+                            )
+                        }
+                    ],
+                }
 
         # Nested (not a separate method) so the batching loop remains part of
         # ``step``'s own body: the cross-backend batch-and-recheck contract is
@@ -2476,6 +2566,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 obj_info["mass"],
                 is_static,
             )
+            # A new physics body sits outside the tensor view PhysX built at the
+            # last reset: it will not fall, and an existing robot's joint reads
+            # go empty. Measured, not inferred - see ``_physics_view_stale``.
+            self._physics_view_stale = True
             return {
                 "status": "success",
                 "content": [
@@ -3172,6 +3266,22 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         logger.error("IsaacSimulation.load_scene: %s", msg)
                         return {"status": "error", "content": [{"text": msg}]}
 
+                # The tensor view is live again, by the rebuild above rather
+                # than by ``world.reset()`` -- which this path must not call,
+                # for the reason the comment on the rebuild gives. So the
+                # ``add_object`` / ``remove_object`` calls that realized this
+                # scene no longer leave anything for a caller to repair, and
+                # ``step`` must not refuse. Cleared here, at the end of the
+                # rebuild, so every earlier ``return`` leaves the scene marked
+                # stale: each one of them is a path where the view was
+                # invalidated and NOT rebuilt.
+                #
+                # A reload that removes prior objects and realizes none skips
+                # this block entirely (it is gated on ``realized``), and stays
+                # stale -- correctly, since those removals invalidated the view
+                # with no rebuild behind them.
+                self._physics_view_stale = False
+
             logger.info("IsaacSimulation.load_scene: %s", summary)
             return {
                 "status": "success",
@@ -3504,6 +3614,11 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 self._prim_registry.remove(prim_path)
 
             logger.info("Removed object '%s' (prim=%s)", name, prim_path)
+            # Deleting a prim PhysX holds a shape for invalidates the tensor
+            # view outright - Isaac logs "the physics.tensors simulationView was
+            # invalidated" - after which an articulation read raises rather than
+            # answering. Measured; see ``_physics_view_stale``.
+            self._physics_view_stale = True
             return {
                 "status": "success",
                 "content": [{"text": f"Object '{name}' removed."}],
@@ -3548,6 +3663,26 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 # create_world() to feature-detect, so DEBUG-only.
                 logger.debug(
                     "get_observation(robot_name=%r): world not yet created",
+                    robot_name,
+                )
+                return {}
+
+            # A stale tensor view makes every articulation read unanswerable, and
+            # on the DELETE path unanswerable means raising: after
+            # ``remove_object``, ``SingleArticulation.get_joint_positions``
+            # raises a bare ``Exception`` ("Failed to get DOF positions from
+            # backend") straight out of this method, which the ``SimEngine`` ABC
+            # documents as returning a dict. The narrow handler further down
+            # cannot catch that without widening to ``except Exception``, which
+            # AGENTS.md forbids - so the read is not attempted while the view is
+            # known stale. Empty is this method's documented degraded mode; the
+            # WARNING is what keeps it from being silent, and it names the remedy
+            # because the caller is one reset() away from a real answer.
+            if self._physics_view_stale:
+                logger.warning(
+                    "get_observation(robot_name=%r): returning no observation because the scene "
+                    "changed since the last reset() and PhysX's tensor view no longer covers it. "
+                    "Call reset() to rebuild it.",
                     robot_name,
                 )
                 return {}
