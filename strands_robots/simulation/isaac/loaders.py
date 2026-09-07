@@ -78,6 +78,7 @@ if TYPE_CHECKING:
 __all__ = [
     "load_urdf",
     "load_mjcf",
+    "mjcf_declares_floating_base",
     "load_usd",
     "SceneObject",
     "load_mjcf_scene_objects",
@@ -505,6 +506,50 @@ _MJCF_JOINT_TAGS = ("joint", "freejoint")
 # only ``name``, ``group`` and ``align`` - MuJoCo refuses ``type`` on it - and
 # MJCF has no ``<default><freejoint>`` block, so it resolves no default class.
 _MJCF_FREEJOINT_TAG = "freejoint"
+
+
+def mjcf_declares_floating_base(path: str) -> bool:
+    """Whether the MJCF's root body is attached to the world by a FREE joint.
+
+    The question ``add_robot`` has to answer about a converted MJCF and cannot ask
+    the flag it uses for URDF: URDF cannot declare a floating base, so that path
+    takes ``fix_base`` from the caller - but MJCF *can*, with ``<freejoint/>`` or
+    ``<joint type="free">``, and every quadruped and humanoid in the shipped asset
+    corpus uses one. So for an MJCF the answer is in the file, and asking the
+    caller would be asking them to restate it.
+
+    Read from the whole spliced model via :func:`_mjcf_model_worldbody_bodies`,
+    because a root body can live in an ``<include>``d fragment - the same reason
+    that helper exists. Both spellings are read through
+    :data:`_MJCF_JOINT_TAGS` and :data:`_MJCF_FREEJOINT_TAG`, so the vocabulary has
+    one owner and a reader consulting only ``<joint type="free">`` cannot drift
+    back in.
+
+    Only a TOP-LEVEL body counts. A free joint deeper in the tree is a free-flying
+    child (a MuJoCo idiom for a detached payload), not the robot's base, and
+    reporting that as a floating base would put ``base_pos`` on a robot bolted to
+    a table.
+
+    Returns ``False`` for a file that cannot be read or parsed rather than
+    raising: the caller is deciding whether to *report* four observation keys, and
+    a robot that loads with no ``base_*`` is a smaller error than an ``add_robot``
+    that refuses over a file MuJoCo itself may accept. The load path parses the
+    same file immediately afterwards and reports any real problem there.
+    """
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError):
+        return False
+    root = tree.getroot()
+    base_dir = os.path.dirname(os.path.abspath(path))
+    _declares, top_bodies = _mjcf_model_worldbody_bodies(root, base_dir)
+    for body_el in top_bodies:
+        for child in body_el:
+            if child.tag == _MJCF_FREEJOINT_TAG:
+                return True
+            if child.tag in _MJCF_JOINT_TAGS and (child.get("type") or "").strip() == "free":
+                return True
+    return False
 
 
 def load_mjcf(path: str) -> ProceduralRobot:
