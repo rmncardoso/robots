@@ -6398,7 +6398,26 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         if n_actions == 0 and render:
             self._converge_render(self._idle_converge)
         # 3. Refresh joint-state cache for every robot.
-        for rname, r in self._robots.items():
+        #
+        # Snapshotted under the lock, then iterated outside it. Concurrent
+        # mutation is this method's DESIGNED usage, not an edge case: the
+        # docstring above describes worker threads calling in while the owning
+        # main thread pumps, and add_robot / remove_robot / add_camera /
+        # destroy all mutate these registries under self._lock. Iterating the
+        # live dict therefore raised "dictionary changed size during iteration"
+        # (6/6 trials with a worker adding robots mid-pump), and the per-item
+        # ``except RuntimeError`` below cannot catch it - the exception comes
+        # from the ``for`` statement's own call to the iterator, which is
+        # outside the try. So it escaped pump() on the MAIN thread, taking the
+        # whole app down rather than degrading one tick.
+        #
+        # The lock is held only for the list copy, deliberately not across the
+        # body: the joint read and the frame grab below both reach into Kit,
+        # and holding the lock across them would serialize the pump against
+        # every tool call for the length of a render.
+        with self._lock:
+            robots_snapshot = list(self._robots.items())
+        for rname, r in robots_snapshot:
             if r.articulation is None:
                 continue
             try:
@@ -6413,7 +6432,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         # capture already published its frames to the cache; re-grabbing
         # here would be a wasted readback per camera every recorded frame.
         if render and n_actions == 0 and self._pump_cameras:
-            for cname, cam in self._cameras.items():
+            # Snapshotted for the same reason as the robot registry above.
+            with self._lock:
+                cameras_snapshot = list(self._cameras.items())
+            for cname, cam in cameras_snapshot:
                 if cam.handle is None:
                     continue
                 try:
