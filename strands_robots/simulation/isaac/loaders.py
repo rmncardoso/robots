@@ -1,11 +1,26 @@
 """Robot description file loaders -> :class:`ProceduralRobot`.
 
 Follow-up to the R7 Phase 1 procedural-builder slice (robots-sim#46): instead of
-hardcoding ``_build_so100`` / ``_build_panda`` / ``_build_unitree_g1`` in
+hardcoding one Python builder per robot in
 :mod:`strands_robots.simulation.isaac.procedural`, drive the same
-``ProceduralRobot`` dataclass from existing
-robot description files (URDF, MJCF, USD) so the code path becomes a generic
-loader rather than a per-robot Python builder.
+``ProceduralRobot`` dataclass from existing robot description files (URDF, MJCF,
+USD) so the code path is a generic loader. Those three builders have since been
+deleted outright - they described no real robot and nothing turned them into one
+- so this module is now the only producer of a ``ProceduralRobot``.
+
+Scope - who these three loaders are FOR (adjudicated deliberately, so a
+dead-code audit does not re-litigate it): ``load_urdf`` / ``load_mjcf`` /
+``load_usd`` are the *description-introspection* API - parse a robot file into
+a joints/bodies report - published in ``__all__`` and documented on the Isaac
+docs page for library users, and consumed in-repo by the cross-backend parity
+suites (~17 test modules grade joint vocabulary, axis defaults, free-joint
+spellings and pose conventions against them). They are NOT the load path:
+``IsaacSimulation.add_robot`` builds articulations through Isaac's own
+URDF/MJCF importers and never calls them, which is why a caller-grep of the
+package finds none - the callers are outside the package and inside ``tests/``.
+The rest of this module (``load_mjcf_scene_objects`` / ``SceneObject``) is the
+``load_scene`` path's parser and is called from
+:mod:`strands_robots.simulation.isaac.simulation` directly.
 
 Supported formats:
     * **URDF** - ``load_urdf(path)``. Parsed with stdlib
