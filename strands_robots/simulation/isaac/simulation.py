@@ -1293,18 +1293,44 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 # config and the arguments, never read back off the world. That
                 # made a leak into a wrong answer.
                 #
-                # Same teardown as destroy(), with the same narrow handler: stop()
-                # and clear_instance() can themselves raise on a half-built world,
-                # and this path already has an error to report, so a cleanup
-                # failure is logged rather than allowed to replace it.
-                try:
-                    if self._world is not None:
+                # Two properties this teardown needs, both learned the hard way.
+                #
+                # 1. It must NOT be gated on ``self._world``. That name is bound
+                #    only after ``World(...)`` RETURNS, while the singleton is
+                #    registered inside ``SimulationContext.__new__`` - before
+                #    ``__init__`` runs. So every failure raised by the ``World(...)``
+                #    call itself, which is the likeliest one here (an unusable
+                #    ``physics_dt``, a device the host cannot provide), left a
+                #    registered singleton that a ``self._world is not None`` guard
+                #    skipped entirely. ``clear_instance`` is a classmethod, so the
+                #    local ``World`` symbol reaches the live instance whether or
+                #    not this object ever got a reference to it.
+                #
+                # 2. ``stop()`` and ``clear_instance()` need SEPARATE handlers.
+                #    ``stop()`` is the one that raises on a half-built world - the
+                #    case destroy()'s own comment names - and with both in one try
+                #    a raising stop() skipped the clear_instance() that is the
+                #    entire point, silently restoring the bug the fix removes.
+                #
+                # Both are best-effort and logged: this path already has a failure
+                # to report, and a cleanup error must not replace it.
+                if self._world is not None:
+                    try:
                         self._world.stop()
-                        self._world.clear_instance()
-                except (RuntimeError, OSError, AttributeError) as cleanup_exc:
+                    except (RuntimeError, OSError, AttributeError) as stop_exc:
+                        logger.warning(
+                            "World.stop() after a failed create_world raised (the original failure is "
+                            "reported, and clear_instance is still attempted): %s",
+                            stop_exc,
+                        )
+                try:
+                    World.clear_instance()
+                except (RuntimeError, OSError, AttributeError) as clear_exc:
                     logger.warning(
-                        "World cleanup after a failed create_world raised (the original failure is reported): %s",
-                        cleanup_exc,
+                        "World.clear_instance() after a failed create_world raised; a stale singleton may "
+                        "outlive this call and be returned to the next create_world() (the original "
+                        "failure is reported): %s",
+                        clear_exc,
                     )
                 self._world = None
                 logger.error("Failed to create Isaac world: %s", e)
