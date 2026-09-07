@@ -4336,6 +4336,15 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             render_on = self._config.render_mode != "headless"
             for i in range(n_substeps):
                 last = i == n_substeps - 1
+                # Replay the latched wrench, as ``step`` does. PhysX's
+                # ``apply_force_at_pos`` acts for ONE tick, and ``apply_force``
+                # stores the latch without touching PhysX at all - so a tick that
+                # does not re-push it is a tick the force is absent from. Every
+                # tick that advances ``_sim_time`` replays; a render-only pump
+                # (``_converge_render``, ``_refresh_all_render_products``) does
+                # not, because it advances no time.
+                if getattr(self, "_applied_wrenches", None):
+                    self._reapply_wrenches()
                 self._world.step(render=bool(render_on and last))
                 self._sim_time += self._config.physics_dt
                 self._step_count += 1
@@ -4725,6 +4734,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             with self._lock:
                 for rname, act in per_robot_action.items():
                     self._apply_lockstep_action(rname, act, warned_unresolved)
+                # Same replay as ``step`` and ``send_action``: this tick advances
+                # ``_sim_time``, so a latched wrench has to act on it.
+                if getattr(self, "_applied_wrenches", None):
+                    self._reapply_wrenches()
                 self._world.step(render=render_on)
                 self._sim_time += physics_dt
                 self._step_count += 1
@@ -5374,6 +5387,12 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             attempted = i + 1
             try:
                 _ensure_timeline_playing()
+                # A warmup tick advances ``_sim_time`` like any other, so it
+                # replays the latch too. Exempting it would make a latched wrench
+                # act on a tick count that depends on how many warmup passes the
+                # RTX product happened to need.
+                if getattr(self, "_applied_wrenches", None):
+                    self._reapply_wrenches()
                 self._world.step(render=True)
                 self._sim_time += self._config.physics_dt
                 self._step_count += 1

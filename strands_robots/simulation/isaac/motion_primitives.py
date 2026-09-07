@@ -97,6 +97,10 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
             """Provided by ``IsaacSimulation``; declared here for type-checkers."""
             raise NotImplementedError
 
+        def _reapply_wrenches(self) -> None:
+            """Provided by ``IsaacSimulation``; declared here for type-checkers."""
+            raise NotImplementedError
+
         def run_on_main(self, fn: Any, timeout: float | None = None) -> Any:
             """Provided by ``IsaacSimulation``; declared here for type-checkers."""
             raise NotImplementedError
@@ -336,6 +340,13 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
         caller passes IS the physics-step budget. Renders when the config is
         not headless, matching ``send_action``.
         """
+        # Replay the latched wrench before advancing, as ``step`` and
+        # ``send_action`` do: PhysX's ``apply_force_at_pos`` acts for ONE tick and
+        # ``apply_force`` stores the latch without touching PhysX, so a tick that
+        # does not re-push it is a tick the force is absent from. A primitive drive
+        # loop advances ``_sim_time`` like any other.
+        if getattr(self, "_applied_wrenches", None):
+            self._reapply_wrenches()
         self._world.step(render=self._config.render_mode != "headless")
         self._sim_time += self._config.physics_dt
         self._step_count += 1

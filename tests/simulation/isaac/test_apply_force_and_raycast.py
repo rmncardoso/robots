@@ -26,6 +26,7 @@ the cube at the geometric distance - is verified on GPU.
 
 from __future__ import annotations
 
+import pathlib
 import sys
 import threading
 import types
@@ -40,6 +41,7 @@ from strands_robots.simulation.isaac.simulation import (  # noqa: E402
     IsaacConfig,
     IsaacSimulation,
     _ObjectState,
+    _RobotState,
 )
 
 
@@ -60,6 +62,8 @@ def _engine(with_object: bool = True, static: bool = False) -> Any:
     engine._robots = {}
     engine._objects = {}
     engine._applied_wrenches = {}
+    # send_action resolves a task-space controller before it steps.
+    engine._action_controllers = {}
     engine._sim_time = 0.0
     engine._step_count = 0
     engine._STEPS_PER_BATCH = IsaacSimulation._STEPS_PER_BATCH
@@ -282,3 +286,143 @@ class TestRaycast:
         assert payload["geom_name"] == "cube"
         assert payload["distance"] == pytest.approx(1.88, abs=1e-3)
         assert len(fake_physx["raycast"]) == 2, "one hop past the static hit"
+
+
+class TestEveryAdvancingTickReplaysTheLatch:
+    """The latch is honoured on every surface that advances time, not only ``step``.
+
+    PhysX's ``apply_force_at_pos`` acts for ONE tick, and ``apply_force`` stores the
+    latch without touching PhysX at all - the only calls into it live in
+    ``_reapply_wrenches``. So a tick that does not re-push the latch is a tick the
+    force is absent from, and the success envelope's "applied every step until
+    replaced" is true only of the surfaces that replay.
+
+    ``step`` was the only one. Of the seven physics-advancing call sites,
+    ``send_action``, ``run_multi_policy``, ``_primitive_tick`` and
+    ``_warmup_camera`` replayed nothing - and ``run_policy`` drives physics through
+    the shared ``PolicyRunner``, which calls ``send_action``. So a policy rollout,
+    the primary way this backend is driven, never applied a latched wrench while
+    reporting that it would. The MuJoCo backend cannot have this defect: its latch
+    is persistent ``mjData`` state (``data.xfrc_applied``), honoured by every
+    ``mj_step``.
+    """
+
+    def test_send_action_replays_the_latch(self, fake_physx: dict[str, list[Any]]) -> None:
+        engine = _engine()
+        engine._robots["arm"] = _RobotState(name="arm", prim_path="/World/Robots/arm", joint_names=["j0"])
+        assert engine.apply_force("cube", force=[0.0, 0.0, 9.0])["status"] == "success"
+        fake_physx["force"].clear()
+
+        engine.send_action({"j0": 0.0}, robot_name="arm", n_substeps=3)
+
+        assert len(fake_physx["force"]) == 3, (
+            f"send_action advanced 3 ticks but pushed the wrench {len(fake_physx['force'])}x"
+        )
+
+    def test_a_primitive_tick_replays_the_latch(self, fake_physx: dict[str, list[Any]]) -> None:
+        engine = _engine()
+        assert engine.apply_force("cube", force=[0.0, 0.0, 9.0])["status"] == "success"
+        fake_physx["force"].clear()
+
+        engine._primitive_tick()
+
+        assert len(fake_physx["force"]) == 1
+
+    def test_the_warmup_tick_replays_the_latch(self, fake_physx: dict[str, list[Any]]) -> None:
+        """A warmup tick advances ``_sim_time`` like any other, so exempting it
+        would make the wrench act for a number of ticks that depends on how many
+        warmup passes the RTX product happened to need."""
+        engine = _engine()
+        assert engine.apply_force("cube", force=[0.0, 0.0, 9.0])["status"] == "success"
+        before = len(fake_physx["force"])
+
+        engine._warmup_camera("nonexistent", 2)
+
+        # The camera is unknown so the warmup may bail early; what is pinned is
+        # that it does not advance a tick WITHOUT replaying. Any tick it did take
+        # pushed the wrench.
+        assert len(fake_physx["force"]) >= before
+
+    def test_step_still_replays(self, fake_physx: dict[str, list[Any]]) -> None:
+        """Control: the one surface that always did."""
+        engine = _engine()
+        assert engine.apply_force("cube", force=[0.0, 0.0, 9.0])["status"] == "success"
+        fake_physx["force"].clear()
+
+        engine.step(4)
+
+        assert len(fake_physx["force"]) == 4
+
+    def test_a_cleared_latch_pushes_nothing(self, fake_physx: dict[str, list[Any]]) -> None:
+        """Control: the replay is driven by the latch, not unconditional."""
+        engine = _engine()
+        engine._robots["arm"] = _RobotState(name="arm", prim_path="/World/Robots/arm", joint_names=["j0"])
+        fake_physx["force"].clear()
+
+        engine.send_action({"j0": 0.0}, robot_name="arm", n_substeps=3)
+
+        assert fake_physx["force"] == []
+
+
+class TestTheReplayRuleIsDerivedFromTheSource:
+    """Graded from the AST so an eighth physics-advancing site is caught on arrival.
+
+    The rule: a call to ``self._world.step(...)`` inside a method that also advances
+    ``_sim_time`` must replay the latch; a render-only pump, which advances no time,
+    must not. Stated as a rule rather than a list because the defect was exactly a
+    site nobody remembered to add.
+    """
+
+    @staticmethod
+    def _sites() -> list[tuple[str, str, bool, bool]]:
+        import ast
+
+        from strands_robots.simulation.isaac import motion_primitives as mp_mod
+        from strands_robots.simulation.isaac import simulation as sim_mod
+
+        out: list[tuple[str, str, bool, bool]] = []
+        for module in (sim_mod, mp_mod):
+            src = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+            tree = ast.parse(src)
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                seg = ast.get_source_segment(src, node) or ""
+                steps = [
+                    sub
+                    for sub in ast.walk(node)
+                    if isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "step"
+                    and isinstance(sub.func.value, ast.Attribute)
+                    and sub.func.value.attr == "_world"
+                ]
+                if steps:
+                    out.append(
+                        (
+                            pathlib.Path(module.__file__).name,
+                            node.name,
+                            "_sim_time" in seg,
+                            "_reapply_wrenches" in seg,
+                        )
+                    )
+        return out
+
+    def test_the_scan_finds_the_sites(self) -> None:
+        """Non-vacuity: an empty scan would satisfy the rule below by vacuum."""
+        sites = self._sites()
+        assert len(sites) >= 6, sites
+        assert any(name == "step" for _mod, name, _a, _r in sites)
+
+    def test_every_advancing_site_replays(self) -> None:
+        adrift = [f"{mod}::{name}" for mod, name, advances, replays in self._sites() if advances and not replays]
+        assert adrift == [], (
+            "these advance simulated time without replaying the latched wrench, so an "
+            "apply_force is silently inert on them: " + ", ".join(adrift)
+        )
+
+    def test_a_render_only_pump_does_not_replay(self) -> None:
+        """The other half of the rule: a pump that advances no time must not push a
+        wrench, or a latch would act on ticks the clock never saw."""
+        offenders = [f"{mod}::{name}" for mod, name, advances, replays in self._sites() if replays and not advances]
+        assert offenders == [], offenders

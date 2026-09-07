@@ -45,3 +45,37 @@ distance matching the geometric value to sub-millimeter (1.8800 m vs 1.88) and
 `include_static=False` over bare ground answering "no hit". 23 unit tests over
 the domains, the latch bookkeeping, the per-tick replay, and the raycast
 translation with the static-hop.
+
+**Every tick that advances simulated time replays the latch, not just `step()`.**
+PhysX's `apply_force_at_pos` acts for ONE tick, and `apply_force` stores the latch
+without touching PhysX at all - the only calls into it live in
+`_reapply_wrenches`. So a tick that does not re-push the latch is a tick the force
+is absent from, and the success envelope's "applied every step until replaced" is
+true only of the surfaces that replay.
+
+Of the seven physics-advancing call sites, `step()` was the only one that did.
+`send_action`, `run_multi_policy._apply_all_and_step`, `_primitive_tick` and
+`_warmup_camera` replayed nothing - and `run_policy` drives physics through the
+shared `PolicyRunner`, which calls `send_action`. So a policy rollout, the primary
+way this backend is driven, never applied a latched wrench while reporting that it
+would:
+
+```python
+sim.apply_force("cube", force=[0, 0, 20])   # "applied every step until replaced"
+sim.run_policy("arm", policy_provider="mock")
+# before: the cube was never accelerated. Nothing logged, nothing warned.
+```
+
+That silently turns a disturbance-rejection eval, a wind-field randomization sweep
+or a push-recovery benchmark into a measurement of an *undisturbed* rollout,
+reported as the perturbed one. The MuJoCo backend cannot have this defect: its
+latch is persistent `mjData` state (`data.xfrc_applied`), honoured by every
+`mj_step`.
+
+The rule is now stated rather than enumerated - a tick that advances `_sim_time`
+replays; a render-only pump (`_converge_render`,
+`_refresh_all_render_products`), which advances no time, must not, or a latch
+would act on ticks the clock never saw. A grader derives both halves from the
+module AST, so an eighth call site is graded the hour it lands. The shipped test
+had exercised only `engine.step(...)`, which is why every latch case passed.
+
