@@ -234,6 +234,24 @@ open a window.
 - **Robots** - `add_robot` (procedural builders, or USD via `usd_path=`, or
   URDF), `remove_robot`, `list_robots`, `robot_joint_names`, `send_action`,
   `get_observation`.
+
+  `add_robot(..., fix_base=False)` gives a URDF robot a **floating base**, which
+  is what a humanoid or quadruped needs; the default `True` welds the root, as
+  every URDF import here used to do unconditionally. It is a parameter rather
+  than something read from the file because URDF cannot answer it - the universal
+  convention for a mobile robot is a root link with no parent joint, which is
+  byte-identical to how a bolted-down arm declares its base - which is why
+  Isaac's own importer takes the flag and why MuJoCo and Newton, reading MJCF's
+  `<freejoint>`, have no equivalent parameter. It applies to `urdf_path` only: a
+  USD asset carries its own articulation root, so `fix_base=False` there is
+  refused rather than ignored.
+
+  A floating-base robot reports the four `base_*` observation entries the
+  `SimEngine.get_observation` schema requires (`base_pos`, `base_quat`,
+  `base_lin_vel`, `base_ang_vel`), matching MuJoCo and Newton; a fixed-base arm
+  reports none of them, as the schema specifies. Note that a `reset()` does not
+  preserve a floating base's spawn height - see `add_robot`'s docstring for the
+  measurement and the reason.
 - **Objects** - `add_object` (`cuboid` / `sphere` / `cylinder` / `capsule` /
   `mesh`, dynamic or static), `remove_object`. A `shape="mesh"` add takes a
   `mesh_path` to an STL/OBJ/MSH asset (converted to USD once and cached under

@@ -47,6 +47,7 @@ from strands_robots.simulation.recording import undriven_robot_state
 from strands_robots.simulation.terrain import validate_difficulty
 from strands_robots.utils import (
     FREE_CAMERA_TOKENS,
+    boolean_flag_error,
     camera_fov_error,
     coerce_orientation_quaternion,
     coerce_pose_vector,
@@ -630,7 +631,18 @@ class _RobotState:
         actual_prim_path: str | None = None,
         data_config: str | None = None,
         usd_to_urdf_joint_names: dict[str, str] | None = None,
+        fixed_base: bool = True,
     ):
+        #: Whether this robot's root is welded to the world. ``True`` is the
+        #: historical behaviour and stays the default: every URDF import hardcoded
+        #: ``fix_base=True``, so no robot on this backend could fall, and
+        #: ``get_observation`` emitted none of the ``base_*`` keys the
+        #: ``SimEngine`` schema requires of a floating base - consistently, since
+        #: a welded base's pose is a constant. Recorded per robot rather than read
+        #: back off the stage because the two questions differ for a USD robot
+        #: this backend did not import: what the importer was told is knowable,
+        #: what an arbitrary USD asset declares is not always.
+        self.fixed_base = fixed_base
         self.name = name
         self.prim_path = prim_path
         self.joint_names = joint_names
@@ -1818,6 +1830,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         position: list[float] | None = None,
         orientation: list[float] | None = None,
         keyframe: str | int | None = None,
+        fix_base: bool = True,
     ) -> dict[str, Any]:
         """Add a robot to the simulation.
 
@@ -1866,6 +1879,44 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             contract). Use ``create_simulation(backend="mujoco")`` to spawn
             at a keyframe, or omit ``keyframe`` for the default zero-pose
             spawn.
+        fix_base : bool, optional
+            Whether to weld the robot's root to the world. Default ``True``,
+            which is what every URDF import here did unconditionally - so a
+            humanoid or quadruped could not fall, walk, or be pushed, and
+            nothing said so. Pass ``False`` for a floating base.
+
+            It is a parameter rather than something read out of the file because
+            URDF cannot answer it. The format has a ``floating`` joint type, but
+            the universal convention for a mobile robot is a root link with no
+            parent joint at all - which is byte-identical to how a bolted-down
+            arm declares its base, so the consumer chooses. That is why Isaac's
+            own importer takes the flag, and why this forwards it instead of
+            inferring. MJCF *can* say (``<freejoint>``), and MuJoCo and Newton
+            read it from there, which is why neither has this parameter.
+
+            ``True`` stays the default because it is the current behaviour and
+            because the shipped LIBERO Franka depends on it; a fixed-base arm is
+            also the common case here.
+
+            A floating base is what makes the ``base_pos`` / ``base_quat`` /
+            ``base_lin_vel`` / ``base_ang_vel`` entries of the
+            :meth:`~strands_robots.simulation.base.SimEngine.get_observation`
+            schema meaningful, and :meth:`get_observation` emits them only for
+            such a robot - a welded base would report four constants.
+
+            **A ``reset()`` does not preserve a floating base's spawn height.**
+            Measured on nvcr.io/nvidia/isaac-sim:6.0.1 (A10G), a robot added at
+            ``position=[0, 0, 1.2]`` reads ``base_pos`` z ``1.2`` immediately, and
+            ``0.0402`` after a ``reset()`` - because ``world.reset()`` re-applies
+            each registered prim's default state on ``post_reset``, which is the
+            same mechanism :meth:`load_scene` deliberately avoids a reset for
+            (#1802). Recording the spawn pose via the articulation's
+            ``set_default_state`` was tried and does not change that reading, so
+            this is stated rather than worked around: to drop a robot from a
+            height, step from the pose ``add_robot`` leaves rather than resetting
+            first. Without an intervening reset the fall is clean - the same robot
+            went ``1.2 -> 1.1898 -> 0.9786 -> 0.2245 -> 0.05`` over 120 steps and
+            settled on the ground at its base half-height.
 
         Validation
         ----------
@@ -1970,6 +2021,40 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             # structured envelope this method documents as its failure channel.
             if (name_err := entity_name_error("add_robot", "name", name)) is not None:
                 return {"status": "error", "content": [{"text": name_err}]}
+
+            # A posture flag, checked rather than read by truthiness: it selects
+            # whether the root is welded, and a truthy non-boolean would pick the
+            # opposite posture from the one it reads as. ``fix_base="false"`` and
+            # ``fix_base="no"`` are the spellings that matter - both non-empty
+            # strings, so both truthy, so both would WELD the base of a caller who
+            # spelled out that they wanted it free, and the only symptom is a
+            # humanoid that never falls under a success envelope.
+            if (base_err := boolean_flag_error(fix_base, "fix_base", "add_robot")) is not None:
+                return {"status": "error", "content": [{"text": base_err}]}
+            fix_base = bool(fix_base)
+
+            # ``fix_base`` is settable only where the importer takes it, which is
+            # the URDF path. A USD asset carries its own articulation root and a
+            # procedural builder authors its own prims, so honouring the flag
+            # there would mean editing someone else's asset; refuse rather than
+            # accept-and-ignore, which would leave the caller believing they had
+            # a floating base and the ``base_*`` observation keys believing the
+            # opposite.
+            if not fix_base and urdf_path is None:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "add_robot: fix_base=False is only supported for a urdf_path "
+                                "import, because that is the one path whose importer takes the "
+                                "flag. A USD asset declares its own articulation root, and a "
+                                "procedural build authors its own prims. Pass urdf_path= for a "
+                                "floating base, or author the free root into the USD."
+                            )
+                        }
+                    ],
+                }
 
             if name in self._robots:
                 return {
@@ -2101,7 +2186,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 # names. Pre-Phase-2 it returned joint_names=[] and
                 # silently did nothing.
                 try:
-                    joint_names, articulation = self._load_urdf_robot(prim_path, urdf_path, pos)
+                    joint_names, articulation = self._load_urdf_robot(prim_path, urdf_path, pos, fix_base)
                 except (RuntimeError, ValueError, OSError, AttributeError, TypeError, ImportError) as e:
                     # Cleanup-clause shape mirrors the USD branch above
                     # plus create_world (#52 precedent). RuntimeError
@@ -2130,6 +2215,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     actual_prim_path=getattr(articulation, "_strands_actual_prim_path", None),
                     data_config=data_config,
                     usd_to_urdf_joint_names=getattr(articulation, "_strands_usd_to_urdf_joint_names", None),
+                    fixed_base=fix_base,
                 )
                 self._robots[name] = robot_state
 
@@ -3794,6 +3880,38 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     # drift, ValueError/TypeError on np coercion. Programming
                     # bugs propagate.
                     logger.debug("Failed to get joint positions: %s", e)
+
+                # Floating base: the four entries the ``SimEngine.get_observation``
+                # schema requires of a robot whose root is free. MuJoCo emits them
+                # (``mujoco/rendering.py``) and Newton emits them
+                # (``newton/simulation.py``); this backend emitted none, so a
+                # locomotion policy reading ``base_lin_vel`` - the base twist every
+                # walking controller is conditioned on - got nothing here, while
+                # the same policy on the other two backends got a value. That is
+                # the one asymmetry that makes the documented "policies and
+                # observation mappings transfer unchanged between backends" false
+                # for a legged robot.
+                #
+                # Emitted only for a floating base, because a welded root would
+                # report four constants and the schema reserves these keys for a
+                # robot that has a base to report ("Absent for fixed-base arms").
+                if not robot.fixed_base:
+                    try:
+                        base_pos, base_quat = robot.articulation.get_world_pose()
+                        lin_vel = robot.articulation.get_linear_velocity()
+                        ang_vel = robot.articulation.get_angular_velocity()
+                    except (RuntimeError, ValueError, AttributeError, TypeError) as e:
+                        # Same degraded mode as the joint read above, and for the
+                        # same reasons: an uninitialised world, or a handle whose
+                        # surface has drifted. Omitting the keys is what the schema
+                        # licenses ("Absent for fixed-base arms"); substituting
+                        # zeros would report a base at the origin, at rest.
+                        logger.debug("Failed to read the floating base state: %s", e)
+                    else:
+                        obs["base_pos"] = [float(v) for v in base_pos]
+                        obs["base_quat"] = [float(v) for v in base_quat]
+                        obs["base_lin_vel"] = [float(v) for v in lin_vel]
+                        obs["base_ang_vel"] = [float(v) for v in ang_vel]
 
             # Camera frames keyed by camera name (RGB HxWx3 uint8), so callers
             # (e.g. the SO-101 collector / Gradio render) get images the same way
@@ -6586,7 +6704,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         )
         return joint_names, articulation
 
-    def _load_urdf_robot(self, prim_path: str, urdf_path: str, position: list[float]) -> tuple[list[str], Any]:
+    def _load_urdf_robot(
+        self, prim_path: str, urdf_path: str, position: list[float], fix_base: bool = True
+    ) -> tuple[list[str], Any]:
         """Load a robot from a URDF file. Returns ``(joint_names, articulation)``.
 
         Phase 2 wiring (#14): the previous Phase-1 stub silently
@@ -6665,7 +6785,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             cfg = URDFImporterConfig()
             cfg.urdf_path = os.path.abspath(urdf_path)
             for attr, val in (
-                ("fix_base", True),
+                ("fix_base", fix_base),
                 ("merge_fixed_joints", False),
                 ("allow_self_collision", False),
                 ("collision_from_visuals", False),
@@ -6711,7 +6831,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 from omni.importer.urdf import _urdf  # type: ignore[import-not-found]
 
             import_config = _urdf.ImportConfig()
-            import_config.fix_base = True
+            import_config.fix_base = fix_base
             import_config.import_inertia_tensor = True
             import_config.create_physics_scene = False
             import_config.distance_scale = 1.0
