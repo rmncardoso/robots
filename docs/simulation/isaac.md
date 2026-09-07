@@ -19,8 +19,8 @@ on Python 3.12, or out-of-band (see below).
 - You have an NVIDIA RTX GPU (Ubuntu 22.04+, CUDA 12+) and want photoreal,
   path-traced observations for sim2real visuals or paper-grade frames.
 - You want USD-native scenes (real CAD assets, Nucleus, IsaacLab compatibility).
-- You want Replicator synthetic data - ground-truth depth, segmentation, and
-  bounding boxes alongside RGB.
+- You want RTX metric depth alongside RGB, for depth-aware compositing
+  (`get_frame` returns an `(H, W) float32` buffer in metres).
 - You want fleet RL on PhysX GPU with 1024+ parallel environments.
 
 On macOS / Apple Silicon or CPU-only hosts, install the lightweight default
@@ -34,23 +34,64 @@ Install the Isaac Sim runtime first, then the `sim-isaac` extra:
 
 ```bash
 # Step 1 - install Isaac Sim 6.0 (Python 3.12) via one of:
-#   - pip wheels (see caveats below):
-#       pip install 'isaacsim[all,extscache]==6.0.*' --extra-index-url https://pypi.nvidia.com
+#   - NGC Docker (the only route verified to RENDER; see below):
+#       docker pull nvcr.io/nvidia/isaac-sim:6.0.1
 #   - Omniverse Launcher -> Isaac Sim 6.0, OR
 #   - Isaac Lab: git clone IsaacLab && ./isaaclab.sh -i, OR
-#   - NGC Docker: docker pull nvcr.io/nvidia/isaac-sim:6.0
+#   - pip wheels (physics only - no RTX frames; see caveats below):
+#       pip install 'isaacsim[all,extscache]==6.0.*' --extra-index-url https://pypi.nvidia.com
 
 # Step 2 - install the sim-isaac extra (helpers for the built-in backend):
 pip install 'strands-robots[sim-isaac]'
 ```
 
+Use a full `major.minor.patch` docker tag. NVIDIA publishes no `major.minor` tag
+for this image, so `nvcr.io/nvidia/isaac-sim:6.0` and `:latest` both fail with
+`no such manifest`; `6.0.1`, `6.0.0`, `5.0.0` and `4.5.0` exist. `6.0.1` is the
+tag this backend is verified against.
+
 The `sim-isaac` extra lives in **`strands-robots`** (a peer of `sim-mujoco` and
-`sim-newton`). Requesting `create_simulation("isaac")` without the extra
-installed raises a `ValueError` whose message carries the exact install hint
-(`pip install 'strands-robots[sim-isaac]'`). Backend discovery is lazy, so
-MuJoCo-only users never pay the Isaac Sim import cost.
+`sim-newton`). Backend discovery is lazy, so MuJoCo-only users never pay the
+Isaac Sim import cost - and that laziness is why `create_simulation("isaac")`
+**succeeds** with no Isaac Sim installed rather than refusing: nothing imports
+the runtime until you build a world. The failure arrives at `create_world()`, as
+the structured error every `SimEngine` method returns, naming each install route:
+
+```python
+sim = create_simulation("isaac")     # succeeds - resolves the in-tree backend
+sim.create_world()
+# {"status": "error", "content": [{"text":
+#   "Isaac Sim import failed: omni.isaac.kit.SimulationApp / isaacsim.SimulationApp
+#    not available. Isaac Sim must be installed first - via pip ..., Omniverse
+#    Launcher, Isaac Lab ..., or Docker (nvcr.io/nvidia/isaac-sim:6.0.1)."}]}
+```
+
+To check up front instead, ask - this is the eager check, and it needs no world:
+
+```python
+from strands_robots.simulation.isaac import IsaacSimulation
+ok, reason = IsaacSimulation.is_available()   # (False, "<every install route>")
+```
+
+Note the contrast with the Newton backend, which *does* raise `ImportError` from
+`create_simulation("newton")` when `warp` is absent. The two differ deliberately:
+Newton imports its runtime to construct, Isaac does not.
 
 ### Installing Isaac Sim via pip - caveats
+
+> **The pip route runs physics but produces no RTX pixels.** Measured on an AWS
+> `g5.2xlarge` (A10G, an RT-core GPU): a pip-wheel install boots `SimulationApp`,
+> steps physics and reports success, and every RTX camera read comes back empty -
+> while the **same script under `nvcr.io/nvidia/isaac-sim:6.0.1` on the same
+> instance returns real frames**. That isolates it to the install route rather
+> than to the GPU, the driver, or this backend: it reproduces in *pure Isaac Sim*
+> with no `strands-robots` code in the process.
+>
+> Nothing raises, which is what makes it expensive. `render()` degrades to a blank
+> frame by contract, so a rollout recording video writes an all-black MP4 and
+> reports success; `get_frame()` raises, since it refuses degraded output. If you
+> need camera observations, dataset video, or the hybrid compositor, **use the
+> container**. Use pip only for physics, joint state and proprioceptive rollouts.
 
 Since the cp312 wheels shipped for Isaac Sim 6.0.x, the runtime itself is
 pip-installable on Python 3.12. The `extscache` extra is **required** - the
@@ -149,7 +190,6 @@ rejected eagerly. The commonly used fields:
 | `stage_path` | `str` | `"/World"` | USD prim-path prefix every created prim is addressed under. Must be absolute, with at least one component, every component a prim name (`[A-Za-z_][A-Za-z0-9_]*`). |
 | `nucleus_url` | `str \| None` | `None` | Override Omniverse Nucleus URL (env-resolvable). |
 | `camera_width` / `camera_height` | `int` | `640` / `480` | Default camera resolution, for every `add_camera` / render call that states none of its own. Positive integers - the same pixel floor those `width` / `height` arguments take. |
-| `enable_rtx_sensors` | `bool` | `True` | Enable RTX-accelerated camera / LiDAR sensors. |
 | `verbose` | `bool` | `False` | Verbose Isaac Sim / Kit logging. |
 
 ### Environment variables
