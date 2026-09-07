@@ -537,6 +537,37 @@ _RENDERER_BY_MODE: dict[str, str] = {
 }
 
 
+def _resolved_physics_device(world: Any) -> str | None:
+    """The device PhysX is solving on, or ``None`` when it cannot be read.
+
+    Read off the live physics context rather than echoed from the config,
+    because the two can disagree and the configured value alone cannot show it.
+    ``World``'s own ``device`` default is ``None``, which resolves to ``"cpu"``,
+    so for as long as this backend omitted the argument every report said
+    ``cuda:0`` while PhysX solved on the CPU at about a fifth of the throughput.
+    Reporting what was *resolved* is what makes a recurrence visible in
+    ``get_state`` instead of only in a benchmark.
+
+    A module-level function rather than a method because two of its three
+    callers are reached with a ``types.SimpleNamespace`` standing in for
+    ``self`` - the ``replicate`` suites call the unbound method with a stub - so
+    a method would raise ``AttributeError`` there for a reporting concern.
+    Taking the world as an argument keeps every caller on one implementation.
+
+    Answers ``None`` rather than raising when there is no world yet or the
+    runtime does not expose the attribute: this feeds status reads, and a status
+    read must not be the thing that fails.
+    """
+    if world is None:
+        return None
+    try:
+        context = world.get_physics_context()
+    except (AttributeError, RuntimeError):
+        return None
+    device = getattr(context, "device", None)
+    return str(device) if device else None
+
+
 def _get_or_create_simulation_app(
     headless: bool = True,
     launch_config: SimulationAppLaunchConfig | None = None,
@@ -1184,8 +1215,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         # an example's opening rollout. Env-tunable for headroom on slow GPUs.
         self._camera_warmup_steps = _env_int("STRANDS_ISAAC_CAMERA_WARMUP_STEPS", 10)
 
+        # device_requested, not device: no world exists yet, so the physics
+        # context cannot be asked what it resolved. create_world reports that.
         logger.info(
-            "IsaacSimulation initialized: num_envs=%d, device=%s, headless=%s",
+            "IsaacSimulation initialized: num_envs=%d, device_requested=%s, headless=%s",
             config.num_envs,
             config.device,
             config.headless,
@@ -1464,11 +1497,29 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 dt = timestep if timestep is not None else self._config.physics_dt
                 grav = gravity
 
-                # Create World
+                # Create World.
+                #
+                # ``device`` is forwarded, and that is the whole reason this
+                # backend runs on the GPU. ``World``'s own default is ``None``,
+                # which resolves to ``"cpu"`` - so while ``IsaacConfig.device``
+                # defaulted to ``"cuda:0"``, was validated to require CUDA, and
+                # was reported as ``cuda:0`` by ``get_status``, ``describe`` and
+                # ``__repr__``, PhysX was solving on the CPU for every caller.
+                # Measured through this class on an A10G, 40 cuboids, 300
+                # step() calls after a 30-step warmup, one container per arm:
+                #
+                #   without   reported cuda:0   resolved 'cpu'      9.9 steps/s
+                #   with      reported cuda:0   resolved 'cuda:0'  112.3 steps/s
+                #
+                # 11.3x, on the one property Isaac is selected over MuJoCo for.
+                # The reported device is the SAME in both rows, which is why this
+                # survived: every surface echoed the config's value rather than
+                # reading what the physics context resolved.
                 self._world = World(
                     stage_units_in_meters=1.0,
                     physics_dt=dt,
                     rendering_dt=self._config.rendering_dt,
+                    device=self._config.device,
                 )
 
                 # Set gravity
@@ -1509,7 +1560,11 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     "ground_plane": bool(ground_plane and self._config.ground_plane),
                     "stage_path": self._config.stage_path,
                     "stage_units_in_meters": 1.0,
-                    "device": self._config.device,
+                    # Resolved, not requested: the world exists by now, so the
+                    # first thing a caller reads can be the device PhysX chose
+                    # rather than the one it was handed.
+                    "device": _resolved_physics_device(self._world) or self._config.device,
+                    "device_requested": self._config.device,
                     "headless": self._config.headless,
                     "render_mode": self._config.render_mode,
                     "num_envs": self._config.num_envs,
@@ -1526,7 +1581,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                             "text": (
                                 f"Isaac Sim world created. "
                                 f"dt={dt:.5f}, gravity={grav}, "
-                                f"device={self._config.device}, "
+                                f"device={world_info['device']}, "
                                 f"headless={self._config.headless}"
                             ),
                             "json": world_info,
@@ -1980,7 +2035,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         Returns
         -------
         dict
-            Status dict with state information.
+            Status dict with state information. ``device`` is the device PhysX
+            resolved, which is the one that matters; ``device_requested`` is
+            what the config asked for. They are reported separately because
+            they were silently able to differ.
         """
         with self._lock:
             if not self._world_created:
@@ -1994,7 +2052,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 "num_cameras": len(self._cameras),
                 "num_objects": len(self._objects),
                 "stage_path": self._config.stage_path,
-                "device": self._config.device,
+                "device": _resolved_physics_device(self._world) or self._config.device,
+                "device_requested": self._config.device,
                 "headless": self._config.headless,
                 "render_mode": self._config.render_mode,
             }
@@ -7438,7 +7497,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                             f"Cloned the scene into {n} environments ({len(targets)} clones of "
                             f"{len(sources)} source prim(s) plus the source as env_0, "
                             f"{prims_created} prims) in {elapsed * 1000:.0f}ms at "
-                            f"{grid_spacing:.2f}m spacing on {self._config.device}."
+                            f"{grid_spacing:.2f}m spacing on {_resolved_physics_device(self._world) or self._config.device}."
                             f"{collision_note} "
                             f"NOTE: get_observation/send_action address env_0 only - there is no "
                             f"per-environment action API, so the clones advance under physics but "
