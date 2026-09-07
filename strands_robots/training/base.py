@@ -518,6 +518,45 @@ class Trainer(ABC):
 
         return checkpoint_cadence_problems(spec, context=self.provider_name)
 
+    def _rl_checkpoint_interval_problems(self, spec: TrainSpec) -> list[str]:
+        """Checkpoint-cadence preflight for the RL loop, on its own field.
+
+        Returns a problem when :attr:`RLTrainSpec.log_interval` is not a whole
+        number of iterations, against the same shared step-cadence domain
+        :meth:`_checkpoint_cadence_problems` holds ``save_freq`` to. A
+        :meth:`validate` implementation whose loop paces ``save_checkpoint`` on
+        ``it % log_interval`` MUST call this: the field is the RL run's
+        checkpoint cadence, and the modulus judges it no more than lerobot's
+        does. ``nan`` satisfies the truthiness guard and never the modulus, so a
+        run that asked to checkpoint every few iterations silently keeps only
+        its final one and still reports ``status="success"`` - the reading that
+        matters most for RL, where return is non-monotonic and the deployable
+        policy is often an earlier checkpoint. ``True`` is a cadence of one, a
+        fraction is a silently different cadence, and a string raises
+        ``TypeError`` out of the loop after ``setup`` has built the env, the
+        networks and the optimizers. Only the type is graded: ``0`` is the
+        documented "no intermediate checkpoints" mode.
+
+        Scoped like :meth:`_network_width_problems` rather than like
+        :meth:`_gae_lambda_problems`: all three RL backends run the same loop
+        over the same field, so there is no RL backend for which reporting on it
+        would be a false rejection. A supervised backend does not read it and
+        MUST NOT report on it - it has ``save_freq`` for the same question.
+
+        Imported lazily for the same reason as :meth:`_security_problems` - to
+        keep the ``base -> _validate`` import one-way at runtime.
+
+        Args:
+            spec: The spec to preflight.
+
+        Returns:
+            A single problem when the cadence cannot be honored; empty
+            otherwise.
+        """
+        from strands_robots.training._validate import rl_checkpoint_interval_problems
+
+        return rl_checkpoint_interval_problems(spec, context=self.provider_name)
+
     def _validation_episodes_problems(self, spec: TrainSpec) -> list[str]:
         """Held-out-validation preflight shared by every backend that reads it.
 
@@ -747,6 +786,130 @@ class Trainer(ABC):
         from strands_robots.training._validate import initial_temperature_problems
 
         return initial_temperature_problems(spec, context=self.provider_name)
+
+    def _target_entropy_problems(self, spec: TrainSpec) -> list[str]:
+        """Target-entropy preflight, for backends that tune a temperature.
+
+        Returns a problem when :attr:`RLTrainSpec.target_entropy` is neither the
+        ``None`` sentinel nor a finite real of either sign. It is the third field
+        of FastSAC's temperature block, and a backend that builds that block MUST
+        call this **alongside** :meth:`_initial_temperature_problems` and
+        :meth:`_temperature_learning_rate_problems`: those two guard the
+        temperature's starting value and the rate that moves it, and this one the
+        constant it is moved *toward*, so guarding two of the three leaves the
+        third to the arithmetic that spends it.
+
+        The domain is signed, which is why it is
+        :func:`~strands_robots.utils.finite_number_error` rather than the
+        positive-finite domain its two neighbours read: the field defaults to
+        ``-num_actions``, so every reading of it is a negative entropy in nats and
+        no endpoint is decidable. ``target_entropy=True`` is therefore not merely
+        a flag read as a number but a silent sign flip - a target of ``+1.0`` -
+        and a run that took it reported success while checkpointing a different
+        temperature. ``nan`` poisons ``alpha``, which scales the entropy term of
+        both the critic target and the actor loss, and the next rollout raises
+        from inside ``torch.distributions.Normal`` about ``nan`` policy means; a
+        list or a dict raises ``TypeError`` out of the ``float()`` coercion in
+        ``setup``.
+
+        ``None`` is exempt rather than refused: unlike ``init_alpha`` and
+        ``alpha_lr`` this field is annotated ``float | None``, and ``None`` is the
+        documented request for the ``-num_actions`` heuristic.
+
+        Like :meth:`_initial_temperature_problems` this is not scoped to
+        ``autotune_alpha``: the coercion in ``setup`` is unconditional, so a
+        non-real value raises on either branch.
+
+        Only a backend that optimizes a temperature against a target entropy may
+        call this: like :meth:`_gae_lambda_problems`, and unlike
+        :meth:`_learning_rate_problems`, a backend that does not read the field
+        MUST NOT report on it, because per :class:`TrainSpec` a backend ignores
+        the fields it does not support.
+
+        Imported lazily for the same reason as :meth:`_security_problems` - to
+        keep the ``base -> _validate`` import one-way at runtime.
+
+        Args:
+            spec: The spec to preflight.
+
+        Returns:
+            A single-element list when ``target_entropy`` cannot be honored;
+            empty when it can.
+        """
+        from strands_robots.training._validate import target_entropy_problems
+
+        return target_entropy_problems(spec, context=self.provider_name)
+
+    def _polyak_coefficient_problems(self, spec: TrainSpec) -> list[str]:
+        """Polyak-coefficient preflight, for a backend that keeps a target network.
+
+        Returns a problem when :attr:`RLTrainSpec.tau` is not a real number in
+        ``(0, 1]``. It is the rate at which a target network tracks its online
+        network, spent in one expression per mirrored critic pair,
+        ``tp.mul_(1.0 - spec.tau).add_(spec.tau * p)``, so it decides whether a
+        separate target network exists at all rather than merely how fast it
+        moves.
+
+        The interval is the one the two on-policy interval gates cite as their
+        precedent - :meth:`_discount_factor_problems` and
+        :meth:`_gae_lambda_problems` both generalize "``tau`` must be in
+        ``(0, 1]``" - and it is half-open where theirs is closed because zero is
+        a degenerate spelling here: it freezes the target parameters at their
+        initialization for the whole run. The upper endpoint stays inside, being
+        the deliberate hard update ``tp = p``.
+
+        The two backends each carried a bare local interval comparison against
+        those bounds instead, which admitted ``True`` as a silent ``tau`` of one -
+        a target network that is a copy of the online network, measured as an
+        exactly zero online-to-target gap in the exported checkpoint of a run
+        that reported success - and raised ``TypeError`` out of the comparison
+        itself on a numeric string, ``None`` or a list, from a :meth:`validate`
+        documented to *return* its problems.
+
+        Only a backend that maintains a target network may call this: like
+        :meth:`_gae_lambda_problems`, and unlike :meth:`_learning_rate_problems`,
+        a backend that does not read the field MUST NOT report on it, because
+        per :class:`TrainSpec` a backend ignores the fields it does not support.
+        PPO has no target network and never reads ``tau``.
+
+        Imported lazily for the same reason as :meth:`_security_problems` - to
+        keep the ``base -> _validate`` import one-way at runtime.
+
+        Args:
+            spec: The spec to preflight.
+
+        Returns:
+            A single-element list when ``tau`` cannot be honored; empty when it
+            can.
+        """
+        from strands_robots.training._validate import polyak_coefficient_problems
+
+        return polyak_coefficient_problems(spec, context=self.provider_name)
+
+    def _spec_device_problems(self, spec: TrainSpec) -> list[str]:
+        """Device preflight for a backend that places its tensors from the spec.
+
+        Returns a problem when :attr:`RLTrainSpec.device` is not a device string
+        torch can parse. Distinct from
+        :meth:`~strands_robots.training.lerobot.LerobotTrainer._device_problems`,
+        which grades that trainer's ``device`` *constructor* knob: this one grades
+        the field on the spec, which is where the from-scratch RL backends carry
+        it. Both consult one domain,
+        :func:`~strands_robots.utils.torch_device_error`.
+
+        Imported lazily for the same reason as :meth:`_security_problems` - to
+        keep the ``base -> _validate`` import one-way at runtime.
+
+        Args:
+            spec: The spec to preflight.
+
+        Returns:
+            A single-element list when ``device`` cannot be honored; empty when
+            it can or when it is unstated.
+        """
+        from strands_robots.training._validate import torch_device_problems
+
+        return torch_device_problems(spec, context=self.provider_name)
 
     def _gradient_clip_problems(self, spec: TrainSpec) -> list[str]:
         """Gradient-clip preflight for a backend that clips before it steps.

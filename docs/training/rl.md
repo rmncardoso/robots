@@ -136,6 +136,17 @@ device as the network (no cross-device tensor mismatch and no per-step
 host-to-device copies). Pass `device="cpu"` explicitly to keep everything on
 CPU even on a GPU machine.
 
+`validate()` refuses a `device` no torch build can parse, before `setup()` builds
+anything, on the same domain the `lerobot_train` tool and `LerobotTrainer` apply
+to the value they hand to lerobot. Only the *spelling* is graded, never
+availability: `device="cuda"` on a CPU-only host is a valid spec, because a
+queued or containerised run is written on one machine and executed on another. A
+non-string is refused without consulting torch at all -- `torch.device(1)`
+constructs on any host and then fails at the first `.to()` with `CUDA error:
+invalid device ordinal`, so asking torch about an ordinal would make one spec
+launch on a multi-GPU box and abort on a single-GPU one. Leaving `device` unset
+(or falsy) still selects the documented default above.
+
 ## FastSAC
 
 `FastSacTrainer` is the **off-policy** trainer: it keeps a replay buffer of past
@@ -173,6 +184,35 @@ The off-policy fields on `RLTrainSpec` (`buffer_size`, `batch_size`,
 `alpha_lr`, `target_entropy`) are read only by SAC; on-policy PPO ignores them.
 `target_entropy` defaults to `-num_actions` (the SAC heuristic) when left
 `None`. Like PPO, `FastSacTrainer` trains fine on CPU.
+
+The three fields of the temperature block are each preflighted, on two different
+domains. `init_alpha` (the temperature's starting value) and `alpha_lr` (the rate
+that moves it) must be positive and finite, because the first reaches
+`torch.log` and the second is an optimizer's learning rate. `target_entropy` -
+the constant the temperature is optimized *toward* - is instead any **finite real
+of either sign**, checked against the same shared domain as the on-policy loss
+weights: the field defaults to `-num_actions`, so every reading of it is negative
+and no endpoint is decidable, while a value that is not a finite real has no
+reading at all. Over a 40-timestep run, `validate()` used to return `[]` for all
+of them: `nan`, `inf` and `-inf` made `alpha_loss` non-finite, and since `alpha`
+scales the entropy term of both the critic's TD target and the actor loss, the
+next rollout raised `ValueError` from inside `torch.distributions.Normal` about a
+tensor of `nan` policy means - naming that distribution's parameter rather than
+the field, after the env, both networks and a full rollout had been built.
+`target_entropy=True` was worse than a crash: `bool` is an `int` subclass, so it
+is a target entropy of `+1.0` where the field's own default is `-6.0` for that
+env, and the run reported `status="success"` while checkpointing
+`log_alpha == -0.0018031001091003418` against the honored run's
+`-0.001801646314561367` - it demonstrably drove the temperature somewhere else. A
+list or a dict raised `TypeError` out of the `float()` coercion in `setup`.
+
+`None` is exempt from that domain rather than refused by it: unlike `init_alpha`
+and `alpha_lr`, which are annotated `float` with concrete defaults, this field is
+annotated `float | None` and its `None` is the documented request for the
+heuristic. And the check is not conditioned on `autotune_alpha` even though only
+the tuning branch spends the value, because the coercion that reads it is
+unconditional - with tuning off a list raises the same `TypeError`, while `nan`
+reaches a successful run that simply never spends it.
 
 ## BaseRLAlgo
 
@@ -355,6 +395,42 @@ successful, deployable run whose objective was not the configured one:
 `clamp(ratio, -inf, inf)` returns the ratio unchanged, so it is the field's only
 spelling of *do not clip* - and the two bounds share one domain helper rather
 than a copy each.
+
+`log_interval` must be a whole number of iterations, checked by `validate()` on
+all three backends. **It is the RL run's checkpoint cadence, not a logging one**:
+no RL module emits a progress log, and the field is read in exactly one
+expression - `it % log_interval == 0` - which decides whether `save_checkpoint`
+runs for that iteration. So it answers for an RL run what
+[`TrainSpec.save_freq`](overview.md) answers for a supervised one
+(RL reads this field and ignores that one), and it takes the same shared
+step-cadence domain, because the modulus judges the value no more than lerobot's
+does. Measured on the loop over 20 iterations, against the `[1, 6, 11, 16, 20]`
+an `int` cadence of `5` writes:
+
+| `log_interval` | Checkpoints written | Reading |
+|---|---|---|
+| `5` | 5, at 1/6/11/16/20 | the requested schedule |
+| `True` | **20** | a modulus of one - one every iteration |
+| `2.5` | 5, at 1/6/11/16/20 | the schedule of `5`, not of `2.5` |
+| `0.3` | **2**, at 1 and 20 | the periodic checkpoints are gone |
+| `nan` | **1**, at 20 | silently the *disabled* mode |
+| `inf` | **2**, at 1 and 20 | ditto |
+| `"5"` | **0** | `TypeError` out of `train()`, after `setup` |
+| `0` | 1, at 20 | the supported "no intermediate checkpoints" mode |
+| `-5` | 5, at 1/6/11/16/20 | the cadence of its magnitude |
+
+`nan` is the worst of them: it satisfies the truthiness guard, never satisfies
+the modulus, and so a long run that asked to checkpoint every few iterations
+keeps only its final one - under `status="success"`. For RL those intermediate
+checkpoints are not a convenience: return is non-monotonic in training, so the
+deployable policy is often an earlier iteration, and a run that silently kept
+only its last cannot be recovered without training again.
+
+Only the *type* is graded, so this domain has no floor: `0` disables the periodic
+checkpoints and leaves the end-of-run fallback to write exactly one final
+checkpoint. A negative is accepted for the same reason and is *not* the disabled
+mode here - unlike lerobot's `save_freq > 0` test, this loop guards on bare
+truthiness - so which spelling disables is the loop's business, not the domain's.
 
 ## Worked example
 
