@@ -988,7 +988,12 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         timestep : float, optional
             Override physics_dt from config.
         gravity : list[float], optional
-            Override gravity vector from config. [gx, gy, gz].
+            Gravity vector ``[gx, gy, gz]``, or a real scalar taken as the
+            z-component. Omitted, :attr:`IsaacConfig.gravity` is used; either
+            way the value takes the same domain - three finite, non-boolean
+            components, Z-aligned - because this backend's
+            ``PhysicsContext.set_gravity`` takes a signed scalar and cannot
+            honour an off-axis vector.
         ground_plane : bool
             Whether to add a ground plane. Default True.
         terrain : str, optional
@@ -1070,37 +1075,48 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         # while the result echoed the full input vector as if applied. Validate
         # up front and reject anything the backend cannot honour, rather than
         # applying a gravity the caller never asked for.
-        if gravity is not None:
-            # Normalize through the shared domain first, so the component count,
-            # the numeric domain and the boolean refusal are the ones every
-            # other gravity surface applies. The local copy coerced a scalar
-            # with ``float()``, and bool is an int subclass, so
-            # ``create_world(gravity=True)`` configured a +1 m/s^2 gravity
-            # pointing *up*; it also keyed on ``isinstance(gravity, (list, tuple))``,
-            # so a NumPy vector - which the other backends accept - was refused
-            # as "not a scalar or vector". The Z-alignment constraint below is
-            # this backend's own and is applied to the normalized components.
-            components, gravity_error = self._normalize_gravity(gravity, "create_world")
-            if components is None:
-                return cast("dict[str, Any]", gravity_error)
-            if components[0] != 0.0 or components[1] != 0.0:
-                return {
-                    "status": "error",
-                    "content": [
-                        {
-                            "text": (
-                                f"create_world: the Isaac backend only supports Z-aligned gravity "
-                                f"(its PhysicsContext.set_gravity takes a signed scalar); a non-Z-aligned "
-                                f"vector like {gravity!r} cannot be honoured. Pass a scalar or a "
-                                f"[0, 0, gz] vector, or use create_simulation(backend='mujoco') for "
-                                f"arbitrary-direction gravity."
-                            )
-                        }
-                    ],
-                }
-            # Store the normalized components so what the result reports and
-            # what the physics context receives are the same value.
-            gravity = components
+        # Resolved from config-or-argument first, the way ``effective_timestep``
+        # above is: ``IsaacConfig.gravity`` is the same value from the other
+        # owner, and gating the argument alone left every verdict below to
+        # whether the caller happened to spell the value at the call site. Read
+        # from the field, ``(0, -9.81, 0)`` still reached ``set_gravity(0.0)``
+        # and the result still echoed the full vector, a non-finite or
+        # non-numeric component still reached the physics context unexamined,
+        # and a 2-component field raised ``IndexError`` past this method's
+        # structured-error contract. ``gravity_param`` follows the source so the
+        # message names the owner to fix.
+        effective_gravity = self._config.gravity if gravity is None else gravity
+        gravity_param = "gravity" if gravity is not None else "IsaacConfig.gravity"
+        # Normalize through the shared domain, so the component count, the
+        # numeric domain and the boolean refusal are the ones every other
+        # gravity surface applies. The local copy coerced a scalar with
+        # ``float()``, and bool is an int subclass, so
+        # ``create_world(gravity=True)`` configured a +1 m/s^2 gravity pointing
+        # *up*; it also keyed on ``isinstance(gravity, (list, tuple))``, so a
+        # NumPy vector - which the other backends accept - was refused as "not a
+        # scalar or vector". The Z-alignment constraint below is this backend's
+        # own and is applied to the normalized components.
+        components, gravity_error = self._normalize_gravity(effective_gravity, "create_world", gravity_param)
+        if components is None:
+            return cast("dict[str, Any]", gravity_error)
+        if components[0] != 0.0 or components[1] != 0.0:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"create_world: the Isaac backend only supports Z-aligned gravity "
+                            f"(its PhysicsContext.set_gravity takes a signed scalar); a non-Z-aligned "
+                            f"vector like {effective_gravity!r} in {gravity_param!r} cannot be honoured. "
+                            f"Pass a scalar or a [0, 0, gz] vector, or use "
+                            f"create_simulation(backend='mujoco') for arbitrary-direction gravity."
+                        )
+                    }
+                ],
+            }
+        # Store the normalized components so what the result reports and
+        # what the physics context receives are the same value.
+        gravity = components
         with self._lock:
             if self._world_created:
                 return {
@@ -1131,7 +1147,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     from omni.isaac.core import World  # type: ignore[import-not-found]
 
                 dt = timestep if timestep is not None else self._config.physics_dt
-                grav = gravity if gravity is not None else list(self._config.gravity)
+                grav = gravity
 
                 # Create World
                 self._world = World(
@@ -1143,7 +1159,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 # Set gravity
                 # Isaac Sim 5.1: set_gravity takes a scalar magnitude, not a vector.
                 # Extract the Z-component (convention: gravity points along -Z).
-                gravity_magnitude = grav[2] if isinstance(grav, (list, tuple)) else grav
+                gravity_magnitude = grav[2]
                 self._world.get_physics_context().set_gravity(gravity_magnitude)
 
                 # Add ground plane
@@ -1172,7 +1188,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 world_info = {
                     "physics_dt": dt,
                     "rendering_dt": self._config.rendering_dt,
-                    "gravity": list(grav) if isinstance(grav, (list, tuple)) else [0.0, 0.0, float(grav)],
+                    "gravity": list(grav),
                     "ground_plane": bool(ground_plane and self._config.ground_plane),
                     "stage_path": self._config.stage_path,
                     "stage_units_in_meters": 1.0,
@@ -5831,12 +5847,25 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         Parameters
         ----------
         num_envs : int, optional
-            Number of environments. Defaults to config.num_envs.
+            Number of environments, a positive integer on the shared count
+            domain (:func:`strands_robots.utils.positive_count_error`) -- the
+            same domain :class:`~strands_robots.simulation.isaac.IsaacConfig`
+            applies to the ``num_envs`` field this argument is checked
+            *instead of*, so the two owners of one environment count reach one
+            verdict. ``None`` (the default) takes ``config.num_envs``, decided
+            by membership rather than truthiness, so a supplied ``0`` is
+            refused as the count it is instead of read as "not supplied".
 
         Returns
         -------
         dict
-            Status dict with replication info.
+            Status dict with replication info, or ``{"status": "error"}``
+            naming ``num_envs`` when the requested count cannot be honored --
+            the same channel this method's no-world and no-robot refusals use.
+            The resolved count is reported back here, by :meth:`get_state` and
+            by :meth:`destroy` as ``num_envs_released``, and it locks the scene
+            against further ``add_robot`` calls, so a count that is not one
+            cannot be accepted and announced.
         """
         with self._lock:
             if not self._world_created:
@@ -5848,7 +5877,29 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     "content": [{"text": "Add at least one robot first."}],
                 }
 
-            n = num_envs or self._config.num_envs
+            # Read the requested count by membership, not truthiness, and grade
+            # it before spending it. ``num_envs or self._config.num_envs`` read
+            # a supplied ``0`` as "not supplied" and replicated to the
+            # *configured* count instead, announcing that count under
+            # ``status: "success"`` -- the caller's explicit request discarded
+            # with nothing saying so. Every truthy value was stored unchecked
+            # and reported as an environment count three times over: by this
+            # method, by ``get_state``, and by ``destroy``'s
+            # ``num_envs_released``. ``'4'`` was the worst of them, rendering in
+            # the message below exactly as the int ``4`` does, so the text read
+            # as an ordinary success while the payload carried a ``str``. Every
+            # other config-defaulted argument on this backend already resolves
+            # this way -- ``physics_dt``, ``gravity``, and the ``width`` /
+            # ``height`` pair whose own comment states the rule: "``None`` still
+            # means 'take the config default'; membership decides that, not
+            # truthiness".
+            if (
+                num_envs is not None
+                and (envs_err := positive_count_error(num_envs, "num_envs", "replicate")) is not None
+            ):
+                return {"status": "error", "content": [{"text": envs_err}]}
+
+            n = self._config.num_envs if num_envs is None else num_envs
 
             t0 = time.perf_counter()
             # In full implementation: use omni.isaac.cloner.Cloner
