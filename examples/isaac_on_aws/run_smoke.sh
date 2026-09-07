@@ -39,9 +39,14 @@ cat > /opt/strands/inner.sh <<'INNER'
 # example asked for the wrong version. (It did - this line carried >=1.7.0
 # against a declared floor of >=1.13.0, and tests/test_dependency_audit.py is
 # what caught it.)
-REQ=$(/isaac-sim/python.sh -c "import re, pathlib; print(re.search(r'\"(strands-agents>=[^\"]*)\"', pathlib.Path('/sr/pyproject.toml').read_text()).group(1))")
-echo "installing $REQ (from pyproject)"
-/isaac-sim/python.sh -m pip -q install "$REQ" opencv-python-headless 2>&1 | tail -1
+# The \$ are escaped because this text is built inside an UNQUOTED outer heredoc
+# (<<EOF, which must expand \$URL above), so an unescaped \$( ) would be evaluated
+# by the SHELL BUILDING THE SCRIPT rather than by the container running it - which
+# is what happened: the host has no /isaac-sim/python.sh, so it failed with
+# "No such file or directory" and then "REQ: unbound variable" under set -u.
+REQ=\$(/isaac-sim/python.sh -c "import re, pathlib; print(re.search(r'\"(strands-agents>=[^\"]*)\"', pathlib.Path('/sr/pyproject.toml').read_text()).group(1))")
+echo "installing \$REQ (from pyproject)"
+/isaac-sim/python.sh -m pip -q install "\$REQ" opencv-python-headless 2>&1 | tail -1
 PYTHONPATH=/sr /isaac-sim/python.sh /sr/examples/isaac_on_aws/smoke.py
 INNER
 chmod +x /opt/strands/inner.sh
