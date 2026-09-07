@@ -61,33 +61,3 @@ nothing, and a `bool` passed as a count of one.
 deliberately does *not* mark the simulation replicated, so `add_robot` keeps
 working. Marking it would refuse every later `add_robot` on the strength of a call
 that cloned nothing, which is what the stub did for every count.
-
-### Changed: `replicate()` states what it does not do
-
-There is no per-environment observation or action API. `get_observation` and
-`send_action` address environment 0's robot, the only one carrying an
-`Articulation` handle; the clones advance under physics and are what a renderer and
-a domain-randomisation pass see, but they cannot be driven or read individually.
-The success message says so on every call, so a `num_envs: 64` in the payload is not
-mistaken for 64 drivable robots. Building that surface needs an articulation view
-across environments and a cross-backend decision about what a batched observation
-looks like, so it is deliberately out of scope here rather than half-present.
-
-### Fixed: the GPU test that should have caught this graded nothing
-
-`tests_integ/simulation/test_isaac_gpu.py::test_replicate_fleet_creates_parallel_envs`
-carried the docstring "`replicate()` must create the requested parallel
-environments" and asserted only `status == "success"` and `"16" in text` - both of
-which a complete no-op produces, and did, for as long as the stub shipped. It now
-reads the stage: the environment prims must exist, one env root per requested
-environment beyond the source, `prims_created` must equal the measured stage delta,
-and `build_time_ms` must be above zero.
-
-### Fixed: three false fleet claims in the Isaac docs
-
-`docs/simulation/isaac.md` offered "fleet RL on PhysX GPU with 1024+ parallel
-environments", described `num_envs` as "Set to `1024`+ for fleet RL", and shipped a
-"Fleet (IsaacLab-style) preview" whose code never called `replicate()` at all.
-Setting `num_envs` alone creates nothing - `replicate()` is what clones - and the
-missing per-environment action API is what keeps this short of fleet RL. All three
-now say what the backend does.

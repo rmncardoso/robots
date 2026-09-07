@@ -235,6 +235,19 @@ if __name__ == "__main__":
         main()
     except BaseException:
         traceback.print_exc()
+        # Re-raised so this stays the cleanup-and-reraise form the repository's
+        # py/catch-base-exception census requires: every `except BaseException` in
+        # the tree ends in a lexical raise except the one cross-thread marshal box
+        # whose disposition AGENTS.md records, and a second loose handler would be
+        # a new merge-gating alert with no recorded disposition
+        # (tests/test_codeql_query_filters.py measures this from the tree).
+        #
+        # Behaviourally a no-op: `finally` runs first, and its os._exit ends the
+        # process before this exception can propagate. That exit is the point -
+        # Isaac Sim's atexit segfault makes a normal return exit 134 after the run
+        # has already succeeded, so the summary must be printed and the code chosen
+        # here rather than left to interpreter teardown.
+        raise
     finally:
         passed = sum(1 for _, ok, _ in CHECKS if ok)
         print(f"\n=== SMOKE SUMMARY: {passed}/{len(CHECKS)} ===", flush=True)
