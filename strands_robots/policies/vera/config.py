@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 from strands_robots.utils import (
+    dial_host_error,
     positive_finite_number_error,
     positive_whole_number_error,
     tcp_port_error,
@@ -175,7 +176,16 @@ class VeraConfig:
             field is the key every other per-embodiment default is looked up by
             and an unknown one would otherwise resolve to another embodiment's
             ports and render width.
-        host: Policy-server hostname.
+        host: Policy-server hostname or IP literal, and the host half of
+            :attr:`server_uri`. Must be a bare host a URI can carry - no ``/``,
+            ``?``, ``#``, ``@``, ``:`` (outside a bracketed IPv6 literal such as
+            ``[::1]``), whitespace or control character - because those end the
+            host inside ``ws://<host>:<port>`` and the port is what they take:
+            ``"127.0.0.1/foo"`` dials port 80, discarding the port the shared
+            TCP-port domain just accepted. ``""`` is refused with ``"0.0.0.0"``
+            named as the spelling that reaches a server bound on every
+            interface. Whether the host resolves is left to the readiness probe,
+            which is the surface that can observe it.
         server_port: Policy-server websocket port. ``None`` applies
             ``VERA_SERVER_PORT`` else the per-embodiment default; any other
             value must be an ``int`` in ``[1, 65535]``, because the client dials
@@ -204,7 +214,11 @@ class VeraConfig:
             (``hf download sizhe-lester-li/VERA --local-dir …``). Exported to
             ``VERA_CKPT_ROOT`` for the server subprocess.
         sample_steps: WAN denoise steps (deploy default is 10; ``None`` uses the
-            planner yaml's value).
+            planner yaml's value). A supplied count must be a positive whole
+            number - the shared domain ``render_width`` takes - and is converted
+            to ``int``, because it reaches the server only as the text of
+            ``--sample-steps`` / ``VERA_SAMPLE_STEPS`` and ``str(10.0)`` is not a
+            token that flag can parse.
         tracker_backend: IDM point tracker backend override.
         motion_plan_scale: IDM motion-plan scale override (live-tunable).
             ``None`` - the default, and what an unset ``VERA_MOTION_PLAN_SCALE``
@@ -212,13 +226,18 @@ class VeraConfig:
             must be a positive finite number, because it multiplies the motion
             plan the IDM turns into actions.
         teacache: Enable the near-lossless DiT teacache speedup (default True).
-        teacache_thresh: teacache rel_l1 threshold (>0.15 hits a quality cliff).
-            Carried to the server by both launch modes: as ``--teacache-thresh``
-            on the subprocess argv, and as ``-e VERA_TEACACHE_THRESH`` for the
-            container, which the entrypoint turns back into the same flag. Only
-            the ``teacache`` off-switch used to be forwarded to the container, so
-            a tuned threshold applied under ``server_mode="subprocess"`` and was
-            silently dropped under ``server_mode="docker"``.
+        teacache_thresh: teacache rel_l1 threshold (>0.15 hits a quality cliff,
+            which is guidance rather than a bound). Must be a positive finite
+            number - the shared domain ``motion_plan_scale`` takes - checked
+            whatever ``teacache`` is set to, since that flag can be turned on
+            after construction. Use ``teacache=False`` to switch the cache off;
+            ``0`` is not that opt-out. Carried to the server by both launch
+            modes: as ``--teacache-thresh`` on the subprocess argv, and as
+            ``-e VERA_TEACACHE_THRESH`` for the container, which the entrypoint
+            turns back into the same flag. Only the ``teacache`` off-switch used
+            to be forwarded to the container, so a tuned threshold applied under
+            ``server_mode="subprocess"`` and was silently dropped under
+            ``server_mode="docker"``.
         auto_launch_server: Launch + manage the server subprocess on first use.
         server_ready_timeout: Seconds the readiness wait allows the server
             websocket to come up before raising (WAN model load can be slow).
@@ -277,6 +296,16 @@ class VeraConfig:
         # second copy of a default is what made "not a known embodiment" and
         # "mimicgen" the same request.
         if (err := _embodiment_error(self.embodiment, "embodiment", type(self).__name__)) is not None:
+            raise ValueError(err)
+        # The other half of ``server_uri``. Checked here, in the same funnel the
+        # port half passes through, because the two are one expression: a URI
+        # cut apart by an unchecked host is not a bad address, it is a
+        # *different* address, and the port is the component it takes. Nothing
+        # downstream refuses it - the runner's probe reports a bind-only host as
+        # ready, the client raises ``InvalidURI`` past the ``OSError`` channel
+        # that carries its actionable hint, and a non-string surfaces as a
+        # ``getaddrinfo`` ``TypeError`` out of ``start()``.
+        if (err := dial_host_error(self.host, "host", type(self).__name__)) is not None:
             raise ValueError(err)
         # Apply per-embodiment port defaults when not explicitly set.
         default_policy, default_vis = _DEFAULT_PORTS[self.embodiment]
@@ -403,6 +432,73 @@ class VeraConfig:
             # any real scalar, so an ``int`` 1 or a ``np.float64`` passes it, while
             # the field is declared ``float``.
             self.motion_plan_scale = float(self.motion_plan_scale)
+        # ``sample_steps`` and ``teacache_thresh`` are the video planner's two
+        # sampler knobs, and they were the two numeric fields this funnel did not
+        # look at. Five of the seven are held to a shared domain on the effective
+        # value - both ports, ``render_width``, ``motion_plan_scale`` and the
+        # readiness budget below - and these two were held to nothing, so every
+        # spelling of them was accepted: ``nan``, ``inf``, a negative, a zero, a
+        # ``bool``, a ``str``, and ``None`` on a field declared ``float``.
+        #
+        # Neither field is read anywhere else. Their only consumer is the launch
+        # command, which carries them as TEXT: ``str(cfg.sample_steps)`` and
+        # ``str(cfg.teacache_thresh)`` in ``VeraServerRunner._build_command``, and
+        # ``f"VERA_SAMPLE_STEPS={cfg.sample_steps}"`` in the docker ``-e`` overlay.
+        # Nothing between here and the server inspects the value, so the server is
+        # left to report it, and it has two ways to - neither naming the field:
+        #
+        # * A token the flag's own type cannot parse (``'2.7'``, ``'nan'``,
+        #   ``'True'``, ``'ten'`` for an ``int`` flag) makes the server exit before
+        #   it opens its port, and ``_wait_until_ready`` reports "VERA server
+        #   exited early (code N) ... common causes are missing checkpoints (set
+        #   VERA_CKPT_ROOT / ckpt_root) or CUDA OOM" - two causes that are not the
+        #   cause.
+        # * A token it can parse (``'0'`` or ``'-5'`` denoise steps, a ``nan`` or
+        #   ``inf`` threshold) starts a server configured by a value nobody asked
+        #   for, and the rollout runs on it under a reported success.
+        #
+        # Which of the two happens is not a property of the value being usable, it
+        # is a property of how ``str()`` happens to spell it. ``start()`` already
+        # holds this position two statements above the launch:
+        # ``_require_vera_installed`` exists because, in its own words, without it
+        # "a missing install surfaces only as an opaque 'server exited early (code
+        # 1)' RuntimeError several seconds later". A value this constructor can
+        # judge belongs in the same place.
+        #
+        # The two spellings of each knob disagreed, too. ``_env_int`` and
+        # ``_env_float`` return ``None`` for anything ``int()``/``float()`` refuses,
+        # so ``VERA_SAMPLE_STEPS=ten`` is absorbed and the planner yaml decides -
+        # deliberate, and pinned. The keyword spelling of the same knob was checked
+        # nowhere, so one knob was guarded from the environment and unguarded from
+        # the API.
+        #
+        # ``sample_steps`` is a count of denoise steps, so it takes the same shared
+        # domain ``render_width`` does, and is normalized for the same reason - and
+        # here the conversion is load-bearing rather than tidy. That domain admits
+        # an integral float, and a computed count is one: ``sample_steps=20 / 2`` is
+        # ``10.0``, ``str(10.0)`` is ``'10.0'``, and ``--sample-steps`` cannot parse
+        # it. Converting after the domain accepts the value is what puts ``10`` on
+        # the command line rather than a token that ends the server.
+        #
+        # ``teacache_thresh`` is a continuous rel_l1 threshold, so it takes the
+        # continuous domain ``motion_plan_scale`` does. It is checked
+        # unconditionally even though the command carries it only when ``teacache``
+        # is on, because this is a plain dataclass: ``teacache`` can be turned on
+        # after construction, and a check scoped to its value here would not be
+        # there when the field is read. ``0`` is not the opt-out either -
+        # ``teacache=False`` is, and it emits ``--no-teacache`` in place of the
+        # threshold. The documented quality cliff above ``0.15`` is guidance and
+        # stays a legitimate request; only the values no threshold can be are
+        # refused.
+        if self.sample_steps is not None:
+            if (err := positive_whole_number_error(self.sample_steps, "sample_steps", type(self).__name__)) is not None:
+                raise ValueError(err)
+            self.sample_steps = int(self.sample_steps)
+        if (
+            err := positive_finite_number_error(self.teacache_thresh, "teacache_thresh", type(self).__name__)
+        ) is not None:
+            raise ValueError(err)
+        self.teacache_thresh = float(self.teacache_thresh)
         # The readiness budget is resolved and checked here for the reason the
         # ports, ``render_width`` and ``motion_plan_scale`` above are: this is the
         # one funnel every caller passes through, and it is the only place the
