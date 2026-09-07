@@ -7063,6 +7063,39 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
         if state is not None:
             return _body_state_envelope(body_name, state)
 
+        # A name that IS in the object registry is a different failure from an
+        # unknown one, and must not borrow its message. Reporting "not found"
+        # here printed the searched-for name inside its own "Known objects"
+        # list - "Body 'mug' not found on the Isaac stage. Known objects:
+        # [mug]." - and then advised the two remedies for a MISNAMED body:
+        # spell it '<robot>/<link>', or pass an absolute prim path. The name was
+        # already right, so following either produces the same refusal, and the
+        # actual cause - the object is registered but its rigid prim cannot be
+        # read - is named nowhere. Three distinct states reach here: the object
+        # never got a handle, the handle raised on get_world_pose (the
+        # invalidate-on-reset family), or the pose came back unusable. All three
+        # are about the object's prim rather than about the name.
+        if obj is not None:
+            reason = (
+                "it has no rigid-prim handle"
+                if obj.handle is None
+                else "its rigid prim could not be read (the handle raised, or returned an unusable pose)"
+            )
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"Body '{body_name}' is a registered object but its pose is unavailable: "
+                            f"{reason}. The name is correct, so respelling it will not help. A handle "
+                            f"is lost when the prim was never created, or when the scene changed since "
+                            f"the last reset() - call reset() and read it again. Prim path: "
+                            f"{obj.prim_path!r}."
+                        )
+                    }
+                ],
+            }
+
         objects = sorted(self._objects)
         shown = ", ".join(objects[:20]) + (", ..." if len(objects) > 20 else "")
         msg = (
