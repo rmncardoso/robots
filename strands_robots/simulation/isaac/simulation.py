@@ -1518,27 +1518,52 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
 
                 # Create World.
                 #
-                # ``device`` is forwarded, and that is the whole reason this
-                # backend runs on the GPU. ``World``'s own default is ``None``,
-                # which resolves to ``"cpu"`` - so while ``IsaacConfig.device``
-                # defaulted to ``"cuda:0"``, was validated to require CUDA, and
-                # was reported as ``cuda:0`` by ``get_status``, ``describe`` and
-                # ``__repr__``, PhysX was solving on the CPU for every caller.
-                # Measured through this class on an A10G, 40 cuboids, 300
-                # step() calls after a 30-step warmup, one container per arm:
+                # ``device`` is deliberately NOT forwarded, and this comment is
+                # the reason - because forwarding it looks obviously right and is
+                # not. ``World`` accepts ``device`` and its own default is
+                # ``None``, which resolves to ``"cpu"``, so PhysX solves on the
+                # CPU here even though ``IsaacConfig.device`` defaults to
+                # ``"cuda:0"`` and is validated to require CUDA. That costs a lot:
+                # measured through this class on an A10G, 40 cuboids, 300
+                # ``step()`` calls after a 30-step warmup, one container per arm,
+                # 9.9 steps/s on the CPU against 112.3 with ``device="cuda:0"``.
                 #
-                #   without   reported cuda:0   resolved 'cpu'      9.9 steps/s
-                #   with      reported cuda:0   resolved 'cuda:0'  112.3 steps/s
+                # It is still not forwarded, because passing it makes
+                # ``add_robot`` fail outright. Measured on the same A10G, same
+                # tree, only the argument differing:
                 #
-                # 11.3x, on the one property Isaac is selected over MuJoCo for.
-                # The reported device is the SAME in both rows, which is why this
-                # survived: every surface echoed the config's value rather than
-                # reading what the physics context resolved.
+                #   no device arg     gpu_pipeline=False  add_robot -> success
+                #   device="cuda:0"   gpu_pipeline=True   add_robot -> CUDA error:
+                #       an illegal memory access was encountered
+                #       (omni.physx.tensors GpuArticulationView.cpp:631)
+                #
+                # PhysX's GPU pipeline pre-sizes its tensor buffers at
+                # ``world.reset()``. ``create_world`` resets immediately, sizing
+                # them for a stage holding a ground plane and ZERO articulations,
+                # so the first ``add_robot`` initializes an articulation into a
+                # view with no room for it. Nothing recovers in-process: the
+                # illegal access poisons the CUDA context, so the next
+                # ``add_object`` fails too.
+                #
+                # Neither available ordering fixes it. Adding while the sim is
+                # stopped instead fails with ``'NoneType' object has no attribute
+                # 'create_articulation'`` - stopped, there is no view to add into.
+                # Making this work needs Isaac Lab's pattern, where the entire
+                # scene is built BEFORE the first reset, and that is incompatible
+                # with this backend's incremental contract, where an agent calls
+                # ``create_world`` and then ``add_robot`` one tool call at a time.
+                # That is a feature, not the repair of a wrong answer, so it is
+                # left out and written down rather than half-done.
+                #
+                # What DID change is the reporting. Every surface used to echo
+                # ``self._config.device``, so all five said ``cuda:0`` while
+                # physics ran on the CPU - the falsehood above was invisible.
+                # They now read the resolved device off the physics context and
+                # report ``device_requested`` beside it, so the gap is legible.
                 self._world = World(
                     stage_units_in_meters=1.0,
                     physics_dt=dt,
                     rendering_dt=self._config.rendering_dt,
-                    device=self._config.device,
                 )
 
                 # Set gravity

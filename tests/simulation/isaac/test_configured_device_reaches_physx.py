@@ -1,34 +1,43 @@
-"""The configured CUDA device reaches PhysX, and what is reported is what it resolved.
+"""The Isaac backend reports the device PhysX resolved, and does not claim the one it was asked for.
 
 ``IsaacConfig.device`` defaults to ``"cuda:0"`` and its ``__post_init__`` refuses
 anything that does not start with ``cuda`` - "Isaac Sim requires a CUDA device".
-``create_world`` then built the world without passing it:
+``create_world`` builds the world **without** passing it, and ``World``'s own
+``device`` default is ``None``, which resolves to ``"cpu"``. So PhysX solves on
+the CPU, and it is expensive: measured through ``IsaacSimulation`` on an A10G
+under Isaac Sim 6.0.1 - 40 cuboids, 300 ``step()`` calls after a 30-step warmup,
+one container per arm - 9.9 steps/s on the CPU against 112.3 with
+``device="cuda:0"``.
 
-    World(stage_units_in_meters=1.0, physics_dt=dt, rendering_dt=...)
+The device is nonetheless **deliberately not forwarded**, and that is pinned here
+rather than left to look like an oversight, because forwarding it is the obvious
+one-line change and it breaks the backend. Measured on the same A10G, same tree,
+only the argument differing:
 
-``World``'s own ``device`` default is ``None``, which resolves to ``"cpu"``. So
-PhysX solved on the CPU for every caller of this backend, while ``get_state``,
-``create_world``'s own result, ``replicate``'s message, the init log line and
-``__repr__`` all echoed ``cuda:0`` - the configured value, never the resolved
-one. Nothing compared the two, which is why a backend selected specifically for
-GPU physics could run entirely on the CPU without a single report saying so.
+    no device arg     gpu_pipeline=False   add_robot -> success
+    device="cuda:0"   gpu_pipeline=True    add_robot -> CUDA error: an illegal
+        memory access was encountered (GpuArticulationView.cpp:631)
 
-Measured end to end through ``IsaacSimulation`` on an A10G under Isaac Sim 6.0.1
-- 40 cuboids, 300 ``step()`` calls after a 30-step warmup, one container per arm
-so the ``World`` singleton is not reused. Same code path both ways:
+PhysX's GPU pipeline pre-sizes its tensor buffers at ``world.reset()``.
+``create_world`` resets immediately, sizing them for a stage with a ground plane
+and ZERO articulations, so the first ``add_robot`` initializes an articulation
+into a view with no room. The illegal access poisons the CUDA context, so the
+following ``add_object`` fails too. Adding while stopped instead fails with
+``'NoneType' object has no attribute 'create_articulation'``. Making it work needs
+Isaac Lab's build-the-whole-scene-then-reset-once pattern, which this backend's
+incremental contract - an agent calling ``add_robot`` one tool call at a time -
+does not have.
 
-    main       reported cuda:0   physics_context 'cpu'      gpu=False    9.9 steps/s
-    with fix   reported cuda:0   physics_context 'cuda:0'   gpu=True   112.3 steps/s
+What this fixes is the **reporting**. All five surfaces that named the device -
+``create_world``'s result, ``get_state``, ``replicate``'s message, the init log
+line and ``__repr__`` - echoed ``self._config.device``, the value that had been
+*requested*. Nothing read what PhysX resolved, so there was no field in which the
+two could disagree, and a wholly CPU-bound run reported ``device=cuda:0``
+everywhere a user would look. The only symptom was being slow, which reads as
+"Isaac is heavyweight" rather than as a defect.
 
-11.3x, on the one property Isaac is chosen over MuJoCo for, and note that the
-reported device is identical in both rows - that is the defect, not a footnote.
-The gap widens with scene size, because GPU physics amortizes its fixed cost over
-more bodies.
-
-Two halves are pinned here, and the second is what stops a silent recurrence:
-the device is forwarded, and every report resolves it from the physics context
-rather than echoing the request. ``device_requested`` is reported beside it so a
-divergence is legible instead of invisible.
+Now ``device`` is the resolved value and ``device_requested`` sits beside it, so
+the gap is legible instead of invisible.
 
 Nothing here needs Isaac Sim: a fake ``isaacsim`` tree records the kwargs
 ``World`` was constructed with and what its physics context reports.
@@ -111,44 +120,58 @@ def fake_isaacsim(monkeypatch):
     return mods
 
 
-class TestTheDeviceIsForwardedToWorld:
-    """The fix itself: omitting the argument is what put PhysX on the CPU."""
+class TestTheDeviceIsDeliberatelyNotForwarded:
+    """Pinned as a decision, not left to look like an oversight.
 
-    def test_world_is_constructed_with_the_configured_device(self, fake_isaacsim) -> None:
+    Forwarding ``device`` is a one-line change that turns the GPU pipeline on and
+    makes the first ``add_robot`` fail with a CUDA illegal memory access, because
+    PhysX pre-sizes its GPU tensor buffers at the ``world.reset()`` that
+    ``create_world`` performs - before any articulation exists. Whoever reads
+    ``World`` accepting ``device`` and this code not passing it needs to find the
+    reason attached to the code, not rediscover it on a GPU.
+    """
+
+    def test_world_is_built_without_a_device_argument(self, fake_isaacsim) -> None:
         sim = IsaacSimulation(config=IsaacConfig(device="cuda:0"))
 
         assert sim.create_world()["status"] == "success"
 
-        assert _FakeWorld.last_kwargs.get("device") == "cuda:0"
+        assert "device" not in _FakeWorld.last_kwargs
 
-    def test_a_second_gpu_is_honoured_rather_than_collapsed_to_zero(self, fake_isaacsim) -> None:
-        """The multi-GPU case, which is the one a caller can observe directly."""
+    def test_the_reason_is_recorded_next_to_the_call(self) -> None:
+        """A bare omission reads as a bug and invites the one-line "fix". The
+        measurement and the GpuArticulationView failure must travel with it."""
+        import inspect
+
+        source = inspect.getsource(IsaacSimulation.create_world)
+
+        assert "GpuArticulationView" in source
+        assert "illegal memory access" in source
+        assert "pre-sizes" in source
+
+    def test_the_config_still_carries_the_request(self, fake_isaacsim) -> None:
+        """The value is not silently dropped from the config - it is reported as
+        device_requested, which is what makes the CPU reality visible."""
         sim = IsaacSimulation(config=IsaacConfig(device="cuda:1"))
-
-        assert sim.create_world()["status"] == "success"
-
-        assert _FakeWorld.last_kwargs.get("device") == "cuda:1"
-
-    def test_the_argument_is_present_at_all(self, fake_isaacsim) -> None:
-        """The precise pre-fix shape: the key was absent, not wrong. A test
-        asserting only ``!= "cpu"`` would have passed on the broken code, because
-        the broken code never named a device for anything to disagree with."""
-        sim = IsaacSimulation(config=IsaacConfig(device="cuda:0"))
         sim.create_world()
 
-        assert "device" in _FakeWorld.last_kwargs
+        assert sim._config.device == "cuda:1"
+        assert sim.get_state()["content"][0]["json"]["device_requested"] == "cuda:1"
 
 
 class TestWhatIsReportedIsWhatResolved:
     """The half that makes a recurrence visible instead of benchmark-only."""
 
-    def test_create_world_reports_the_resolved_device(self, fake_isaacsim) -> None:
+    def test_create_world_reports_the_resolved_device_not_the_request(self, fake_isaacsim) -> None:
+        """The live situation, asserted directly: PhysX resolved cpu, the config
+        asked for cuda:0, and the result says both. Before this, it said cuda:0
+        twice and there was no field in which the truth could appear."""
         sim = IsaacSimulation(config=IsaacConfig(device="cuda:0"))
 
-        result = sim.create_world()
+        info = sim.create_world()["content"][0]["json"]
 
-        assert result["content"][0]["json"]["device"] == "cuda:0"
-        assert result["content"][0]["json"]["device_requested"] == "cuda:0"
+        assert info["device"] == "cpu"
+        assert info["device_requested"] == "cuda:0"
 
     def test_get_state_reports_both(self, fake_isaacsim) -> None:
         sim = IsaacSimulation(config=IsaacConfig(device="cuda:0"))
@@ -156,8 +179,26 @@ class TestWhatIsReportedIsWhatResolved:
 
         state = sim.get_state()["content"][0]["json"]
 
-        assert state["device"] == "cuda:0"
+        assert state["device"] == "cpu"
         assert state["device_requested"] == "cuda:0"
+
+    def test_the_two_fields_disagree_and_that_is_the_point(self, fake_isaacsim) -> None:
+        """A reader who compares them learns where physics is running. A reader
+        of the pre-fix reports could not, because one value was printed twice."""
+        sim = IsaacSimulation(config=IsaacConfig(device="cuda:0"))
+        sim.create_world()
+
+        state = sim.get_state()["content"][0]["json"]
+
+        assert state["device"] != state["device_requested"]
+
+    def test_the_text_line_carries_the_resolved_device(self, fake_isaacsim) -> None:
+        """The human-readable line is what most callers actually read."""
+        sim = IsaacSimulation(config=IsaacConfig(device="cuda:0"))
+
+        text = sim.create_world()["content"][0]["text"]
+
+        assert "device=cpu" in text
 
     def test_a_divergence_is_legible(self, fake_isaacsim, monkeypatch) -> None:
         """The whole point. With the physics context reporting cpu against a
