@@ -28,8 +28,16 @@ This module pins that whole matrix:
 * :class:`TestRefusalsThatHadNoTest` -- the four refusals the constructor
   already made that nothing exercised (duplicate arm names, a
   non-callable injected read, a non-positive scale, an inverted limit row).
-* :class:`TestToScalarFallback` -- the documented "everything else ->
-  ``default`` after a WARNING log" coercion branch.
+* :class:`TestAnUnreadableChannelIsRefusedByDefault`,
+  :class:`TestTheDegradedPostureIsStillAvailable` and
+  :class:`TestANonFiniteChannelIsRefusedInBothPostures` -- the coercion branch,
+  which used to log a WARNING and substitute a zero unconditionally. The
+  degrade-one-axis posture is preserved under ``strict=False``; a non-finite
+  channel is refused either way, because it solved to ``nan`` targets for every
+  arm joint rather than holding one axis.
+* :class:`TestAnAbsentChannelIsNotAnError` -- absence means "hold this axis" and
+  is the distinction that lets the coercion refuse a value it cannot read.
+* :class:`TestTheStrictFlagIsCheckedNotTruthy` -- the posture flag's domain.
 * :class:`TestARefusedValueNeverBecomesAPerActionEnvelope` -- the engine
   seam, and the reason the constructor is the right place to refuse.
 * :class:`TestEveryNumericKnobIsJudged` -- a drift guard, so a sixth
