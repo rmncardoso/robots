@@ -1,10 +1,10 @@
-### Fixed: a non-finite delta-EEF channel no longer reaches PhysX as `nan` joint targets
+### Fixed: a NaN delta-EEF channel no longer reaches PhysX as `nan` joint targets
 
 `IsaacDeltaEEFController` coerced each GR00T action channel through a helper that
 logged a WARNING and substituted `0.0` (`0.5` for the gripper) for anything it
 could not read. Two separate problems, and only one of them was a posture choice.
 
-**A non-finite channel was never caught at all.** `float("nan")` coerces
+**A NaN channel was never caught at all.** `float("nan")` coerces
 successfully, so it walked straight past the fallback, and the finiteness guard in
 `_solve_arm_targets` covers only the *injected callables*. Measured:
 
@@ -24,9 +24,26 @@ silent zero-motion step" (#1812). It was applied to one input and not the other.
 
 It is also the case the pre-existing test for this branch could not have caught
 while asserting what it asserts: it requires `all(np.isfinite(...))` of the
-returned targets, and never passed a `nan` in. A non-finite channel now raises
-`ValueError` in **both** postures, because there is no reading of it that holds an
-axis.
+returned targets, and never passed a `nan` in. `NaN` now raises `ValueError` in
+**both** postures, because there is no reading of it that holds an axis - and it is
+pinned on *every* channel, not just one, so a later change that special-cases the
+gripper coercion cannot slip past a class that tested only `x`.
+
+**`±inf` is accepted, and that correction came out of adversarial review.** An
+earlier version of this fix refused every non-finite value, on the stated grounds
+that a non-finite delta "solves to non-finite targets for every arm joint". That is
+true of `nan` and **false of `±inf`**: `np.clip(±inf, -1, 1)` is `±1.0`, so an
+infinite channel saturates to the maximum per-step delta - exactly the
+clip-then-scale contract this controller documents. Measured against clean main:
+
+```python
+compute_joint_targets({"x": float("inf")})   # {'j1': 0.0499, 'j2': 0.0}  - finite
+compute_joint_targets({"x": float("nan")})   # {'j1': nan,    'j2': nan}
+```
+
+Refusing `inf` would have converted a correct saturation into a hard failure for
+any policy head that saturates. `inf` and `1.0` are pinned as producing identical
+targets, which is what makes accepting it correct rather than merely lenient.
 
 **An unreadable channel is now refused by default, with the old behaviour behind
 `strict=False`.** The previous posture was deliberate and documented - *"a
