@@ -161,6 +161,31 @@ def main() -> None:
         "" if guard_err is None else " ".join(b.get("text", "") for b in guard_err["content"])[:150],
     )
 
+    # A registry humanoid's MJCF declares <freejoint/>, so the robot lands with a
+    # genuinely free root - and before the base was read from that MJCF the USD
+    # path recorded the fixed-base default, so get_observation omitted all four
+    # base_* keys for exactly the robots a locomotion policy needs them for.
+    # Driven here on a real registry asset rather than a fixture.
+    r = sim.add_robot("g1", data_config="unitree_g1")
+    print(f"  add_robot(unitree_g1) -> {r.get('status')}: {str(r)[:150]}", flush=True)
+    if r.get("status") == "success":
+        st = sim._robots["g1"]
+        print(f"  recorded fixed_base={st.fixed_base}", flush=True)
+        check("a registry humanoid is recorded as floating-base", st.fixed_base is False, f"fixed_base={st.fixed_base}")
+        sim.reset()
+        obs = sim.get_observation("g1")
+        base_keys = sorted(k for k in obs if k.startswith("base_"))
+        print(f"  base_* keys: {base_keys}", flush=True)
+        check(
+            "a registry humanoid reports every base_* key",
+            set(base_keys) == {"base_pos", "base_quat", "base_lin_vel", "base_ang_vel"},
+            f"got {base_keys}",
+        )
+    else:
+        # A registry asset that will not resolve on this host is not a verdict on
+        # the fix, so it is reported rather than silently passing.
+        check("a registry humanoid loads", False, str(r)[:200])
+
     sim.destroy()
 
 
