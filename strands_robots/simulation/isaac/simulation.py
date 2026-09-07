@@ -755,6 +755,7 @@ class _RobotState:
         data_config: str | None = None,
         usd_to_urdf_joint_names: dict[str, str] | None = None,
         fixed_base: bool = True,
+        description_path: str | None = None,
     ):
         #: Whether this robot's root is welded to the world. ``True`` is the
         #: historical behaviour and stays the default: every URDF import hardcoded
@@ -774,6 +775,19 @@ class _RobotState:
         # Recorded as the LeRobotDataset ``robot_type`` so datasets collected
         # on Isaac carry the same embodiment metadata as MuJoCo/Newton ones.
         self.data_config = data_config
+        # The MuJoCo-compilable description this robot was actually BUILT from:
+        # the URDF handed to (or resolved by) ``add_robot``, or the MJCF an
+        # imported USD was converted from. ``None`` for a robot loaded from a
+        # plain USD, which no MuJoCo compiler can read. ``move_to``'s IK solve
+        # runs on a compiled MuJoCo model, and before this field existed it
+        # could only resolve one through the ``data_config`` registry lookup -
+        # so a robot added via a bare ``urdf_path`` was refused IK outright,
+        # and a ``data_config`` naming a registry model that DIFFERS from the
+        # loaded asset (same joint names, different geometry) solved on the
+        # wrong kinematics and then confirmed its own convergence by FK on that
+        # same wrong model. Recording the source makes the IK model the file
+        # that is simulating, by construction.
+        self.description_path = description_path
         # USD-mangled DOF name -> URDF joint name, for robots loaded from a
         # URDF whose joint names are not valid USD identifiers (e.g. the
         # ``robotstudio_so101`` URDF's ``"1"``..``"6"``, imported as
@@ -2330,6 +2344,11 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     articulation=articulation,
                     actual_prim_path=getattr(articulation, "_strands_actual_prim_path", None),
                     data_config=data_config,
+                    # The MJCF this USD was converted from, when there is one:
+                    # it is the MuJoCo-compilable truth about the kinematics on
+                    # the stage, and move_to's IK solve prefers it over a
+                    # registry lookup. None for a plain USD asset.
+                    description_path=source_mjcf,
                 )
                 self._robots[name] = robot_state
 
@@ -2404,6 +2423,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     data_config=data_config,
                     usd_to_urdf_joint_names=getattr(articulation, "_strands_usd_to_urdf_joint_names", None),
                     fixed_base=fix_base,
+                    # The URDF the importer just built this articulation from -
+                    # MuJoCo compiles URDF, so move_to's IK solve can run on
+                    # exactly the file that is simulating.
+                    description_path=urdf_path,
                 )
                 self._robots[name] = robot_state
 
@@ -8386,7 +8409,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 "move_to": (
                     "(robot_name=None, position=[x,y,z], orientation=None, tol=0.01, "
                     "max_steps=200, orientation_tol=None) -> dict  # IK-solve (shared mink "
-                    "bridge on the registry MJCF) then servo the end-effector to a world-frame "
+                    "bridge on the robot's own URDF/MJCF description, else the registry "
+                    "data_config) then servo the end-effector to a world-frame "
                     "Cartesian target; position-only when orientation is omitted, otherwise "
                     "converged to within orientation_tol radians (default 0.1) as well"
                 ),
