@@ -1,12 +1,13 @@
 # Isaac Sim Backend (GPU)
 
 The Isaac Sim backend runs the simulation on
-[NVIDIA Isaac Sim](https://developer.nvidia.com/isaac-sim) (PhysX GPU physics +
-RTX path-traced rendering). It is a **built-in, in-tree** backend that lives at
+[NVIDIA Isaac Sim](https://developer.nvidia.com/isaac-sim) (PhysX physics + RTX
+path-traced rendering on the GPU; note that **physics currently solves on the
+CPU** - see [PhysX runs on the CPU](#physx-runs-on-the-cpu-and-what-that-costs)). It is a **built-in, in-tree** backend that lives at
 `strands_robots.simulation.isaac`, a peer of the `mujoco` and `newton` backends.
 It implements the same `SimEngine` contract as the MuJoCo backend, so the
 `Robot()` / `Simulation` / policy APIs are identical - only the physics and
-rendering run on the GPU through Isaac Sim.
+rendering runs on the GPU through Isaac Sim.
 
 `strands-robots` has **no hard dependency** on Isaac Sim: the `sim-isaac` extra
 provides the pip-installable helpers, and `create_simulation("isaac")` resolves
@@ -139,23 +140,50 @@ rejected eagerly. The commonly used fields:
 | Kwarg | Type | Default | Description |
 |-------|------|---------|-------------|
 | `num_envs` | `int` | `1` | Parallel environments. Set to `1024`+ for fleet RL. A positive integer - the same domain `replicate(num_envs=...)` takes. |
-| `device` | `str` | `"cuda:0"` | CUDA device (`cuda:N`). Must be a CUDA device. Forwarded to `World`, so it is what PhysX solves on. |
+| `device` | `str` | `"cuda:0"` | CUDA device (`cuda:N`). Must be a CUDA device. **Selects the CUDA device for RTX rendering; PhysX itself currently solves on the CPU** - see below. |
 
-`get_state()` reports `device` as the device PhysX **resolved** and
-`device_requested` as the one the config asked for. Read the first when you want
-to know where physics is running:
+### PhysX runs on the CPU, and what that costs
+
+Rendering is on the GPU. **Physics is not.** `create_world` builds `World` without
+passing `device`, and `World`'s own default resolves to `"cpu"`, so PhysX solves on
+the CPU regardless of what `device` says.
+
+`get_state()` reports both, and on current hardware they disagree - which is the
+honest signal:
 
 ```python
-sim.get_state()["content"][0]["json"]["device"]           # 'cuda:0'
-sim._world.get_physics_context().use_gpu_pipeline         # True
+sim.get_state()["content"][0]["json"]
+# {..., "device": "cpu", "device_requested": "cuda:0", ...}
 ```
 
-The two fields are separate because they were able to differ silently. Until the
-device was forwarded, `World`'s own default (`None`, which resolves to `"cpu"`)
-meant PhysX solved on the CPU while every surface echoed the configured
-`cuda:0` - measured at 9.9 against 112.3 steps/s on an A10G for 40 bodies. If
-`device` and `device_requested` ever disagree, physics is not where you asked for
-it.
+Read `device` when you want to know where physics is actually running.
+`device_requested` is what the config asked for.
+
+The cost is real: measured on an AWS `g5.2xlarge` (A10G) under Isaac Sim 6.0.1 -
+40 cuboids, 300 `step()` calls after a 30-step warmup - **9.9 steps/s on the CPU
+against 112.3 steps/s** with the GPU pipeline enabled.
+
+It is not enabled because enabling it breaks `add_robot`:
+
+```
+device="cuda:0"  ->  gpu_pipeline=True  ->  add_robot() fails with
+    CUDA error: an illegal memory access was encountered
+    (omni.physx.tensors GpuArticulationView.cpp:631)
+```
+
+PhysX's GPU pipeline **pre-sizes its tensor buffers at `world.reset()`**, and
+`create_world` resets immediately - sizing them for a stage with a ground plane and
+*zero* articulations. The first `add_robot` initializes an articulation into a view
+with no room for it, and the illegal access poisons the CUDA context, so the next
+`add_object` fails too. Adding while the sim is stopped fails differently
+(`'NoneType' object has no attribute 'create_articulation'`).
+
+Using the GPU pipeline requires Isaac Lab's pattern - build the entire scene, then
+reset once - which is incompatible with this backend's incremental contract, where
+an agent calls `create_world` and then `add_robot` one tool call at a time. If your
+workload is physics-throughput-bound and your scene is known up front, the MuJoCo
+backend is currently faster for that shape; use this backend for RTX observations
+and USD scenes.
 | `headless` | `bool` | `True` | Run without a GUI (required for cloud/CI). |
 | `physics_dt` | `float` | `1/120` | Physics timestep (seconds). Positive and finite - the domain `create_world()` applies to the effective dt, and the one the legacy `IsaacSimulation(default_timestep=...)` shortcut that writes this field takes as well. |
 | `rendering_dt` | `float` | `1/30` | Rendering timestep (seconds). |
