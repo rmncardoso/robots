@@ -32,7 +32,16 @@ curl -sS -o /tmp/payload.tgz "$URL"
 tar xzf /tmp/payload.tgz -C /opt/strands
 cat > /opt/strands/inner.sh <<'INNER'
 #!/bin/bash
-/isaac-sim/python.sh -m pip -q install "strands-agents>=1.7.0,<2.0.0" opencv-python-headless 2>&1 | tail -1
+# The strands-agents requirement is READ OUT OF the packed pyproject.toml rather
+# than written here. A bound copied into this script goes stale silently: it
+# would install a version the package itself refuses, and pip would exit 0, so
+# the smoke run's first failure would be an import error with no hint that the
+# example asked for the wrong version. (It did - this line carried >=1.7.0
+# against a declared floor of >=1.13.0, and tests/test_dependency_audit.py is
+# what caught it.)
+REQ=$(/isaac-sim/python.sh -c "import re, pathlib; print(re.search(r'\"(strands-agents>=[^\"]*)\"', pathlib.Path('/sr/pyproject.toml').read_text()).group(1))")
+echo "installing $REQ (from pyproject)"
+/isaac-sim/python.sh -m pip -q install "$REQ" opencv-python-headless 2>&1 | tail -1
 PYTHONPATH=/sr /isaac-sim/python.sh /sr/examples/isaac_on_aws/smoke.py
 INNER
 chmod +x /opt/strands/inner.sh
