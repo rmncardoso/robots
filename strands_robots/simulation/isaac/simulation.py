@@ -1802,6 +1802,43 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 )
             self._recording_state_dict = {}
 
+            # Per-world state keyed by names from the world being torn down. All
+            # of it was left in place, so the NEXT create_world() inherited it and
+            # applied it to a scene it was never configured for. Every entry below
+            # is keyed by an object/robot/camera name or prim path, and those names
+            # are reused freely across worlds - a second world with a "cube" in it
+            # is the ordinary case, not a collision someone has to engineer.
+            #
+            # Measured on a torn-down engine, each of these survived destroy():
+            #
+            #  _applied_wrenches   a latched apply_force replayed onto the next
+            #                      world's body of the same name - an invisible
+            #                      external force nobody applied. reset() clears
+            #                      this registry, so destroy() not clearing it was
+            #                      the odd one out, and destroy() is the stronger
+            #                      boundary of the two.
+            #  _obs_noise          set_obs_noise's per-robot sigma kept perturbing
+            #  _obs_noise_rng      get_observation in the next world, so a
+            #                      deliberately clean run silently carried noise.
+            #  _dr_base            randomize()'s first-touch baseline, which exists
+            #                      to stop scaling compounding. Retained, it anchors
+            #                      the next world's randomization to a pose from a
+            #                      world that no longer exists.
+            #  _frame_cache        a full RTX frame and a joint snapshot from the
+            #  _joint_cache        old stage, readable as if current.
+            #
+            # getattr guards because 24 test modules build a skeleton engine with
+            # __new__ and seed only what they exercise; destroy() runs from
+            # __del__, so a missing attribute here would raise during GC and mask
+            # whatever the test was actually about.
+            for _registry in ("_applied_wrenches", "_obs_noise", "_dr_base", "_frame_cache", "_joint_cache"):
+                _held = getattr(self, _registry, None)
+                if _held is not None:
+                    _held.clear()
+            # Not a mapping: a seeded generator whose stream belongs to that world.
+            if getattr(self, "_obs_noise_rng", None) is not None:
+                self._obs_noise_rng = None
+
             # Reset state
             self._world_created = False
             self._replicated = False
