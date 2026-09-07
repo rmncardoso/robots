@@ -320,6 +320,7 @@ def _physics_scene_path(stage: Any) -> str:
         pass
     return _DEFAULT_PHYSICS_SCENE_PATH
 
+
 def _translate_contact_report(
     headers: Any,
     data: Any,
