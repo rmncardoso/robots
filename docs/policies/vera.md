@@ -148,12 +148,13 @@ wins over code defaults):
 | kwarg | env var | maps to |
 |-------|---------|---------|
 | `embodiment` | — | `--embodiment` (`pusht` \| `mimicgen` \| `allegro` \| `droid`) |
+| `host` | — | `--host` (a bare hostname or IP literal; `[::1]` for IPv6) |
 | `server_port` / `vis_port` | `VERA_SERVER_PORT` / `VERA_VIS_PORT` | `--port` / `--vis-port` |
 | `algo_config` | `VERA_ALGO_CONFIG` | `--algo-config` (swap to the omni planner) |
 | `dynamics_run_id` | `VERA_DYNAMICS_RUN_ID` | `--dynamics-run-id` |
 | `text_prompt` | `VERA_TEXT_PROMPT` | `--text` |
 | `ckpt_root` | `VERA_CKPT_ROOT` | container `/ckpts` mount |
-| `sample_steps` | `VERA_SAMPLE_STEPS` | `--sample-steps` |
+| `sample_steps` | `VERA_SAMPLE_STEPS` | `--sample-steps` (positive whole count of denoise steps) |
 | `teacache` / `teacache_thresh` | — | `--no-teacache` / `--teacache-thresh` |
 | `tracker_backend` | `VERA_TRACKER_BACKEND` | IDM tracker |
 | `motion_plan_scale` | `VERA_MOTION_PLAN_SCALE` | live `configure` |
@@ -195,6 +196,25 @@ whichever spelling named it. `VERA_SERVER_PORT=0` is refused exactly as
 `server_port=0` is, and `VERA_VIS_PORT=0` disables the viewer exactly as
 `vis_port=0` does.
 
+`host` is the other half of that URI, and it is checked in the same funnel for
+the same reason: `ws://{host}:{port}` is one expression, so a host a URI cannot
+carry does not name a bad address — it names a *different* address, and the port
+is the component it takes. It must be a bare hostname or IP literal, with no `/`,
+`?`, `#`, `@`, `:` (outside a bracketed IPv6 literal such as `[::1]`), whitespace
+or control character. `host="127.0.0.1/foo"` parses as host `127.0.0.1`, path
+`/foo:8820` and port **80**, and `host="ws://127.0.0.1"` — the shape a caller who
+pastes a URI supplies — parses as host `ws` on port 80: both discard the port the
+TCP-port domain just accepted, which the port half cannot see. `""` is refused
+naming `"0.0.0.0"` as the spelling that reaches a server bound on every
+interface, because `""` is the one unusable host the readiness probe *accepted* —
+it maps a bind-only host to loopback, so the runner reported `VERA server ready`
+and the client then raised `InvalidURI` past the `OSError` channel that carries
+its "could not reach the VERA policy server" hint. A non-string never reaches a
+URI at all: it is handed to `socket.getaddrinfo`, which answers with a `TypeError`
+naming neither the field nor a fix. Whether the host *resolves*, and whether
+anything is listening on it, are facts about the network that the constructor
+cannot know and that the readiness probe already reports.
+
 `server_ready_timeout` is the span the readiness wait allows the server to open
 its websocket: a positive finite number of seconds, the shared continuous-span
 domain (`positive_finite_number_error`) a `duration` in seconds already takes, or
@@ -219,6 +239,38 @@ with a best-effort `configure` call whose failure is logged at INFO and does not
 stop the rollout, so a value `float()` cannot convert is neither applied nor
 reported. `VERA_MOTION_PLAN_SCALE` goes through the same check; an unparsable
 spelling still falls back to `None`, as it does for the ports.
+
+The two video-planner sampler knobs take the same treatment, for a reason
+specific to how they travel. `sample_steps` and `teacache_thresh` are read
+nowhere but the launch command, which carries them as *text* —
+`str(cfg.sample_steps)` and `str(cfg.teacache_thresh)` in the subprocess argv,
+`VERA_SAMPLE_STEPS=` and `VERA_TEACACHE_THRESH=` in the container's `-e` overlay
+— so a value nothing here inspects is handed to the server, and the server can
+only report it in one of two ways, neither naming the field. A token its flag's
+own type cannot parse (`'2.7'`, `'nan'`, `'True'` for an `int` flag) makes the
+server exit before it opens its port, and the readiness wait answers `VERA
+server exited early (code N) ... common causes are missing checkpoints (set
+VERA_CKPT_ROOT / ckpt_root) or CUDA OOM` — two causes that are not the cause. A
+token it *can* parse starts a server on a setting nobody asked for: `0` or `-5`
+denoise steps, a threshold of `nan` (below nothing) or `inf` (below everything).
+Which of the two happens is not a property of the value being usable, only of
+how `str()` spells it, and `start()` already refuses a locally-decidable cause
+in the same place — `_require_vera_installed` exists so a missing install does
+not surface as that same opaque early exit.
+
+So `sample_steps` takes the shared count domain `render_width` takes and is
+converted to `int`, and `teacache_thresh` takes the shared continuous domain
+`motion_plan_scale` takes and is converted to `float`. The conversion is
+load-bearing on the count: `sample_steps=20 / 2` is a positive whole number the
+domain accepts, `str(10.0)` is `'10.0'`, and `--sample-steps` cannot parse that —
+converting after the check is what puts `10` on the command line. `0` is not the
+threshold's opt-out; `teacache=False` is, and it emits `--no-teacache` in place of
+the flag. The documented quality cliff above `0.15` is guidance about output
+quality rather than a bound, so `0.25` stays a legitimate request. The threshold
+is checked whatever `teacache` is set to, because `VeraConfig` is a plain
+dataclass and the flag can be turned on after construction. `VERA_SAMPLE_STEPS`
+goes through the same check on the effective value; an unparsable spelling still
+falls back to `None`, as it does for the ports.
 
 ### IK conversion knobs
 
