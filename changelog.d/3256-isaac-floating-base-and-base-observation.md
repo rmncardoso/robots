@@ -59,3 +59,28 @@ each registered prim's default state on `post_reset` - the same mechanism
 the articulation's `set_default_state` was tried and does not change that reading,
 so `add_robot`'s docstring states it: to drop a robot from a height, step from the
 pose `add_robot` leaves rather than resetting first.
+
+**`base_ang_vel` is reported in the BODY frame**, which is the correction this
+entry needed most and did not have at first. Linear velocity is world-frame on all
+three backends; angular velocity is body-frame - the IMU-gyro convention a
+locomotion policy is trained against. The Newton backend says so outright and
+carries `_quat_rotate_inverse_wxyz` specifically to convert, "so `base_ang_vel`
+matches the MuJoCo backend and the IMU-gyro convention WBC / locomotion controllers
+consume". Isaac's `articulation.get_angular_velocity()` returns the world frame, and
+it was emitted unrotated - so of the four base channels this was the one whose
+numbers silently disagreed with the other two backends, which falsifies the very
+parity claim this feature rests on.
+
+It disagreed in the way hardest to catch: **for an upright, un-yawed base the two
+frames coincide**. A standing robot reads correct, a robot yawing about world Z
+reads correct on Z, and the error appears only once the base tilts - exactly when a
+locomotion policy is depending on the signal. Those coinciding cases are pinned
+alongside the divergent ones precisely because a test that stood a robot up and
+checked the gyro would have found nothing.
+
+The rotation uses this module's own quaternion primitive rather than importing
+Newton's helper, which would pull `warp` into Isaac's import path. Two
+implementations can drift, so the drift is measured: they are compared over 200
+random (quaternion, vector) pairs and agree to 1.3e-15. The expected values were
+cross-checked against `scipy.spatial.transform.Rotation` - one of them was written
+with the wrong sign first, and the implementation was right.
