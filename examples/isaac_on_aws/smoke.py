@@ -193,14 +193,29 @@ def main() -> None:
     # the config is exactly what hid it.
     pc = sim._world.get_physics_context()
     print(f"  physics_context: device={pc.device!r} gpu_pipeline={pc.use_gpu_pipeline}", flush=True)
-    check("PhysX resolved the configured CUDA device", str(pc.device).startswith("cuda"), f"device={pc.device!r}")
-    check("the GPU physics pipeline is on", bool(pc.use_gpu_pipeline), f"use_gpu_pipeline={pc.use_gpu_pipeline}")
     st = sim.get_state()["content"][0]["json"]
     print(f"  get_state: device={st.get('device')!r} requested={st.get('device_requested')!r}", flush=True)
+    # The reported device must be what the physics context RESOLVED, whatever that
+    # is. Asserting "cuda" here would re-encode the bug: the pre-fix code reported
+    # cuda:0 while PhysX ran on the CPU, and that is precisely what this catches.
     check(
         "get_state reports the resolved device, not the request",
-        st.get("device") == str(pc.device) and st.get("device_requested") is not None,
-        f"device={st.get('device')!r} requested={st.get('device_requested')!r}",
+        st.get("device") == str(pc.device),
+        f"reported {st.get('device')!r} but the physics context says {pc.device!r}",
+    )
+    check(
+        "the requested device is reported separately",
+        st.get("device_requested") == "cuda:0",
+        f"device_requested={st.get('device_requested')!r}",
+    )
+    # PhysX is expected on the CPU: the GPU pipeline pre-sizes its tensor buffers
+    # at create_world's reset, so the first add_robot faults. If this ever reads
+    # True, the incremental add_robot path needs re-verifying before trusting it.
+    check(
+        "the CPU-physics reality is reported, not hidden",
+        st.get("device") == "cpu" and not pc.use_gpu_pipeline,
+        f"device={st.get('device')!r} gpu_pipeline={pc.use_gpu_pipeline} - if the GPU "
+        f"pipeline is on, re-verify add_robot (GpuArticulationView illegal access)",
     )
 
     # reset(env_ids=...) is refused rather than full-resetting and calling it partial.
