@@ -4081,6 +4081,69 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             # coasting on stale targets while its siblings advance.
             raise RuntimeError(f"run_multi_policy: failed to set joint targets on '{robot_name}': {e}") from e
 
+    def run_policy(self, robot_name: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        """Drive a single-robot rollout, then release the robot.
+
+        Delegates the whole rollout to :meth:`SimEngine.run_policy` and adds one
+        thing: it lowers ``policy_running`` in a ``finally``, so a rollout that
+        ends for any reason - completion, a cooperative stop, or a raise - leaves
+        the robot idle. That is the same shape the MuJoCo backend's
+        ``_drive_rollout`` has, and for the same reason.
+
+        Without it the flag was raised and never lowered on this path. It is
+        raised as a side effect of the recording hook
+        (:meth:`IsaacRecordingMixin._make_run_policy_hook` sets it, and reaches
+        that line whenever a world exists, recording or not), and nothing in the
+        shared ``run_policy`` mentions the flag at all - so the ONLY Isaac path
+        that lowered it was :meth:`run_multi_policy`, which does so in its own
+        ``finally``.
+
+        What that cost is the motion primitives. ``move_to``, ``rotate_wrist``
+        and ``set_gripper`` all refuse while ``policy_running`` is set, because a
+        primitive and the policy loop would race on the articulation's PD
+        targets - a real hazard, and the guard is right to exist. But after one
+        ``run_policy`` the flag stayed up forever, so every later primitive on
+        that robot was refused with:
+
+            Cannot 'move_to' on 'arm' while its policy is running [...] Wait for
+            the rollout to finish (Isaac policy loops clear the flag on exit).
+
+        The rollout had finished. The parenthetical was a promise only
+        ``run_multi_policy`` kept, so the advice named a wait that would never
+        end, and the only recovery was to remove and re-add the robot.
+
+        ``start_policy`` is covered by this override rather than needing its own:
+        the shared implementation ends in ``return self.run_policy(...)``, so the
+        worker it submits reaches this ``finally`` too. ``eval_policy`` is NOT -
+        it drives ``PolicyRunner.evaluate``, which never touches the flag on
+        either backend, so it is out of scope here rather than fixed silently.
+
+        Args:
+            robot_name: the robot to drive, resolved as
+                :meth:`SimEngine.run_policy` resolves it (``None`` picks the only
+                robot when there is exactly one).
+            **kwargs: forwarded verbatim to :meth:`SimEngine.run_policy`.
+
+        Returns:
+            Whatever :meth:`SimEngine.run_policy` returns, unchanged.
+        """
+        try:
+            return super().run_policy(robot_name, **kwargs)
+        finally:
+            # Lower it for whichever robot the rollout actually resolved to, not
+            # for the argument: ``robot_name=None`` is the documented spelling
+            # for "the only robot", and that is the one the flag was raised on.
+            # Resolution can itself fail (no robots, or several), and a refusal
+            # from the base call must not be replaced by a raise from cleanup.
+            resolved = robot_name
+            if resolved is None:
+                try:
+                    resolved = self._resolve_single_robot(None)
+                except (ValueError, KeyError, TypeError):
+                    resolved = None
+            if resolved is not None and registered(self._robots, resolved):
+                self._robots[resolved].policy_running = False
+
     def run_multi_policy(
         self,
         policies: dict[str, Policy],
