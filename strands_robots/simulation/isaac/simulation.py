@@ -747,6 +747,25 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
     ...     sim.destroy()
     """
 
+    #: Whether ``run_pump_forever`` currently owns the renderer, and therefore
+    #: whether anything drains ``_action_q``.
+    #:
+    #: Declared on the CLASS, not only assigned in ``__init__``, because many
+    #: test modules build a skeleton engine with ``IsaacSimulation.__new__`` and
+    #: seed only the attributes the method under test reads. A guard that reads
+    #: this off ``self`` then raises ``AttributeError`` in every one of them -
+    #: which is a failure inside the guard rather than the refusal the guard
+    #: exists to make, and it names an attribute unrelated to what the test was
+    #: about.
+    #:
+    #: ``False`` is the fail-CLOSED direction and that is why it is the default:
+    #: an engine that has not been told a pump is running is treated as having
+    #: none, so a queued write is refused rather than stranded. ``getattr(self,
+    #: "_pump_running", True)`` would be the opposite - it would silently assume
+    #: a consumer exists, which is the exact assumption the refusal was added to
+    #: stop.
+    _pump_running: bool = False
+
     def __init__(self, config: IsaacConfig | None = None, **kwargs: Any) -> None:
         # Merge shortcut kwargs into config. Unknown kwargs are rejected
         # eagerly (rather than silently dropped) so a typo like

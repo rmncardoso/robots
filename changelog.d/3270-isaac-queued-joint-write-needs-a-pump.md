@@ -47,3 +47,22 @@ value, an empty mapping and a length mismatch each keep their own diagnosis
 instead of inheriting the threading one - reporting "start a pump" to someone who
 passed a typo'd joint name would cost them a round before they saw the real
 error.
+
+`_pump_running` is now declared on the **class**, not only assigned in
+`__init__`. Many test modules build a skeleton engine with
+`IsaacSimulation.__new__` and seed only what the method under test reads, so a
+guard reading this off `self` raised `AttributeError` in every one of them - a
+failure *inside* the guard rather than the refusal it exists to make, naming an
+attribute unrelated to what the test was about. It surfaced as two `[queued]`
+cases in the cross-backend joint-state suite, which is a composition-only break:
+this change alone is green, and so is that suite alone.
+
+`False` is the default because it is the fail-**closed** direction: an engine that
+has not been told a pump is running is treated as having none, so a queued write
+is refused rather than stranded. `getattr(self, "_pump_running", True)` would
+assume a consumer exists, which is the assumption the refusal was added to stop.
+
+That cross-backend fixture now sets `_pump_running=True` for its queued cases,
+which is the real deployment shape it means - a worker thread *plus* a running
+pump. Without the pump there is no consumer, so the write it asserts lands only
+because one exists.
