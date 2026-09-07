@@ -86,7 +86,9 @@ def main() -> None:
 
     r = sim.get_contacts()
     contacts = next((b["json"]["contacts"] for b in r["content"] if "json" in b), [])
-    check("get_contacts: the resting cube touches something", any(c["active"] for c in contacts), f"{len(contacts)} pairs")
+    check(
+        "get_contacts: the resting cube touches something", any(c["active"] for c in contacts), f"{len(contacts)} pairs"
+    )
 
     r = sim.raycast([0.5, 0.0, 2.0], [0.0, 0.0, -1.0])
     payload = next((b["json"] for b in r["content"] if "json" in b), {})
@@ -102,8 +104,44 @@ def main() -> None:
     sim.step(5)
     rgb, depth = sim.get_frame("cam")
     real_pixels = float(np.asarray(rgb).std()) > 1.0
-    check("RTX frame carries real pixels", real_pixels, f"shape={np.asarray(rgb).shape} std={np.asarray(rgb).std():.1f}")
+    check(
+        "RTX frame carries real pixels", real_pixels, f"shape={np.asarray(rgb).shape} std={np.asarray(rgb).std():.1f}"
+    )
     check("RTX depth carries geometry", depth is not None and bool(np.isfinite(depth).any()))
+
+    # A latched wrench must act on EVERY tick that advances simulated time, not
+    # only on step(). PhysX's apply_force_at_pos acts for ONE tick and apply_force
+    # stores the latch without touching PhysX at all, so before the replay was
+    # added to send_action / _primitive_tick / run_multi_policy a force was
+    # silently inert on every surface but step() - including a policy rollout,
+    # which drives physics through send_action. Measured as an A/B on one
+    # instance: 19/19 with the replay, 18/19 without, this being the one check
+    # that flipped.
+    def _z(name):
+        st = sim.get_body_state(name)
+        for b in st.get("content", []):
+            if "json" in b and b["json"].get("position"):
+                return float(b["json"]["position"][2])
+        return None
+
+    sim.add_object(name="pushed", shape="cuboid", position=[0.9, 0.0, 0.06], size=[0.05] * 3)
+    sim.reset()
+    sim.step(20)  # let it settle on the ground
+    check("apply_force latch: the probe body settled", _z("pushed") is not None, str(_z("pushed")))
+    z0 = _z("pushed")
+    sim.apply_force("pushed", force=[0.0, 0.0, 40.0])
+    # Drive time through SEND_ACTION and never step(): this is the surface a
+    # rollout uses, and the one where the wrench used to do nothing at all.
+    for _ in range(40):
+        sim.send_action({}, robot_name="arm", n_substeps=1)
+    z1 = _z("pushed")
+    print(f"  latched force via send_action: z {z0} -> {z1}", flush=True)
+    check(
+        "a latched force acts on send_action ticks",
+        z0 is not None and z1 is not None and z1 > z0 + 0.01,
+        f"z {z0} -> {z1} (expected the 40 N up-force to lift it)",
+    )
+    sim.apply_force("pushed", force=[0.0, 0.0, 0.0])
 
     sim.destroy()
 
