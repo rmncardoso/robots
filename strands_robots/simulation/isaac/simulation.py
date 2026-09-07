@@ -1689,12 +1689,15 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         Parameters
         ----------
         env_ids : list[int], optional
-            Specific environment indices to reset. If None, reset all.
+            Refused. This backend resets the whole world or nothing: it drives
+            ``omni.isaac.core.World.reset()``, which takes no environment
+            selection, so there is no per-environment reset to route a subset
+            to. Pass ``None`` (or omit it) for the only reset that exists.
 
         Returns
         -------
         dict
-            Status dict.
+            Status dict. ``status="error"`` when ``env_ids`` is given.
 
         Concurrency: main-thread affine. ``world.reset()`` drives Isaac's kit
         runtime (``SimulationContext.stop()``/``play()``), which only pumps
@@ -1704,20 +1707,50 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         (rather than blocking forever) when it is not. See
         :meth:`_marshal_main_thread_affine`.
         """
+        # Refused ahead of every check and every side effect, so a refused call
+        # neither resets nor writes a dataset row.
+        #
+        # This parameter used to be accepted and ignored: the body called
+        # ``world.reset()`` unconditionally and ``env_ids`` selected only the
+        # WORDING, reporting "Partial reset complete for 1 envs." after
+        # re-initializing all of them. Accepting a selection that cannot be
+        # honoured is worse here than refusing it, in two compounding ways.
+        # A vectorized caller resetting the one env that terminated silently
+        # teleported every other env mid-rollout, and was told it had not. And
+        # the recording path reasoned FROM the ignored parameter: it skipped the
+        # episode flush on the stated grounds that a partial reset need not end
+        # the recorded robot's rollout, which is true of a partial reset and
+        # false of the full one that actually ran - so the frames either side of
+        # a whole-world teleport were concatenated into one open episode, giving
+        # a dataset a physically impossible transition with nothing raised.
+        if env_ids is not None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            "reset: env_ids is not supported on the Isaac backend. It resets the "
+                            "whole world or nothing - world.reset() takes no environment "
+                            "selection - so a subset cannot be honoured, and accepting one would "
+                            "re-initialize every environment while reporting a partial reset. "
+                            "Call reset() with no argument for the whole-world reset, and note "
+                            "that it IS an episode boundary: an open recording is flushed as its "
+                            "own episode first."
+                        )
+                    }
+                ],
+            }
+
         with self._lock:
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
 
-        # A full reset re-initializes the scene, so an open recording's buffered
+        # A reset re-initializes the scene, so an open recording's buffered
         # frames are the rollout that just ended - flush them as their own
         # episode before the teleport. Ahead of the main-thread marshal because
-        # the flush is a dataset write and does not touch the kit runtime. A
-        # PARTIAL reset is deliberately not a boundary: it re-initializes some
-        # envs and this stream records one robot, so whether its rollout ended
-        # is not knowable from ``env_ids`` alone, and cutting an episode there
-        # would split a trajectory that never stopped.
+        # the flush is a dataset write and does not touch the kit runtime.
         flush_note = ""
-        if env_ids is None and (flush := self._flush_open_episode_before_reset()) is not None:
+        if (flush := self._flush_open_episode_before_reset()) is not None:
             if flush.get("status") != "success":
                 return flush
             flush_note = flush["content"][0]["text"] + " "
@@ -1757,12 +1790,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 self._sim_time = 0.0
                 self._step_count = 0
 
-                if env_ids is None:
-                    msg = f"{flush_note}Full reset complete."
-                else:
-                    msg = f"Partial reset complete for {len(env_ids)} envs."
-
-                return {"status": "success", "content": [{"text": msg}]}
+                # One wording, because there is one reset. The branch that used
+                # to sit here is what made the ignored env_ids invisible.
+                return {"status": "success", "content": [{"text": f"{flush_note}Full reset complete."}]}
 
         return self._marshal_main_thread_affine("reset", _reset_impl)
 
