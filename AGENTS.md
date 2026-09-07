@@ -383,7 +383,9 @@ hatch run format            # ruff check --fix, ruff format
    all of those resolve. The one shape that does not is a symbol imported from
    a module that only *re-exports* it: the import does not say which file the
    symbol came from, so it resolves to nothing rather than to a guess. Import
-   from the defining module.
+   from the defining module. A pin screens the whole tree for that shape and
+   names the module to import from, so a site that breaks the rule fails the
+   required check instead of dropping out of the roster unnoticed (#3273).
 3. Record the change as a news fragment: `changelog.d/<pr-number>-<slug>.md`
    (see [`changelog.d/README.md`](changelog.d/README.md)). **Never append to
    `## [Unreleased]` in `CHANGELOG.md` directly** - every branch inserts at the
@@ -986,6 +988,34 @@ hatch run format            # ruff check --fix, ruff format
      `require_last_push_approval` then disqualifies the pushing account from
      re-supplying it, turning a one-approval merge into one that needs a second
      reviewer.
+
+     **`CHANGES_REQUESTED` is a fourth reading, and it is the one no approval
+     answers.** A standing request for changes holds the merge until *its own
+     author* approves or dismisses it, so an approval from anybody else
+     satisfies `required_approving_review_count` and leaves the pull request
+     `BLOCKED`. That makes it the opposite of every other value here: the party
+     it needs is not "a reviewer" but one named account, and asking a different
+     reviewer for the approval spends a round that cannot merge anything.
+
+     It is also the reading a resolved thread hides. #3205 sat at
+     `CHANGES_REQUESTED` for 15h44m with its one review thread **resolved**,
+     `call-test-lint` `SUCCESS`, and `check_thread_is_answered.py` reading
+     `nothing-owed` -- 12h51m of that after the fix had landed. Thread
+     resolution and review decision are separate objects and resolving the
+     thread does not retract the review, so the sweep that answers "does this
+     owe me anything" correctly said no while the decision went on blocking.
+     Nor does the requester's own follow-up reply clear it: a reply is a
+     `COMMENTED` review, which expresses no position, so it supersedes nothing.
+
+     `check_merge_blockers.py` reports this as `changes-requested`, owed by
+     `the reviewer who requested changes` and named account by account, ahead of
+     the approval rules it is not answerable by. It did not always: it modelled
+     the approval side alone, so it reported #3205 as `missing-approval` owed by
+     "a reviewer other than the pusher" -- a party whose approval could not have
+     merged it, which is the #1905 presentation reached from the review-decision
+     side rather than the last-push side. If you are the requester and the work
+     has landed, the remedy is to supersede your own review; that is a review,
+     not a push, and it costs the branch nothing.
    - *And that the head it names is the branch's tip.* A pull request has three
      answers to "what is the head commit" and they can disagree for hours. Two
      of them are the API's, and are the pair this bullet compares: `headRefOid`
@@ -1280,7 +1310,9 @@ hatch run format            # ruff check --fix, ruff format
    It reads the branch ruleset - so a rule that is changed in settings cannot
    drift from this file - and names every rule the pull request leaves
    unsatisfied together with the party who can clear it: a conflict or an
-   unresolved thread or a failing check (the author), a missing approval (any
+   unresolved thread or a failing check (the author), a standing request for
+   changes (only the account that made it, by approving or dismissing its own
+   review -- no other reviewer's approval clears it), a missing approval (any
    reviewer), an approval only its own pusher supplied (a different reviewer,
    per #1905), a required check absent because a fork run is held at
    `action_required` (a maintainer, by approving each run), a required check
@@ -2316,10 +2348,46 @@ Corrections from code review that apply to all future contributions:
   Rewriting the flagged code to satisfy the query is the tempting fourth option
   and the one that costs: #1879 spent a round removing a `__float__` from a test
   fixture for a finding that gated nothing. It can also destroy the measurement
-  the code exists for. On #1890 the query asked for a `LookupError`; the one it
-  names first, `IndexError`, is what CPython's `seqiter` *clears* to terminate
-  legacy-protocol iteration, so taking the suggestion would have left the fixture
-  raising nothing and the test asserting nothing, still green.
+  the code exists for - but *which* rewrite does that is a fact about the probe
+  rather than about the rule, and the short version of this reason has now been
+  read onto a shape it is false of.
+
+  For `__getitem__` the query asks for "`KeyError` or `IndexError`" by name, and
+  those two are not interchangeable. Each row below is constructed and executed by
+  `TestTheGetItemRewriteIsNotOneBehaviour` in
+  `tests/test_codeql_query_filters.py`, which reads this table rather than
+  restating it, so a row that stops being true fails there:
+
+  | probe, `__getitem__` raising | `list(probe)` | the raise is swallowed |
+  |---|---|---|
+  | `_LegacySequence` (`__len__` and `__getitem__`, no `__iter__`), `IndexError` | `[]` | **yes** - `seqiter` clears it to end the protocol |
+  | `_LegacySequence`, `KeyError` | `KeyError` | no - it propagates, as a `RuntimeError` does |
+  | `_HostileStr` (a `str` subclass), `IndexError` | `['[', ':', ':', '1', ']']` | no - `str` supplies `__iter__`, so `seqiter` is never built |
+
+  Row 1 is the #1890 reason: `IndexError` is what CPython's `seqiter` *clears* to
+  terminate the legacy iteration protocol, so the probe is consulted, raises, and
+  the read completes empty - a cell asserting a refusal is no longer measuring the
+  read that failed. Rows 2 and 3 are the two ways that reason does not travel.
+  `KeyError` satisfies the same query and is not cleared, so one spelling of the
+  suggestion keeps the measurement intact. And a `str` subclass supplies its own
+  `__iter__`, so `seqiter` is never constructed and `__getitem__` is not consulted
+  at all - the mechanism is absent rather than adverse. That third row is alert
+  1168 on #3272, where this reason was reached for and measured false (#3276).
+
+  `list(probe)` is the whole discriminator, so run it before citing a mechanism.
+  The 280-character dismissal comment cites this file instead of restating an
+  argument, which is what makes a wrong reason here expensive: it becomes a wrong
+  claim in a dismissal that outlives the branch.
+
+  Refuse the rewrite on the **property** instead, because that holds for every
+  probe shape. The query's own help text gives the harm as a user of the class
+  meeting an exception the protocol did not lead them to expect, and a probe
+  written to be an unconventional class *is* that harm, under test on purpose. A
+  conforming `LookupError` models a value refusing *within* the protocol, which is
+  strictly weaker than what a guarded read documents itself as surviving. Then
+  check the population before calling it convention rather than defect: on #3272
+  the same file raised `RuntimeError` from `__str__`, `__iter__` and `__repr__`
+  and none of the three was flagged.
 - **One alert class clears under none of the three, and the question that settles
   it is which thread you marshal onto.** `py/catch-base-exception` never fires on
   cleanup-and-reraise: the query accepts a handler that re-raises *lexically*, and
