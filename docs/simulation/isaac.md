@@ -139,7 +139,23 @@ rejected eagerly. The commonly used fields:
 | Kwarg | Type | Default | Description |
 |-------|------|---------|-------------|
 | `num_envs` | `int` | `1` | Parallel environments. Set to `1024`+ for fleet RL. A positive integer - the same domain `replicate(num_envs=...)` takes. |
-| `device` | `str` | `"cuda:0"` | CUDA device (`cuda:N`). Must be a CUDA device. |
+| `device` | `str` | `"cuda:0"` | CUDA device (`cuda:N`). Must be a CUDA device. Forwarded to `World`, so it is what PhysX solves on. |
+
+`get_state()` reports `device` as the device PhysX **resolved** and
+`device_requested` as the one the config asked for. Read the first when you want
+to know where physics is running:
+
+```python
+sim.get_state()["content"][0]["json"]["device"]           # 'cuda:0'
+sim._world.get_physics_context().use_gpu_pipeline         # True
+```
+
+The two fields are separate because they were able to differ silently. Until the
+device was forwarded, `World`'s own default (`None`, which resolves to `"cpu"`)
+meant PhysX solved on the CPU while every surface echoed the configured
+`cuda:0` - measured at 9.9 against 112.3 steps/s on an A10G for 40 bodies. If
+`device` and `device_requested` ever disagree, physics is not where you asked for
+it.
 | `headless` | `bool` | `True` | Run without a GUI (required for cloud/CI). |
 | `physics_dt` | `float` | `1/120` | Physics timestep (seconds). Positive and finite - the domain `create_world()` applies to the effective dt, and the one the legacy `IsaacSimulation(default_timestep=...)` shortcut that writes this field takes as well. |
 | `rendering_dt` | `float` | `1/30` | Rendering timestep (seconds). |
