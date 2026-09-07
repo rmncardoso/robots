@@ -26,9 +26,19 @@ than its name:
   scene change since the last `reset()` leaves the handle stale;
 * the pose came back in a shape `_to_float_list` rejects.
 
-The refusal now says the object is registered but unreadable, states that
-respelling will not help, distinguishes a missing handle from one that raised
-(different investigations), points at `reset()`, and names the prim path.
+The refusal now says the object is registered but unreadable, distinguishes a
+missing handle from one that raised (different investigations), and points at
+`reset()`.
+
+It also keeps the **one** of main's two remedies that genuinely applies. Of
+"respell it as `<robot>/<link>`" and "pass an absolute prim path", the second
+works for exactly this state: the prim-path route bypasses the dead handle and
+reads the stage. Measured - `get_body_state("mug")` refuses while
+`get_body_state("/World/Objects/mug")` succeeds on the same engine. An earlier
+version of this fix said only that respelling "will not help" and dropped both,
+which removed the working remedy along with the useless one; adversarial review
+caught it. The message now spells the call out, and the premise is pinned by a
+test that drives both routes rather than asserting the advice is sound.
 
 This matters most to the consumers this read exists for. The predicate DSL
 (`body_above_z`, `body_on`, `distance_less_than`) resolves bodies through it, and

@@ -8797,10 +8797,14 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         # here printed the searched-for name inside its own "Known objects"
         # list - "Body 'mug' not found on the Isaac stage. Known objects:
         # [mug]." - and then advised the two remedies for a MISNAMED body:
-        # spell it '<robot>/<link>', or pass an absolute prim path. The name was
-        # already right, so following either produces the same refusal, and the
-        # actual cause - the object is registered but its rigid prim cannot be
-        # read - is named nowhere. Three distinct states reach here: the object
+        # spell it '<robot>/<link>', or pass an absolute prim path - and only the
+        # SECOND of those can help here, which the old wording gave no way to
+        # know. The prim-path route bypasses the dead handle and reads the stage,
+        # so it succeeds for exactly this state (measured); respelling the name
+        # cannot, because the name was already right. The actual cause - the
+        # object is registered but its rigid prim cannot be read - was named
+        # nowhere, and the one remedy that works was buried beside one that
+        # cannot. Three distinct states reach here: the object
         # never got a handle, the handle raised on get_world_pose (the
         # invalidate-on-reset family), or the pose came back unusable. All three
         # are about the object's prim rather than about the name.
@@ -8816,10 +8820,11 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     {
                         "text": (
                             f"Body '{body_name}' is a registered object but its pose is unavailable: "
-                            f"{reason}. The name is correct, so respelling it will not help. A handle "
-                            f"is lost when the prim was never created, or when the scene changed since "
-                            f"the last reset() - call reset() and read it again. Prim path: "
-                            f"{obj.prim_path!r}."
+                            f"{reason}. The name is correct, so respelling it as '<robot>/<link>' will "
+                            f"not help. A handle is lost when the prim was never created, or when the "
+                            f"scene changed since the last reset() - call reset() and read it again. "
+                            f"Reading its prim path directly also bypasses the handle and may work now: "
+                            f"get_body_state({obj.prim_path!r})."
                         )
                     }
                 ],

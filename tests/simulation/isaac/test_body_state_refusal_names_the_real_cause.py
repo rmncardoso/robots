@@ -107,15 +107,47 @@ class TestARegisteredObjectIsNotReportedAsUnknown:
         assert "not found" not in text
 
     @pytest.mark.parametrize("handle", [None, _DeadHandle(), _UnusablePoseHandle()])
-    def test_it_does_not_advise_respelling_a_correct_name(self, handle: Any) -> None:
+    def test_it_says_respelling_the_name_will_not_help(self, handle: Any) -> None:
         """The precise harm: the old advice sent the caller to fix the name."""
         engine = _engine({"mug": _obj(handle)})
 
         text = _text(engine.get_body_state("mug"))
 
-        assert "respelling it will not help" in text
-        assert "<robot>/<link>" not in text
-        assert "absolute prim path" not in text
+        assert "will not help" in text
+
+    @pytest.mark.parametrize("handle", [None, _DeadHandle(), _UnusablePoseHandle()])
+    def test_it_offers_the_prim_path_route_which_does_work(self, handle: Any) -> None:
+        """Of main's two remedies, one genuinely applies here and one cannot.
+
+        Reading the prim path bypasses the dead handle and goes to the stage, so it
+        succeeds for exactly this state - demonstrated by
+        ``test_the_prim_path_route_really_resolves`` below. An earlier version of
+        this refusal said only that respelling "will not help" and dropped both,
+        which removed the working remedy along with the useless one.
+        """
+        engine = _engine({"mug": _obj(handle)})
+
+        text = _text(engine.get_body_state("mug"))
+
+        assert "get_body_state('/World/mug')" in text
+
+    def test_the_prim_path_route_really_resolves(self) -> None:
+        """The premise, executable. Without this the advice above is a guess."""
+        engine = _engine({"mug": _obj(None)})
+        engine._prim_body_state = lambda name: (
+            {
+                "position": [1.0, 2.0, 3.0],
+                "quaternion": [1.0, 0.0, 0.0, 0.0],
+                "rotation_matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "source": "prim",
+                "prim_path": "/World/mug",
+            }
+            if name.startswith("/")
+            else None
+        )
+
+        assert engine.get_body_state("mug")["status"] == "error", "the bare name still cannot resolve"
+        assert engine.get_body_state("/World/mug")["status"] == "success", "the advised route must work"
 
     @pytest.mark.parametrize("handle", [None, _DeadHandle(), _UnusablePoseHandle()])
     def test_it_does_not_list_the_searched_name_as_a_known_object(self, handle: Any) -> None:
