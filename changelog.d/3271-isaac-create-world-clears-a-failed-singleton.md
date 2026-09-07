@@ -47,3 +47,25 @@ kwargs, because that is the mechanism. A fake handing out a fresh object per cal
 let the retry assertions pass on the broken code - the retry got a clean world for
 the wrong reason - which is how the first version of this test measured 1 pre-fix
 failure where the honest fake measures 3.
+
+Two properties of the teardown were wrong in the first version of this fix, both
+found by adversarial review, and both silently restored the leak for the most
+likely failure:
+
+* **It must not be gated on `self._world`.** That name is bound only after
+  `World(...)` *returns*, while the singleton registers inside
+  `SimulationContext.__new__`. So every failure raised by the constructor itself -
+  an unusable `physics_dt`, a device the host cannot provide, which is the
+  likeliest cause here - left a registered instance that an
+  `if self._world is not None` guard skipped entirely. `clear_instance` is a
+  classmethod, so the local `World` symbol reaches the live instance whether or
+  not this object ever held a reference to it.
+* **`stop()` and `clear_instance()` need separate handlers.** `stop()` is the call
+  that raises on a half-built world - `destroy()`'s own comment says so - and with
+  both in one `try` a raising `stop()` skipped the `clear_instance()` that is the
+  entire point. The first version's own test exercised exactly that input while
+  asserting around the invariant rather than on it.
+
+Both are now pinned by tests that fail when the single-`try`, `self._world`-gated
+shape is restored, and the fake `World` registers itself in `__new__` and can fail
+in `__init__`, because a fake that only fails later cannot reach either case.
