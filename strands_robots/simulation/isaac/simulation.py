@@ -3759,6 +3759,35 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                         for i, jname in enumerate(robot.joint_names):
                             if i < len(positions):
                                 obs[jname] = float(positions[i])
+                    # Per-joint velocity, additive (``"<name>.vel"``) beside the
+                    # position key - the ``SimEngine.get_observation`` schema
+                    # entry MuJoCo has emitted since #761 and this backend never
+                    # did. The gap was not cosmetic: the WBC balance controller
+                    # degrades to zero joint velocities with a one-time warning,
+                    # the microduck and ProtoMotions observation packers raise
+                    # ``KeyError``, and an RL env with ``.vel`` in its
+                    # ``actor_obs_keys`` refuses at reset - each on a policy that
+                    # works unchanged on MuJoCo.
+                    #
+                    # Its own ``try``: a handle predating ``get_joint_velocities``
+                    # (or one whose read fails) must degrade to positions-only,
+                    # not take the positions already read down with it - the
+                    # schema says joint state MUST still be returned when other
+                    # reads fail.
+                    try:
+                        joint_velocities = robot.articulation.get_joint_velocities()
+                    except (RuntimeError, ValueError, AttributeError, TypeError) as vel_exc:
+                        logger.debug("Failed to get joint velocities: %s", vel_exc)
+                        joint_velocities = None
+                    if joint_velocities is not None:
+                        velocities = (
+                            joint_velocities.cpu().numpy()
+                            if hasattr(joint_velocities, "cpu")
+                            else np.array(joint_velocities)
+                        )
+                        for i, jname in enumerate(robot.joint_names):
+                            if i < len(velocities):
+                                obs[f"{jname}.vel"] = float(velocities[i])
                 except (RuntimeError, ValueError, AttributeError, TypeError) as e:
                     # Articulation handle may raise RuntimeError on a not-yet
                     # -initialized world, AttributeError on torch-tensor surface
