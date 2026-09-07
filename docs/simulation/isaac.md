@@ -185,6 +185,46 @@ rejected eagerly. The commonly used fields:
 |-------|------|---------|-------------|
 | `num_envs` | `int` | `1` | Default environment count for `replicate()`, which is what actually clones them. Setting it alone creates nothing. A positive integer - the same domain `replicate(num_envs=...)` takes. |
 | `device` | `str` | `"cuda:0"` | CUDA device (`cuda:N`). Must be a CUDA device. **Selects the CUDA device for RTX rendering; PhysX itself currently solves on the CPU** - see below. |
+| `headless` | `bool` | `True` | Run without a GUI (required for cloud/CI). |
+| `physics_dt` | `float` | `1/120` | Physics timestep (seconds). Positive and finite - the domain `create_world()` applies to the effective dt, and the one the legacy `IsaacSimulation(default_timestep=...)` shortcut that writes this field takes as well. |
+| `rendering_dt` | `float` | `1/30` | Rendering timestep (seconds). |
+| `render_mode` | `str` | `"headless"` | `"headless"`, `"rtx_realtime"` (raster), or `"rtx_pathtracing"` (photoreal). |
+| `gravity` | `tuple` | `(0, 0, -9.81)` | Gravity vector (Z-up). Three finite components, Z-aligned - the same domain `create_world(gravity=...)` takes. |
+| `ground_plane` | `bool` | `True` | Add a ground plane on `create_world()`. |
+| `stage_path` | `str` | `"/World"` | USD prim-path prefix every created prim is addressed under. Must be absolute, with at least one component, every component a prim name (`[A-Za-z_][A-Za-z0-9_]*`). |
+| `nucleus_url` | `str \| None` | `None` | Override Omniverse Nucleus URL (env-resolvable). |
+| `camera_width` / `camera_height` | `int` | `640` / `480` | Default camera resolution, for every `add_camera` / render call that states none of its own. Positive integers - the same pixel floor those `width` / `height` arguments take. |
+| `verbose` | `bool` | `False` | Verbose Isaac Sim / Kit logging. |
+
+### Environment variables
+
+The Isaac backend reads three `STRANDS_ISAAC_*` variables (resolved when
+`IsaacConfig` is constructed). `STRANDS_ISAAC_NUCLEUS_URL` is read only when
+`nucleus_url` is not passed, so there the kwarg wins; the two switches override
+their field whenever they are set. Which of those two directions the switches
+*should* have is [#2062](https://github.com/strands-labs/robots/issues/2062).
+
+Both switches accept four symmetric pairs, case-insensitively and ignoring
+surrounding whitespace:
+
+| on | off |
+|----|-----|
+| `1` | `0` |
+| `true` | `false` |
+| `yes` | `no` |
+| `on` | `off` |
+
+Unset -- or set to an empty value, which is what an undefined `${{ vars.* }}`
+interpolation in a GitHub Actions `env:` block produces -- leaves the field
+alone. Any other spelling raises `ValueError` naming both vocabularies, rather
+than falling through to the off side: `STRANDS_ISAAC_HEADLESS=enabled` used to
+open a window.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `STRANDS_ISAAC_NUCLEUS_URL` | Override the Omniverse Nucleus server URL when `nucleus_url` is not passed | unset (Isaac defaults) |
+| `STRANDS_ISAAC_HEADLESS` | On forces `headless`; off forces windowed | unset (uses `headless` kwarg) |
+| `STRANDS_ISAAC_RTX_PATHTRACING` | On forces `render_mode="rtx_pathtracing"`; off leaves `render_mode` alone | unset |
 
 ### PhysX runs on the CPU, and what that costs
 
@@ -228,46 +268,6 @@ an agent calls `create_world` and then `add_robot` one tool call at a time. If y
 workload is physics-throughput-bound and your scene is known up front, the MuJoCo
 backend is currently faster for that shape; use this backend for RTX observations
 and USD scenes.
-| `headless` | `bool` | `True` | Run without a GUI (required for cloud/CI). |
-| `physics_dt` | `float` | `1/120` | Physics timestep (seconds). Positive and finite - the domain `create_world()` applies to the effective dt, and the one the legacy `IsaacSimulation(default_timestep=...)` shortcut that writes this field takes as well. |
-| `rendering_dt` | `float` | `1/30` | Rendering timestep (seconds). |
-| `render_mode` | `str` | `"headless"` | `"headless"`, `"rtx_realtime"` (raster), or `"rtx_pathtracing"` (photoreal). |
-| `gravity` | `tuple` | `(0, 0, -9.81)` | Gravity vector (Z-up). Three finite components, Z-aligned - the same domain `create_world(gravity=...)` takes. |
-| `ground_plane` | `bool` | `True` | Add a ground plane on `create_world()`. |
-| `stage_path` | `str` | `"/World"` | USD prim-path prefix every created prim is addressed under. Must be absolute, with at least one component, every component a prim name (`[A-Za-z_][A-Za-z0-9_]*`). |
-| `nucleus_url` | `str \| None` | `None` | Override Omniverse Nucleus URL (env-resolvable). |
-| `camera_width` / `camera_height` | `int` | `640` / `480` | Default camera resolution, for every `add_camera` / render call that states none of its own. Positive integers - the same pixel floor those `width` / `height` arguments take. |
-| `verbose` | `bool` | `False` | Verbose Isaac Sim / Kit logging. |
-
-### Environment variables
-
-The Isaac backend reads three `STRANDS_ISAAC_*` variables (resolved when
-`IsaacConfig` is constructed). `STRANDS_ISAAC_NUCLEUS_URL` is read only when
-`nucleus_url` is not passed, so there the kwarg wins; the two switches override
-their field whenever they are set. Which of those two directions the switches
-*should* have is [#2062](https://github.com/strands-labs/robots/issues/2062).
-
-Both switches accept four symmetric pairs, case-insensitively and ignoring
-surrounding whitespace:
-
-| on | off |
-|----|-----|
-| `1` | `0` |
-| `true` | `false` |
-| `yes` | `no` |
-| `on` | `off` |
-
-Unset -- or set to an empty value, which is what an undefined `${{ vars.* }}`
-interpolation in a GitHub Actions `env:` block produces -- leaves the field
-alone. Any other spelling raises `ValueError` naming both vocabularies, rather
-than falling through to the off side: `STRANDS_ISAAC_HEADLESS=enabled` used to
-open a window.
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `STRANDS_ISAAC_NUCLEUS_URL` | Override the Omniverse Nucleus server URL when `nucleus_url` is not passed | unset (Isaac defaults) |
-| `STRANDS_ISAAC_HEADLESS` | On forces `headless`; off forces windowed | unset (uses `headless` kwarg) |
-| `STRANDS_ISAAC_RTX_PATHTRACING` | On forces `render_mode="rtx_pathtracing"`; off leaves `render_mode` alone | unset |
 
 ## Capabilities and parity
 
