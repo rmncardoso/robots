@@ -138,7 +138,7 @@ class PoseManager:
         """Load poses from storage."""
         if self.pose_file.exists():
             try:
-                with open(self.pose_file) as f:
+                with open(self.pose_file, encoding="utf-8") as f:
                     data = json.load(f)
                     self.poses = {name: RobotPose.from_dict(pose_data) for name, pose_data in data.items()}
                 logger.info(f"Loaded {len(self.poses)} poses for robot {self.robot_id}")
@@ -150,7 +150,7 @@ class PoseManager:
         """Save poses to storage."""
         try:
             data = {name: pose.to_dict() for name, pose in self.poses.items()}
-            with open(self.pose_file, "w") as f:
+            with open(self.pose_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
             logger.info(f"Saved {len(self.poses)} poses for robot {self.robot_id}")
         except Exception as e:
@@ -533,6 +533,22 @@ class MotorController:
     """Low-level motor control for fine movements."""
 
     def __init__(self, port: str, baudrate: int = 1000000):
+        """Bind a controller to one serial port.
+
+        Args:
+            port: Serial device path; opened by :meth:`connect`.
+            baudrate: Bus speed, a positive integer. Refused here rather than at
+                :meth:`connect`, which reports a failure to open as a reason
+                string: pyserial coerces the speed through its own ``int()`` and
+                refuses only a negative, so an unusable value opens the port at a
+                speed no servo answers and every read then times out, which is
+                indistinguishable from an unplugged arm.
+
+        Raises:
+            ValueError: ``baudrate`` is not a positive integer.
+        """
+        if (reason := positive_count_error(baudrate, "baudrate", type(self).__name__)) is not None:
+            raise ValueError(reason)
         self.port = port
         self.baudrate = baudrate
         self.serial_conn: serial.Serial | None = None
