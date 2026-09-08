@@ -74,3 +74,32 @@ The config's CUDA-only domain is unchanged and pinned as a control. So is the
 absence of the `device` kwarg at the `World` call, with the reason - a bare
 omission reads as an oversight and invites the one-line "fix" that breaks
 `add_robot`.
+
+**Two surfaces that were still echoing now read back**, closing the rest of this
+defect's shape.
+
+`__repr__` is what a traceback and a failing assertion render first, which makes it the
+worst placement for a request presented as fact. It echoed `config.device` - `"cuda:0"`
+by default, while PhysX resolves to `"cpu"` - so a repr in a stack trace asserted the
+opposite of where physics was running. It now reports the resolved device and appends
+`requested=` only when the two differ. It also echoed `config.num_envs`, which is the
+*default for* `replicate()` rather than a count of anything that exists; it now reports
+`_num_envs_active`. The never-raise guarantee on a half-constructed engine is preserved
+and pinned.
+
+`physics_dt` was reported as the value this backend *passed* to `World`. That is wrong
+in one reachable case: `World` is a `SimulationContext` singleton, so a second
+construction returns the first instance with its original `physics_dt` - measured,
+`World(physics_dt=1/60)` then `World(physics_dt=1/120)` reports `get_physics_dt()` of
+1/60. `create_world` and `get_state` now read it back and report
+`physics_dt_requested` beside it.
+
+That pairing also **surfaces a separate, still-open defect rather than hiding it**:
+`create_world(timestep=X)` is honoured by `World` and never written to
+`IsaacConfig.physics_dt`, which is where `physics_timestep()` and the sim-time
+accumulators read from. The two fields disagreeing is a real signal, and reporting only
+one of them is what kept it invisible.
+
+`headless` and `render_mode` deliberately keep coming from the config: the process-wide
+`SimulationApp` offers no cheap resolved answer, and a status read must not become the
+thing that raises to find one. That asymmetry is pinned so it reads as a decision.
