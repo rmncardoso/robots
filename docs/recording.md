@@ -515,6 +515,19 @@ it, and neither start verb probes the encoder, so the flush is the first call
 that needs one. It reports before opening any writer, so every buffer is intact
 and installing the encoder and calling again writes them.
 
+"No encoder" covers two modules, not one: `imageio` declares the plugin that
+actually writes MP4 -- `imageio_ffmpeg` -- as an optional extra of its own, so an
+install can have `imageio` and still no MP4 writer (`[vera-sim]` declares
+`imageio` alone). The flush requires both, and quotes whichever is missing, so
+the remedy it prints is the one that works:
+
+```
+'imageio_ffmpeg' is required for MP4 video encoding (encode_clip)
+Install with:
+  pip install 'strands-robots[sim-mujoco]'
+  pip install imageio-ffmpeg
+```
+
 ```python
 result = sim.stop_cameras_recording()
 if result["status"] == "error":
@@ -546,6 +559,16 @@ text and as `phase` in its JSON block:
 
 `[idle]` is therefore a promise that nothing is pending, which is why the
 settled-but-registered state gets its own name instead of borrowing it.
+
+The Isaac backend exposes the same pair. It captures through the `on_frame` hook
+`start_cameras_recording` returns rather than a daemon thread, so it has no join
+to expire and none of the thread-dependent phases above. The encoder-absence rule
+is the same one, and both recorders word it from one place
+(`encoder_absent_flush_refusal`): nothing is encoded and nothing is dropped, the
+refusal carries `stopped: False` with the per-camera buffered counts, the
+recording stays registered, and installing the encoder and calling
+`stop_cameras_recording` again encodes the frames it kept. A start is refused for
+as long as those frames are registered, for the same reason.
 
 `fps`, `width`, `height` and `max_frames_per_camera` on the plain-MP4 recorders
 must be positive whole numbers - the same domain `run_policy(video={...})`,
@@ -643,6 +666,20 @@ recorder.add_frame(observation, action)
 recorder.save_episode()
 recorder.finalize()
 ```
+
+### A failed import names the install that fixes it
+
+`create()` and `resume()` import `lerobot.datasets.lerobot_dataset`, which fails
+for four unrelated reasons that need four different instructions - so the
+`ImportError` says which one happened, exactly as every backend's
+`start_recording` does:
+
+| Cause | What the error says to do |
+|-------|---------------------------|
+| lerobot itself is absent | `pip install 'strands-robots[lerobot]'` |
+| lerobot is installed, but a package its dataset stack needs (`datasets`, `pandas`, `pyarrow`, `av`, `torchcodec`) is not | `pip install 'lerobot[dataset]'` - installing lerobot alone does not pull those in |
+| lerobot is installed but does not provide that module (an out-of-range or from-source lerobot) | `pip install 'strands-robots[lerobot]'`, which pins the supported range |
+| the import failed with nothing missing (a binary conflict between installed packages) | No install fixes it; reconcile the conflicting packages |
 
 ### Schema column names must be distinct
 
