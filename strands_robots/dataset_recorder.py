@@ -571,13 +571,18 @@ def _lerobot_home() -> Path:
 def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
     """Resolve the on-disk directory a dataset will live in.
 
-    Mirrors ``LeRobotDataset`` root resolution so callers can inspect the
-    target before ``create``/``resume``:
-
     * explicit ``root`` -> used verbatim;
     * a ``repo_id`` that is itself a path (absolute, ``./`` prefixed, or with no
       ``owner/name`` slash) -> treated as a local directory;
     * otherwise ``$HF_LEROBOT_HOME/{repo_id}``.
+
+    The middle rule is this repo's reading, not LeRobot's: ``LeRobotDataset``
+    resolves any absent root to ``$HF_LEROBOT_HOME/{repo_id}`` whatever the id
+    looks like. So this is the resolution callers get, and
+    :meth:`DatasetRecorder.create` hands the result down as an explicit ``root``
+    rather than letting the writer resolve a second time - otherwise the
+    directory inspected before the write and the directory written to are two
+    different places for exactly the ids the middle rule covers.
 
     Args:
         repo_id: HuggingFace dataset id (``owner/name``) or a local path.
@@ -986,7 +991,12 @@ class DatasetRecorder:
                 ``base_quat.*`` columns). Scalar joint/action fallbacks ignore
                 these; add_frame reads the source keys, not the expanded names.
             task: Default task description
-            root: Local directory for dataset storage
+            root: Local directory for dataset storage. When omitted, the
+                directory is resolved by
+                :func:`~strands_robots.dataset_recorder.resolve_dataset_dir`
+                and forwarded to ``LeRobotDataset.create`` explicitly, so the
+                target ``overwrite`` inspects is the target the dataset is
+                written to.
             use_videos: Encode camera frames as video (True) or keep as images.
                 Selects a posture rather than scaling a quantity, so it must be a
                 boolean (:func:`~strands_robots.utils.boolean_flag_error`) - the
@@ -1164,11 +1174,22 @@ class DatasetRecorder:
 
         logger.info(f"Creating LeRobotDataset: {repo_id} @ {fps}fps, {len(features)} features, robot_type={robot_type}")
 
+        # The directory this dataset will live in, resolved once. It is passed to
+        # ``LeRobotDataset.create`` as an explicit ``root`` rather than letting
+        # the writer re-derive it from ``repo_id``, because the two derivations
+        # are not the same one: ``resolve_dataset_dir`` reads a ``repo_id`` that
+        # is itself a path (no ``owner/name`` slash, or ``./``-prefixed) as a
+        # local directory, while LeRobot resolves any absent root to
+        # ``$HF_LEROBOT_HOME/{repo_id}``. Resolving twice put the directory
+        # ``_prepare_create_target`` inspects and wipes somewhere other than the
+        # directory the dataset is written to - see the call below.
+        dataset_dir = resolve_dataset_dir(repo_id, root)
+
         # Build kwargs, skip unsupported params for this LeRobot version.
         create_kwargs = dict(
             repo_id=repo_id,
             fps=fps,
-            root=root,
+            root=str(dataset_dir),
             robot_type=robot_type,
             features=features,
             use_videos=use_videos,
@@ -1197,7 +1218,11 @@ class DatasetRecorder:
         # otherwise dead-end on a bare FileExistsError. This also keeps the
         # resume() docstring and its no-resume RuntimeError message honest: both
         # point callers at an ``overwrite=`` parameter that now exists here.
-        _prepare_create_target(resolve_dataset_dir(repo_id, root), overwrite=overwrite)
+        # ``dataset_dir`` is the same path ``create_kwargs["root"]`` carries, so
+        # what is inspected here is what gets written; a second, independent
+        # resolution here would leave this guard reading a directory the writer
+        # never touches, and ``overwrite=True`` deleting it.
+        _prepare_create_target(dataset_dir, overwrite=overwrite)
 
         dataset = LeRobotDatasetCls.create(**create_kwargs)
 
@@ -1242,7 +1267,14 @@ class DatasetRecorder:
 
         Args:
             repo_id: HuggingFace dataset ID (same as the original recording).
-            root: Local dataset directory (same as the original recording).
+            root: Local dataset directory. When omitted, the directory this
+                ``repo_id`` resolves to
+                (:func:`~strands_robots.dataset_recorder.resolve_dataset_dir`) -
+                the same one :meth:`create` writes to, so the id that created a
+                dataset reopens it. It is forwarded to LeRobot as an explicit
+                root either way; LeRobot refuses an absent one, because the
+                directory it derives for a writer would be the revision-safe Hub
+                snapshot cache.
             task: Default task description for appended frames.
             vcodec: Video codec for the per-camera MP4 streams (default
                 "h264"; routed into the version-appropriate encoder
@@ -1289,8 +1321,19 @@ class DatasetRecorder:
                 "Use overwrite=True for a fresh single-session dataset."
             )
 
+        # The directory to append into, resolved once by the same rule
+        # :meth:`create` writes through and forwarded as an explicit ``root`` for
+        # the same reason: an absent root is not LeRobot's to derive here.
+        # ``LeRobotDataset.resume`` refuses one outright - the directory it would
+        # derive is the revision-safe Hub snapshot cache, which a DatasetWriter
+        # must not open - so forwarding the caller's ``None`` unresolved made the
+        # append entry point unreachable on exactly the arguments ``create``
+        # accepts: the ``repo_id`` that created a dataset could not reopen it, and
+        # the refusal asked for the directory this resolver already names.
+        dataset_dir = resolve_dataset_dir(repo_id, root)
+
         resume_sig = inspect.signature(LeRobotDatasetCls.resume).parameters
-        resume_kwargs: dict[str, Any] = dict(repo_id=repo_id, root=root)
+        resume_kwargs: dict[str, Any] = dict(repo_id=repo_id, root=str(dataset_dir))
         # Mirror create()'s version-tolerant codec routing.
         resume_kwargs.update(_codec_create_kwargs(resume_sig, vcodec, context="resume"))
         if "streaming_encoding" in resume_sig:
