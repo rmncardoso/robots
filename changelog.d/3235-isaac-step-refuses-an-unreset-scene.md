@@ -56,3 +56,57 @@ equivalent - its `step` reads the compiled model directly - and the shared
 step-count and lock-hold domains are unchanged, since the gate is inert until a
 body mutation marks the scene and sits behind the existing "No world created" and
 "World not initialized" refusals.
+
+
+---
+
+**Correction, from hardware.** The first version of this entry marked the scene stale
+for *any* `add_object` / `remove_object`, and had `step` refuse. Both parts were wrong,
+and the evidence for them was one measurement generalised a step too far - the original
+"measured, not inferred" note was taken on a **DynamicCuboid** and applied to every body.
+
+Measured on an A10G under Isaac Sim 6.0.1, reading a Franka's joint keys either side of
+each operation:
+
+| operation | tensor view |
+|---|---|
+| `add_object(is_static=True)` | **intact** - 9 joint keys -> 9 |
+| `add_object(is_static=False)` | invalidated - 9 -> 0 |
+| remove a **static** prim | **intact** - 9 -> 9 |
+| remove a **dynamic** prim | invalidated, and the next joint read **hung** until a 2-minute timeout |
+
+The mechanism was already gated this way in `add_object`: `_construct_shape_prim` stops
+the timeline - which is what clears the sim view - only for a dynamic prim. The mark sat
+outside a gate the code itself drew.
+
+Marking unconditionally was a live regression, not a theoretical one. It disabled **every**
+`step` in `examples/isaac_gs`: all three of its `add_object` calls are `is_static=True`,
+it never calls `reset()` anywhere (its agent prompt instructs the model *"never rebuild,
+reset, or destroy it"*), and all six of its step sites discard the returned envelope. So
+the physics settle, the camera warmup - whose own docstring says an unwarmed product
+returns malformed frames - and the wave demo all silently stopped happening, with no
+diagnostic, in an example whose entire output is images. The same shape hit
+`tests_integ/simulation/test_isaac_body_state_gpu` and `docs/simulation/isaac.md`'s own
+usage example.
+
+**And refusing was the wrong remedy even where the view genuinely is stale.** `step` now
+rebuilds it in place - `SimulationManager.initialize_physics()` + `world.play()` + the
+articulation revive - and refuses only if that fails. Measured on a Franka posed away
+from its default and then made stale:
+
+| joint | in-place rebuild | `reset()` |
+|---|---|---|
+| `panda_joint2` (posed to -0.90) | 0.010 rad | **0.877 rad** |
+| `panda_joint4` (posed to -2.20) | 0.064 rad | **2.163 rad** |
+
+`reset()` - what the old refusal told callers to do - discards the pose. The rebuild
+costs up to ~0.09 rad of settling as the timeline restarts, which is physics running.
+Also measured: the newly added body simulates afterwards, joint reads return (0 -> 9
+keys), and the rebuild is idempotent - three in a row leave the view valid.
+
+The gate now also **logs** when it acts. It logged nothing before, which is why a
+discarded envelope was silent; `get_observation`'s twin gate already warned.
+
+Each half is pinned by a test that fails when that half alone is reverted - verified as a
+four-way mutation matrix (unconditional add mark, unconditional remove mark, no rebuild,
+and a rebuild that falsely claims success).
