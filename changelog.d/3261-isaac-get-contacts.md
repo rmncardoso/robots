@@ -46,3 +46,31 @@ the same-step cache serves the populated answer, and contacts persist across
 steps at rest. The translation from the raw report is a pure function with its
 own unit tests, including the per-header data-offset walk (an offset bug hands
 pair B pair A's contact points).
+
+**The per-step cache is keyed on an epoch, not on `_step_count` alone.** The counter
+is not monotonic - `create_world`, `reset` and `destroy` all rewind it to 0 - so a
+cache written at step N before a rewind was indistinguishable from one written at
+step N after it, and the stale list was served whenever the two coincided.
+Demonstrated three ways: immediately after a `reset()` when the cache was last
+written at step 0; at the first post-reset step matching the cached index; and
+across `destroy()` plus a new `create_world()`, where a world holding **no objects
+at all** reported the previous world's object-ground pair without PhysX being asked.
+
+The last is reachable in shipped code. `PolicyRunner` calls `sim.reset()` per
+episode and evaluates the resolved success criterion after each step, and
+`success_fn="contact"` routes through the predicate DSL into `get_contacts` - so an
+episode that ended on its *first* contact query leaves the cache keyed at exactly
+the index the next episode's first query uses, and that episode reports contact
+success having touched nothing. A silently passing episode.
+
+The invalidation is an epoch bumped by `_rewind_clock()`, now the single owner of
+that rewind, rather than a `_contact_cache = None` beside each of the four
+`_step_count = 0` sites. The epoch makes it structural: a rewind added later
+inherits the invalidation by calling the owner instead of needing to remember a
+second line, and a test derives from the source that no raw `self._step_count = 0`
+survives outside that owner.
+
+The MuJoCo sibling documents the same hazard from the other side - its renderer runs
+`mj_forward` first so contacts are fresh "even immediately after `reset`... (without
+this, stale contacts from the previous step can appear as phantom penetrations at
+t=0)".

@@ -1001,6 +1001,14 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
     #: stop.
     _pump_running: bool = False
 
+    #: Bumped every time the simulated clock is rewound to zero. Anything cached
+    #: against ``_step_count`` must also compare this, because ``_step_count`` is
+    #: NOT monotonic: create_world, reset and destroy all set it back to 0, so a
+    #: post-rewind step index can equal a pre-rewind one and make a stale entry
+    #: look current. Declared on the CLASS for the same reason as the two flags
+    #: above - skeleton engines built with ``__new__`` never run ``__init__``.
+    _contact_epoch: int = 0
+
     def __init__(self, config: IsaacConfig | None = None, **kwargs: Any) -> None:
         # Merge shortcut kwargs into config. Unknown kwargs are rejected
         # eagerly (rather than silently dropped) so a typo like
@@ -1102,8 +1110,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         self._world_created = False
         self._replicated = False
         self._num_envs_active = 1
-        self._sim_time = 0.0
-        self._step_count = 0
+        self._rewind_clock()
 
         # PhysX builds its tensor simulation view at ``world.reset()``, and
         # adding or DELETING a physics-body prim afterwards invalidates it.
@@ -1583,8 +1590,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 self._world_created = True
                 # This reset built the tensor view, so a fresh world is not stale.
                 self._physics_view_stale = False
-                self._sim_time = 0.0
-                self._step_count = 0
+                self._rewind_clock()
 
                 logger.info(
                     "World created: dt=%.5f, gravity=%s, headless=%s",
@@ -1843,8 +1849,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             self._world_created = False
             self._replicated = False
             self._num_envs_active = 1
-            self._sim_time = 0.0
-            self._step_count = 0
+            self._rewind_clock()
 
             logger.info("World destroyed. SimulationApp remains (process-wide singleton).")
 
@@ -1981,8 +1986,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 wrenches = getattr(self, "_applied_wrenches", None)
                 if wrenches:
                     wrenches.clear()
-                self._sim_time = 0.0
-                self._step_count = 0
+                self._rewind_clock()
 
                 # One wording, because there is one reset. The branch that used
                 # to sit here is what made the ignored env_ids invisible.
@@ -2167,6 +2171,34 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             }
 
         return self._marshal_main_thread_affine("step", _step_impl)
+
+    def _rewind_clock(self) -> None:
+        """Set the simulated clock back to zero and invalidate what it keyed.
+
+        The single owner of that rewind. ``_sim_time`` and ``_step_count`` are
+        reset in four places - ``__init__``, ``create_world``, ``reset`` and
+        ``destroy`` - and ``_step_count`` is the key ``get_contacts`` validates its
+        per-step cache against. Because the counter is not monotonic, a cache
+        written at step N before a rewind is indistinguishable from one written at
+        step N after it, so the stale answer is served whenever the two indices
+        coincide: immediately after a reset if the cache was last written at step
+        0, and otherwise at the first post-rewind step that matches.
+
+        That was reachable in the shipped policy runner, which calls ``reset()``
+        per episode and evaluates a contact success criterion after each step - an
+        episode ending on its first contact query leaves the cache keyed at exactly
+        the index the next episode's first query uses, so the next episode could
+        report contact success without PhysX being asked. Worse across
+        ``destroy()``: a brand-new world holding no objects at all could report the
+        previous world's object-ground pair.
+
+        Bumping an epoch here rather than clearing the cache at each site is what
+        makes it structural: a rewind added later gets the invalidation by calling
+        this, instead of needing to remember a second line.
+        """
+        self._sim_time = 0.0
+        self._step_count = 0
+        self._contact_epoch += 1
 
     def get_state(self) -> dict[str, Any]:
         """Get full simulation state summary.
@@ -4519,8 +4551,19 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         with self._lock:
             if not self._world_created or self._world is None:
                 return {"status": "error", "content": [{"text": "No world. Call create_world (or load_scene) first."}]}
+            # Keyed on (epoch, step) rather than step alone. _step_count is NOT
+            # monotonic - create_world, reset and destroy all rewind it to 0 - so a
+            # cache written at step N before a rewind is indistinguishable from one
+            # written at step N after it, and the stale answer was served whenever
+            # the two coincided. Demonstrated three ways: immediately after a
+            # reset() when the cache was last written at step 0; at the first
+            # post-reset step matching the cached index, which for a policy-runner
+            # episode that ended on its first contact query is the NEXT episode's
+            # first query; and across destroy() + create_world(), where a world
+            # holding no objects reported the previous world's object-ground pair
+            # without PhysX ever being asked. _rewind_clock() bumps the epoch.
             cache = getattr(self, "_contact_cache", None)
-            if cache is not None and cache[0] == self._step_count:
+            if cache is not None and cache[0] == (self._contact_epoch, self._step_count):
                 contacts = cache[1]
             else:
                 try:
@@ -4541,7 +4584,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 headers, data = get_physx_simulation_interface().get_contact_report()
                 path_to_name = {st.prim_path: n for n, st in self._objects.items()}
                 contacts = _translate_contact_report(headers, data, PhysicsSchemaTools.intToSdfPath, path_to_name)
-                self._contact_cache = (self._step_count, contacts)
+                self._contact_cache = ((self._contact_epoch, self._step_count), contacts)
 
         if contacts:
             n_active = sum(1 for c in contacts if c["active"])
