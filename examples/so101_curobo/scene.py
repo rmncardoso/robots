@@ -714,8 +714,28 @@ def build_pick_place_scene(
         if _status(sim.add_camera(name=name, position=pos, target=tgt, fov=fov, width=cw, height=ch)) == "success":
             cams.append(name)
 
+    # Isaac only: rebuild PhysX's tensor view before stepping. Adding a DYNAMIC
+    # body - the cube above, with ``is_static=False`` - invalidates the view, and
+    # ``step`` refuses on Isaac until a ``reset`` rebuilds it. Without this the
+    # settle below silently does nothing: ``step`` returns an error envelope this
+    # call discards, and the arm never reaches its home pose.
+    #
+    # Placed BEFORE ``_erect_arm``, not after: ``reset`` returns the robot to its
+    # default pose, so resetting after the erect would undo it. Nothing is posed
+    # before this point, so the reset costs nothing here. MuJoCo needs no rebuild
+    # and is left on its original path.
+    if is_isaac:
+        _reset = sim.reset()
+        if _status(_reset) != "success":
+            logger.warning("scene build: reset before the settle step failed: %s", _reset)
+
     _erect_arm(sim, robot_name="arm")
-    sim.step(20)  # settle into the home pose
+    _settle = sim.step(20)  # settle into the home pose
+    if _status(_settle) != "success":
+        # Checked rather than discarded: this step is what brings the arm to its
+        # home pose, and a silent failure here surfaces later as a robot that
+        # never moved.
+        logger.warning("scene build: the settle step did not run: %s", _settle)
 
     # Final enforcement (after ALL recompiles -- robot, pads, cube/bin, cameras):
     # re-apply the strong gripper force + high pad/cube friction directly on the
