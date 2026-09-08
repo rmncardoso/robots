@@ -537,6 +537,36 @@ _RENDERER_BY_MODE: dict[str, str] = {
 }
 
 
+def _resolved_physics_dt(world: Any) -> float | None:
+    """The physics timestep the World is actually integrating at, or ``None``.
+
+    Read off the World rather than echoed from the argument, for the same reason as
+    :func:`_resolved_physics_device` and one more specific to this value: ``World`` is
+    a ``SimulationContext`` singleton, so a second construction returns the FIRST
+    instance with its original ``physics_dt`` intact. Measured on an A10G,
+    ``World(physics_dt=1/60)`` then ``World(physics_dt=1/120)`` reports
+    ``get_physics_dt()`` of 1/60. So the dt this backend passed and the dt being
+    integrated can differ, and the passed value is the one that used to be reported.
+
+    Answers ``None`` rather than raising when there is no world or the runtime does
+    not expose the reader: this feeds status reads, and a status read must not be the
+    thing that fails.
+    """
+    if world is None:
+        return None
+    getter = getattr(world, "get_physics_dt", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except (AttributeError, RuntimeError):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _resolved_physics_device(world: Any) -> str | None:
     """The device PhysX is solving on, or ``None`` when it cannot be read.
 
@@ -1603,8 +1633,13 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 # environment alongside the human-readable text. Agents
                 # spinning up a sim can introspect device / dt / scene
                 # config without re-querying via get_state().
+                # Read back off the World, not echoed from ``dt``: a reused
+                # singleton keeps its FIRST physics_dt, so the value passed and the
+                # value integrated can differ.
+                resolved_dt = _resolved_physics_dt(self._world)
                 world_info = {
-                    "physics_dt": dt,
+                    "physics_dt": resolved_dt if resolved_dt is not None else dt,
+                    "physics_dt_requested": dt,
                     "rendering_dt": self._config.rendering_dt,
                     "gravity": list(grav),
                     "ground_plane": bool(ground_plane and self._config.ground_plane),
@@ -2225,6 +2260,12 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 "stage_path": self._config.stage_path,
                 "device": _resolved_physics_device(self._world) or self._config.device,
                 "device_requested": self._config.device,
+                # The dt actually being integrated, beside the configured one. They
+                # differ whenever create_world(timestep=) was honoured by World but
+                # not written back to the config - which is where physics_timestep()
+                # and the sim-time accumulators still read from.
+                "physics_dt": _resolved_physics_dt(self._world),
+                "physics_dt_requested": self._config.physics_dt,
                 "headless": self._config.headless,
                 "render_mode": self._config.render_mode,
             }
@@ -9395,12 +9436,34 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         nothing to do with the failure under investigation. Report the
         lifecycle fact that *is* relevant instead, and name no attribute so
         nobody is sent chasing one.
+
+        Two of the four fields used to be read off the config, which made them
+        *requests* rendered as facts - the same shape as the device-reporting defect,
+        in the surface a traceback shows first:
+
+        * ``device`` echoed ``config.device`` (``"cuda:0"`` by default) while PhysX
+          resolves to ``"cpu"``, so a repr in a stack trace asserted the opposite of
+          where physics was running. It now reports the RESOLVED device, and appends
+          ``requested=`` only when the two differ - which is the case worth a reader's
+          attention and, currently, the normal one.
+        * ``num_envs`` echoed ``config.num_envs``, which is the *default for*
+          ``replicate()`` and not a count of anything that exists - "setting it alone
+          creates nothing". It now reports ``_num_envs_active``, the count actually
+          built.
+
+        ``headless`` stays from the config because the process-wide ``SimulationApp``
+        offers no cheap resolved answer here, and this method may not become the thing
+        that raises to find one.
         """
         try:
+            resolved = _resolved_physics_device(getattr(self, "_world", None))
+            requested = self._config.device
+            device = resolved if resolved is not None else requested
+            divergence = f", requested={requested!r}" if resolved is not None and resolved != requested else ""
             return (
                 f"IsaacSimulation("
-                f"num_envs={self._config.num_envs}, "
-                f"device={self._config.device!r}, "
+                f"num_envs={self._num_envs_active}, "
+                f"device={device!r}{divergence}, "
                 f"headless={self._config.headless}, "
                 f"world={'created' if self._world_created else 'none'})"
             )
