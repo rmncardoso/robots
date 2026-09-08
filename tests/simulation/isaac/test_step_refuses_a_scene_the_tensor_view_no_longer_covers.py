@@ -256,7 +256,11 @@ class TestSteppingAMarkedSceneIsRefused:
         assert _REMEDY in text
         # The two mutations that require it are named, and the ones that do not
         # are named too - so a caller is not sent resetting after every call.
-        assert "add_object" in text and "remove_object" in text
+        # The wording is now more precise than "add_object / remove_object",
+        # because only the DYNAMIC case invalidates - measured on an A10G, a
+        # static add and a static remove both leave a Franka's 9 joint keys intact.
+        assert "DYNAMIC" in text
+        assert "static one" in text
         assert "add_camera" in text
 
     def test_the_refusal_does_not_report_a_rate(self, fake_isaacsim: None) -> None:
@@ -351,6 +355,177 @@ class TestAMarkedSceneAnswersNoObservation:
         assert engine._physics_view_stale is False
 
 
+class TestAStaleSceneIsRepairedNotRefused:
+    """``step`` rebuilds the view in place; it only refuses if that fails.
+
+    The rebuild itself needs a live Kit runtime, so on this CPU skeleton
+    ``_rebuild_physics_view`` always answers False and ``step`` takes the refusal
+    branch. That makes the repair path invisible to a plain skeleton test - so these
+    drive it by controlling the rebuild's answer, and the rebuild's own behaviour is
+    verified on hardware (measured on an A10G: joint keys 0 -> 9, the new dynamic
+    body then simulates, and a posed arm moves 0.06 rad where ``reset()`` moves it
+    2.16 rad).
+    """
+
+    def test_a_successful_rebuild_lets_the_step_through(self, fake_isaacsim: None) -> None:
+        engine = _engine()
+        engine._physics_view_stale = True
+        calls: list[int] = []
+
+        def _rebuild() -> bool:
+            calls.append(1)
+            engine._physics_view_stale = False
+            return True
+
+        engine._rebuild_physics_view = _rebuild
+
+        assert engine.step(3)["status"] == "success"
+        assert calls == [1], "step must attempt the rebuild before deciding"
+
+    def test_a_failed_rebuild_still_refuses(self, fake_isaacsim: None) -> None:
+        """The one thing this must never do is advance the clock over a scene the
+        view does not cover."""
+        engine = _engine()
+        engine._physics_view_stale = True
+        engine._rebuild_physics_view = lambda: False
+
+        result = engine.step(3)
+
+        assert result["status"] == "error", result
+        assert "rebuilding it in place failed" in result["content"][0]["text"]
+
+    def test_a_failed_rebuild_does_not_advance_the_clock(self, fake_isaacsim: None) -> None:
+        engine = _engine()
+        engine._physics_view_stale = True
+        engine._rebuild_physics_view = lambda: False
+
+        engine.step(9)
+
+        assert engine._step_count == 0
+        assert engine._sim_time == 0.0
+
+    def test_the_rebuild_is_attempted_before_the_refusal(self, fake_isaacsim: None) -> None:
+        """Structural: a refusal that never tried to repair is the old behaviour."""
+        import inspect
+
+        source = inspect.getsource(IsaacSimulation.step)
+        gate = source[source.index("_physics_view_stale") :]
+
+        assert "_rebuild_physics_view" in gate.split("return {")[0], (
+            "step refuses without attempting the in-place rebuild first"
+        )
+
+    def test_the_rebuild_clears_the_mark_on_success(self, fake_isaacsim: None) -> None:
+        """Otherwise every later step would rebuild again."""
+        import inspect
+
+        assert "_physics_view_stale = False" in inspect.getsource(IsaacSimulation._rebuild_physics_view)
+
+    def test_the_rebuild_answers_false_without_a_runtime(self, fake_isaacsim: None) -> None:
+        """On a skeleton there is no view to rebuild, and it must say so rather than
+        claim success - a false True would advance the clock over a dead view."""
+        engine = _engine()
+
+        assert engine._rebuild_physics_view() is False
+
+    def test_the_rebuild_answers_false_with_no_world(self) -> None:
+        engine = IsaacSimulation.__new__(IsaacSimulation)
+        engine._world = None
+
+        assert engine._rebuild_physics_view() is False
+
+
+class TestOnlyADynamicBodyMarksTheScene:
+    """Static adds and removes do not invalidate the view, so they must not mark it.
+
+    Measured on an A10G under Isaac Sim 6.0.1, reading a Franka's joint keys either
+    side of each operation:
+
+        add_object(is_static=True)     9 keys -> 9    view intact
+        add_object(is_static=False)    9 keys -> 0    view dead
+        remove a static prim           9 keys -> 9    view intact
+        remove a dynamic prim          PhysX: "prim ... was deleted while being used
+                                       by a shape in a tensor view class. The
+                                       physics.tensors simulationView was
+                                       invalidated." The next joint read HUNG until
+                                       a 2-minute timeout - it did not return empty.
+
+    The mechanism is already gated this way inside ``add_object``:
+    ``_construct_shape_prim`` stops the timeline - which is what clears the sim view
+    - only for a dynamic prim.
+
+    Marking unconditionally was a real regression, not a theoretical one. It disabled
+    every ``step`` in ``examples/isaac_gs`` (all three of its adds are
+    ``is_static=True``, it never calls ``reset()``, and its six step sites all
+    discard the envelope), the same in
+    ``tests_integ/simulation/test_isaac_body_state_gpu``, and it made
+    ``docs/simulation/isaac.md``'s own usage example refuse. The original evidence
+    for the mark was a single DynamicCuboid measurement, generalised one step too far.
+    """
+
+    def test_a_static_add_does_not_mark(self, fake_isaacsim: None) -> None:
+        engine = _engine()
+
+        assert (
+            engine.add_object(name="s", shape="cuboid", position=[0.4, 0.0, 0.03], size=[0.05] * 3, is_static=True)[
+                "status"
+            ]
+            == "success"
+        )
+
+        assert engine._physics_view_stale is False
+
+    def test_a_dynamic_add_marks(self, fake_isaacsim: None) -> None:
+        engine = _engine()
+
+        assert (
+            engine.add_object(
+                name="d", shape="cuboid", position=[0.6, 0.0, 0.4], size=[0.05] * 3, is_static=False, mass=0.2
+            )["status"]
+            == "success"
+        )
+
+        assert engine._physics_view_stale is True
+
+    def test_a_static_add_leaves_step_working(self, fake_isaacsim: None) -> None:
+        """The property examples/isaac_gs depends on, stated as behaviour."""
+        engine = _engine()
+        engine.add_object(name="s", shape="cuboid", position=[0.4, 0.0, 0.03], size=[0.05] * 3, is_static=True)
+
+        assert engine.step(20)["status"] == "success"
+
+    def test_the_isaac_gs_sequence_steps(self, fake_isaacsim: None) -> None:
+        """examples/isaac_gs/scene.py's exact build order, which has no reset() and
+        whose step envelope is discarded - so a refusal there is invisible."""
+        engine = _engine()
+        engine.add_object(
+            name="shadow", shape="cuboid", position=[0.0, 0.0, -0.01], size=[2.0, 2.0, 0.02], is_static=True
+        )
+        engine.add_object(name="cube", shape="cuboid", position=[0.45, 0.0, 0.03], size=[0.05] * 3, is_static=True)
+
+        assert engine.step(20)["status"] == "success", "the settle step examples/isaac_gs relies on was refused"
+
+    def test_a_static_removal_does_not_mark(self, fake_isaacsim: None) -> None:
+        engine = _engine()
+        engine.add_object(name="s", shape="cuboid", position=[0.4, 0.0, 0.03], size=[0.05] * 3, is_static=True)
+        engine._physics_view_stale = False
+
+        assert engine.remove_object("s")["status"] == "success"
+
+        assert engine._physics_view_stale is False
+
+    def test_a_dynamic_removal_marks(self, fake_isaacsim: None) -> None:
+        engine = _engine()
+        engine.add_object(
+            name="d", shape="cuboid", position=[0.6, 0.0, 0.4], size=[0.05] * 3, is_static=False, mass=0.2
+        )
+        engine._physics_view_stale = False
+
+        assert engine.remove_object("d")["status"] == "success"
+
+        assert engine._physics_view_stale is True
+
+
 class TestOnlyABodyMutationMarksTheScene:
     """Which mutations invalidate the view was measured, not inferred.
 
@@ -426,7 +601,10 @@ class TestOnlyABodyMutationMarksTheScene:
         clears = {method for method, values in self._assignments().items() if False in values}
         # ``_reset_impl`` is ``reset``'s nested body, marshalled onto the kit
         # thread; it is where the clear sits, and there is no other clearer.
-        assert clears == {"__init__", "create_world", "_reset_impl", "load_scene"}
+        # _rebuild_physics_view joins them: it is the in-place rebuild `step` now
+        # performs instead of refusing, so it clears the mark for the same reason
+        # the other four do - it rebuilt the view.
+        assert clears == {"__init__", "create_world", "_reset_impl", "load_scene", "_rebuild_physics_view"}
 
 
 class TestLoadSceneRebuildsTheViewItself:
@@ -469,15 +647,41 @@ class TestLoadSceneRebuildsTheViewItself:
         assert engine._physics_view_stale is False
 
         # A prior scene whose objects are removed, with nothing new to realize.
-        engine._scene_objects = {"table"}
-        engine._objects["table"] = _ObjectState(
-            name="table", prim_path="/World/Objects/table", shape="cuboid", is_static=True
+        # The removed object must be DYNAMIC for this to leave the mark: measured on
+        # an A10G, removing a static prim leaves a Franka's 9 joint keys intact,
+        # while removing a dynamic one makes PhysX log "prim ... was deleted while
+        # being used by a shape in a tensor view class. The physics.tensors
+        # simulationView was invalidated" - and the next joint read HUNG until a
+        # 2-minute timeout. This test previously used a static table and passed only
+        # because the mark was unconditional.
+        engine._scene_objects = {"crate"}
+        engine._objects["crate"] = _ObjectState(
+            name="crate", prim_path="/World/Objects/crate", shape="cuboid", is_static=False
         )
         empty = tmp_path / "empty.xml"
         empty.write_text('<mujoco model="empty"><worldbody/></mujoco>')
         assert engine.load_scene(str(empty))["status"] == "success"
         assert engine._physics_view_stale is True
         assert engine.step(2)["status"] == "error"
+
+    def test_a_load_that_removes_only_static_objects_leaves_no_mark(self, fake_isaacsim: None, tmp_path: Any) -> None:
+        """The other half of the measured asymmetry, and the case that disabled
+        examples/isaac_gs: a static prim is not held by a shape in the tensor view,
+        so releasing it invalidates nothing and ``step`` must not be affected."""
+        engine = _engine()
+        assert engine.load_scene(self._scene_file(tmp_path))["status"] == "success"
+
+        engine._scene_objects = {"table"}
+        engine._objects["table"] = _ObjectState(
+            name="table", prim_path="/World/Objects/table", shape="cuboid", is_static=True
+        )
+        empty = tmp_path / "empty.xml"
+        empty.write_text('<mujoco model="empty"><worldbody/></mujoco>')
+
+        assert engine.load_scene(str(empty))["status"] == "success"
+
+        assert engine._physics_view_stale is False
+        assert engine.step(2)["status"] == "success"
 
 
 class TestTheMarkSurvivesAnInstanceBuiltWithoutInit:
