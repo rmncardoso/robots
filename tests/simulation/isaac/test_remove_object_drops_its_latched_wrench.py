@@ -144,10 +144,45 @@ class TestTheOtherClearersStillClear:
 
         assert "_applied_wrenches" in inspect.getsource(IsaacSimulation.reset)
 
-    def test_destroy_still_clears_every_latch(self) -> None:
+    def test_the_registry_has_exactly_three_boundaries(self) -> None:
+        """``reset``, ``remove_object`` and ``destroy`` are the three places a latch
+        may be dropped, and no fourth should appear without a reason.
+
+        Derived from the source rather than asserting a fixed list per method,
+        because ``destroy``'s clear arrives on a different branch from
+        ``remove_object``'s - asserting it here made this test pass or fail on which
+        branch it ran from, which is not a property of the code under test. What IS
+        branch-independent is that only lifecycle boundaries touch the registry: a
+        clear appearing in, say, ``step`` or ``send_action`` would silently stop a
+        latched force mid-rollout.
+        """
         import inspect
 
-        assert "_applied_wrenches" in inspect.getsource(IsaacSimulation.destroy)
+        # Only REMOVAL is censused. Many methods read the registry to replay it -
+        # step, send_action, run_multi_policy, _warmup_camera, _primitive_tick - and
+        # a reader is not a boundary. What must stay rare is dropping an entry.
+        # apply_force is in the set because dropping an entry is how it honours its
+        # own documented contract - apply_force(body, force=[0, 0, 0]) stops that one
+        # body - so a pop there is the feature, not a boundary violation.
+        allowed = {"reset", "destroy", "remove_object", "apply_force"}
+        removing = set()
+        for name, fn in inspect.getmembers(IsaacSimulation, inspect.isfunction):
+            source = inspect.getsource(fn)
+            if "_applied_wrenches" not in source:
+                continue
+            for line in source.split("\n"):
+                if "_applied_wrenches" not in line and "wrenches" not in line:
+                    continue
+                if ".clear()" in line or ".pop(" in line:
+                    removing.add(name)
+
+        assert removing <= allowed, (
+            f"{sorted(removing - allowed)} removes a latched wrench. Only lifecycle "
+            f"boundaries may: a drop in a stepping path would stop a latched force "
+            f"mid-rollout, silently."
+        )
+        assert "remove_object" in removing, "the fix under test is missing"
+        assert "reset" in removing, "the documented cross-backend clear is missing"
 
     def test_remove_object_clears_only_the_named_one(self) -> None:
         """A ``.clear()`` here would stop every other body's force - the opposite
