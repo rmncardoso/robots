@@ -260,7 +260,7 @@ class TestSteppingAMarkedSceneIsRefused:
         # because only the DYNAMIC case invalidates - measured on an A10G, a
         # static add and a static remove both leave a Franka's 9 joint keys intact.
         assert "DYNAMIC" in text
-        assert "static one" in text
+        assert "a static add_object or" in text
         assert "add_camera" in text
 
     def test_the_refusal_does_not_report_a_rate(self, fake_isaacsim: None) -> None:
@@ -353,86 +353,6 @@ class TestAMarkedSceneAnswersNoObservation:
         # the ordinary path's business, not this gate's. What is pinned is that
         # the gate is no longer the reason.
         assert engine._physics_view_stale is False
-
-
-class TestAStaleSceneIsRepairedNotRefused:
-    """``step`` rebuilds the view in place; it only refuses if that fails.
-
-    The rebuild itself needs a live Kit runtime, so on this CPU skeleton
-    ``_rebuild_physics_view`` always answers False and ``step`` takes the refusal
-    branch. That makes the repair path invisible to a plain skeleton test - so these
-    drive it by controlling the rebuild's answer, and the rebuild's own behaviour is
-    verified on hardware (measured on an A10G: joint keys 0 -> 9, the new dynamic
-    body then simulates, and a posed arm moves 0.06 rad where ``reset()`` moves it
-    2.16 rad).
-    """
-
-    def test_a_successful_rebuild_lets_the_step_through(self, fake_isaacsim: None) -> None:
-        engine = _engine()
-        engine._physics_view_stale = True
-        calls: list[int] = []
-
-        def _rebuild() -> bool:
-            calls.append(1)
-            engine._physics_view_stale = False
-            return True
-
-        engine._rebuild_physics_view = _rebuild
-
-        assert engine.step(3)["status"] == "success"
-        assert calls == [1], "step must attempt the rebuild before deciding"
-
-    def test_a_failed_rebuild_still_refuses(self, fake_isaacsim: None) -> None:
-        """The one thing this must never do is advance the clock over a scene the
-        view does not cover."""
-        engine = _engine()
-        engine._physics_view_stale = True
-        engine._rebuild_physics_view = lambda: False
-
-        result = engine.step(3)
-
-        assert result["status"] == "error", result
-        assert "rebuilding it in place failed" in result["content"][0]["text"]
-
-    def test_a_failed_rebuild_does_not_advance_the_clock(self, fake_isaacsim: None) -> None:
-        engine = _engine()
-        engine._physics_view_stale = True
-        engine._rebuild_physics_view = lambda: False
-
-        engine.step(9)
-
-        assert engine._step_count == 0
-        assert engine._sim_time == 0.0
-
-    def test_the_rebuild_is_attempted_before_the_refusal(self, fake_isaacsim: None) -> None:
-        """Structural: a refusal that never tried to repair is the old behaviour."""
-        import inspect
-
-        source = inspect.getsource(IsaacSimulation.step)
-        gate = source[source.index("_physics_view_stale") :]
-
-        assert "_rebuild_physics_view" in gate.split("return {")[0], (
-            "step refuses without attempting the in-place rebuild first"
-        )
-
-    def test_the_rebuild_clears_the_mark_on_success(self, fake_isaacsim: None) -> None:
-        """Otherwise every later step would rebuild again."""
-        import inspect
-
-        assert "_physics_view_stale = False" in inspect.getsource(IsaacSimulation._rebuild_physics_view)
-
-    def test_the_rebuild_answers_false_without_a_runtime(self, fake_isaacsim: None) -> None:
-        """On a skeleton there is no view to rebuild, and it must say so rather than
-        claim success - a false True would advance the clock over a dead view."""
-        engine = _engine()
-
-        assert engine._rebuild_physics_view() is False
-
-    def test_the_rebuild_answers_false_with_no_world(self) -> None:
-        engine = IsaacSimulation.__new__(IsaacSimulation)
-        engine._world = None
-
-        assert engine._rebuild_physics_view() is False
 
 
 class TestOnlyADynamicBodyMarksTheScene:
@@ -601,10 +521,7 @@ class TestOnlyABodyMutationMarksTheScene:
         clears = {method for method, values in self._assignments().items() if False in values}
         # ``_reset_impl`` is ``reset``'s nested body, marshalled onto the kit
         # thread; it is where the clear sits, and there is no other clearer.
-        # _rebuild_physics_view joins them: it is the in-place rebuild `step` now
-        # performs instead of refusing, so it clears the mark for the same reason
-        # the other four do - it rebuilt the view.
-        assert clears == {"__init__", "create_world", "_reset_impl", "load_scene", "_rebuild_physics_view"}
+        assert clears == {"__init__", "create_world", "_reset_impl", "load_scene"}
 
 
 class TestLoadSceneRebuildsTheViewItself:
