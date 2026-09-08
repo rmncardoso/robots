@@ -108,6 +108,7 @@ sim.add_robot("so100")                          # procedural; no asset files nee
 sim.add_object(name="cube", shape="cuboid",
                position=[0.4, 0.0, 0.05], scale=[0.05, 0.05, 0.05])
 sim.add_camera(name="front", position=[1.2, 0.0, 0.6], target=[0.0, 0.0, 0.1])
+sim.reset()                                      # see "Adding a dynamic body" below
 sim.step(120)
 frame = sim.render(camera_name="front")          # RGB + depth
 sim.destroy()
@@ -181,6 +182,33 @@ open a window.
 | `STRANDS_ISAAC_NUCLEUS_URL` | Override the Omniverse Nucleus server URL when `nucleus_url` is not passed | unset (Isaac defaults) |
 | `STRANDS_ISAAC_HEADLESS` | On forces `headless`; off forces windowed | unset (uses `headless` kwarg) |
 | `STRANDS_ISAAC_RTX_PATHTRACING` | On forces `render_mode="rtx_pathtracing"`; off leaves `render_mode` alone | unset |
+
+### Adding a dynamic body needs a `reset()` before the next `step()`
+
+`add_object` with `is_static=False` (the default) adds a body PhysX's tensor
+simulation view does not cover, and that view is what every articulation read goes
+through. Measured on an A10G, adding a dynamic cuboid takes a Franka's
+`get_observation` from 9 joint keys to **0**; removing one is worse - PhysX logs
+`the physics.tensors simulationView was invalidated` and the next joint read *hangs*.
+
+So `step()` refuses until a `reset()` rebuilds the view:
+
+```python
+sim.add_object(name="cube", shape="cuboid", position=[0.4, 0.0, 0.5])
+sim.step(60)     # {"status": "error", ...} - the view does not cover the cube
+sim.reset()      # rebuilds it
+sim.step(60)     # runs
+```
+
+Note `reset()` also returns robots to their default pose, so build the scene and
+reset **before** posing anything. An in-place rebuild that avoids the teleport was
+tried and does not work reliably: `SimulationManager.initialize_physics()` +
+`world.play()` restores the view only when the timeline was stopped, and reports
+success without restoring it when the timeline is already playing.
+
+A **static** body needs none of this - `add_object(is_static=True)` and removing a
+static body both leave the view intact (measured: 9 joint keys → 9), as do
+`add_camera`, `move_object`, `add_robot` and `remove_robot`.
 
 ## Capabilities and parity
 
