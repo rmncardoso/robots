@@ -3175,6 +3175,23 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 # eager query never runs. That keeps this clause free of a
                 # bare ``except Exception`` (forbidden by the
                 # exception-hygiene pin, robots-sim#31).
+                # The scene is stale on this path too, and that is the same fact
+                # this clause's own comment above relies on: ``_construct_shape_prim``
+                # stops the timeline - clearing the physics sim view - BEFORE
+                # constructing a dynamic prim. By the time we are here it has
+                # already done so, so the view no longer covers the scene whether
+                # the construction went on to succeed or to raise.
+                #
+                # Only the success path set the flag, so a FAILED add_object left
+                # ``step()`` willing to advance: the clock and step count moved over
+                # a scene PhysX was no longer simulating, and every robot's
+                # ``get_observation`` went empty - the exact degradation the flag was
+                # added to refuse. It read as a transient add failure followed by a
+                # sim that had quietly stopped simulating.
+                #
+                # Set before the error is returned rather than after the guard that
+                # produced it, so no early return can skip it.
+                self._physics_view_stale = True
                 logger.error(
                     "Failed to add object '%s' (shape=%s, static=%s): %s",
                     name,
