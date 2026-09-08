@@ -28,8 +28,21 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: Files that name live cloud resources and must never be tracked.
-FORBIDDEN = ("examples/isaac_on_aws/.instance.json",)
+#: Paths that must never be tracked, and why.
+#:
+#: ``.instance.json`` names a live, billing AWS instance and ``teardown.sh``
+#: terminates whatever it names.
+#:
+#: ``ISAAC_FILED_FINDINGS.md`` is a working handover note, not repository content -
+#: a scratch artifact in a PR is review noise.
+#:
+#: Both reached a commit through ``git add -A`` on a branch where the per-directory
+#: ignore rule does not apply, which is precisely why this is a test and not another
+#: ignore line: it fails wherever the file is staged, on any branch.
+FORBIDDEN = (
+    "examples/isaac_on_aws/.instance.json",
+    "ISAAC_FILED_FINDINGS.md",
+)
 
 
 def _tracked_files() -> set[str]:
@@ -47,9 +60,9 @@ def test_no_live_instance_state_is_tracked() -> None:
     tracked = _tracked_files()
     committed = [p for p in FORBIDDEN if p in tracked]
     assert not committed, (
-        f"{committed} is tracked. It names a live, billing AWS instance, and "
-        f"teardown.sh terminates whatever it names - so a fresh clone's teardown "
-        f"would target an instance in another account. Run: git rm --cached <path>"
+        f"{committed} is tracked and must not be. Run: git rm --cached <path>. "
+        f".instance.json names a live billing instance teardown.sh would terminate; "
+        f"ISAAC_FILED_FINDINGS.md is a working note, not repository content."
     )
 
 
