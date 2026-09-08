@@ -257,6 +257,7 @@ def sync_dataset_to_bucket(
             [hf, "buckets", "create", bucket] + (["--private"] if private else []),
             capture_output=True,
             text=True,
+            errors="replace",
         )
         blob = (cp.stderr + cp.stdout).lower()
         # An already-created bucket is the normal case for a daily re-sync, so it
@@ -274,7 +275,7 @@ def sync_dataset_to_bucket(
     if delete:
         cmd.append("--delete")
     logger.info("Syncing %s -> %s", local_root, dest)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         return {
             "status": "error",
@@ -2107,7 +2108,7 @@ def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
     info_path = root_path / "meta" / "info.json"
     if info_path.is_file():
         try:
-            with info_path.open() as f:
+            with info_path.open(encoding="utf-8") as f:
                 raw_total = json.load(f)["total_episodes"]
         except (OSError, ValueError, KeyError, TypeError):
             # Absent key, or a file no reader can parse: the documented unknown,
