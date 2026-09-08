@@ -58,6 +58,11 @@ Passing a value an action ignores is never an error: `action="start"` without a
 
 ### A session is only forgotten once its process is gone
 
+Both verbs answer through `psutil`, which `[lerobot]` supplies alongside
+`lerobot` itself. `lerobot_train` and `lerobot_teleoperate` import it at module
+scope, so it is a requirement of importing either tool rather than of some branch
+inside it - an install that omits it ships both tools and can load neither.
+
 Because the session runs detached, the on-disk session store is the only place
 its pid is recorded - `stop` and `status` both look the session up there. Both
 stores load, modify and write back, so a record a load leaves out is erased from
@@ -72,6 +77,18 @@ offset rather than a creation date, because the record is written by one run and
 read back by a later one: `/proc/stat`'s boot time is recomputed from the wall
 clock on every read, so a date would move under an NTP correction while the
 kernel's own start ticks do not.
+
+Before either question can be asked, the number has to *be* a process id, and it
+arrives from a file rather than from a caller. So it is graded, not converted:
+`int()` of a value the store should not hold answers about a different process -
+`int(4321.5)` is `4321`, and `true` is pid 1 - or raises on a value `json.load`
+produces from a well-formed file (`1e400`, `NaN`, or the U+FFFD the store's own
+decode policy substitutes for a damaged byte). A `pid` field holding anything but
+a positive integer within the platform's `pid_t` range therefore means "this
+record names no process": `list` and `status` report it as stopped, the teleop
+store prunes it like any other record with no live process, the training store
+keeps it and `stop` refuses it naming the type it found, and nothing is
+signalled either way.
 
 `lerobot_teleoperate` prunes a finished session:
 
@@ -159,7 +176,7 @@ disagree about which address is a servo and which is the whole bus.
 | `motor_id` | integer in `[1, 254]`, or `[1, 253]` for an action that reads a reply | the frame carries the ID in one byte, of which `0xfd` is the highest a servo may hold and `0xfe` is the broadcast, while `0xff` is the header value |
 | `position` | integer in `[0, 4095]` | `Goal_Position` is 12-bit on the STS/SMS series - the same full scale the reported angle divides by |
 | `velocity` | integer in `[0, 32767]` | `Goal_Velocity` is sign-magnitude with bit 15 the direction bit, so a larger magnitude commands the opposite direction |
-| `baudrate` | positive integer | pyserial coerces rather than checks, so `2.7` opens the port at 2 baud |
+| `baudrate` | positive integer | pyserial coerces rather than checks, so `2.7` opens the port at 2 baud and `0` opens it at a speed no servo answers - the same domain every native serial driver holds its `baud_rate` to |
 | `read_bytes` | positive integer | pyserial's read loop is `while len(read) < size`, so a non-positive size returns no bytes and looks like a timeout |
 | `timeout` | finite number >= 0 | `0` is pyserial's non-blocking mode (return what is buffered); `nan` waits no time at all and `inf` overflows the deadline |
 

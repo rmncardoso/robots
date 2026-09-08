@@ -35,9 +35,12 @@ from strands_robots.tools._process_stop import (
     SIGTERM_GRACE_S,
     confirm_exit,
     process_started_since_boot,
+    recorded_pid,
     reused_pid_result,
     session_is_running,
+    session_uptime,
     unstopped_result,
+    unusable_pid_result,
 )
 from strands_robots.utils import (
     declared_count,
@@ -371,7 +374,14 @@ class SessionManager:
         return sessions
 
     def _report_uninspectable(self, sessions: dict[str, Any]) -> None:
-        """Warn for each session whose process exists but cannot be inspected.
+        """Warn for each session this store holds but cannot inspect.
+
+        Two records read that way. One names a pid that exists and may not be
+        read; the other names no pid at all - its ``pid`` field holds something
+        that is not a process id, which
+        :func:`~strands_robots.tools._process_stop.recorded_pid` answers rather
+        than converting, because ``psutil.pid_exists`` raises a ``TypeError`` on a
+        ``str`` or a ``float`` and aborts the action that asked.
 
         ``psutil.pid_exists`` answers existence with a signal; reading the process
         reads ``/proc``, which can be refused. When it raises
@@ -389,8 +399,23 @@ class SessionManager:
             sessions: The loaded records. Inspected only; never modified.
         """
         for name, info in sessions.items():
-            pid = info.get("pid")
-            if not (pid and psutil.pid_exists(pid)):
+            pid = recorded_pid(info)
+            if pid is None:
+                if info.get("pid") is not None:
+                    # A pid field that is not a process id. Nothing can inspect
+                    # it, and converting it would inspect a different process, so
+                    # it is reported for the same reason a denial is: ``list`` and
+                    # ``status`` will read this record as not running, and this is
+                    # the operator's only clue that the run may still be holding
+                    # the GPU under a pid this store no longer names.
+                    logger.warning(
+                        "Training session '%s' records a %s as its PID, which is not a process id; "
+                        "its record is kept, but the run can only be stopped by hand",
+                        name,
+                        type(info.get("pid")).__name__,
+                    )
+                continue
+            if not psutil.pid_exists(pid):
                 continue
             try:
                 # Called for what it raises, not for what it returns: the
@@ -477,20 +502,27 @@ class SessionManager:
         return self._load_sessions()
 
 
-def _read_total_tasks(dataset_root: str) -> int:
-    """Return ``total_tasks`` from a LeRobot v3 dataset's ``meta/info.json``.
+def _read_total_tasks(dataset_root: str) -> Any:
+    """Return what ``meta/info.json`` declares for ``total_tasks``, verbatim.
 
-    lerobot's own field defaults to 0, and older datasets may omit it entirely;
-    both mean "no task count recorded" and are returned as 0, which callers
-    treat as single-task.
+    ``None`` when there is no header to read - no ``info.json``, or no such key -
+    which :func:`~strands_robots.utils.validation_split_error` treats as
+    single-task, as lerobot's own field defaults to 0.
+
+    The declaration is handed over unconverted because that guard is where this
+    header's domain lives, and it is the only surface that can tell a usable
+    count from a declaration that is not one. Coercing an unusable declaration
+    to 0 here reported it as the absent case, which the guard honors as
+    single-task: a three-task dataset whose header spelled the count ``3.0`` (or
+    ``"3"``) passed the guard written to refuse exactly that dataset, and lerobot
+    then held out ``ceil(episodes_in_task * eval_split)`` from each of the three.
     """
     info_path = Path(dataset_root) / "meta" / "info.json"
     if not info_path.exists():
-        return 0
-    with open(info_path) as f:
+        return None
+    with open(info_path, encoding="utf-8") as f:
         info = json.load(f)
-    total = info.get("total_tasks")
-    return total if isinstance(total, int) and not isinstance(total, bool) else 0
+    return info.get("total_tasks")
 
 
 def _read_total_episodes(dataset_root: str) -> int:
@@ -503,7 +535,7 @@ def _read_total_episodes(dataset_root: str) -> int:
     info_path = Path(dataset_root) / "meta" / "info.json"
     if not info_path.exists():
         raise FileNotFoundError(f"Dataset metadata not found: {info_path}")
-    with open(info_path) as f:
+    with open(info_path, encoding="utf-8") as f:
         info = json.load(f)
     total = info.get("total_episodes")
     declared = declared_count(total)
@@ -956,7 +988,10 @@ def lerobot_train(
         Dict with ``status`` ("success" or "error") and a ``content`` list of
         ``{"text": ...}`` items, plus action-specific keys (``session_name``,
         ``pid``, ``command``, ``log_file``, ``output_dir``, ``sessions``,
-        ``is_running``, ``uptime``).
+        ``is_running``, ``uptime``). ``uptime`` is seconds, and is ``None`` when
+        the session record states no usable start time - see
+        :func:`~strands_robots.tools._process_stop.session_uptime`, which is what
+        the reported ``Uptime`` field says instead.
     """
     session_manager = SessionManager()
 
@@ -1048,7 +1083,7 @@ def lerobot_train(
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
             log_file = SESSION_DIR / f"{session_name}.log"
-            with open(log_file, "w") as f:
+            with open(log_file, "w", encoding="utf-8") as f:
                 proc = subprocess.Popen(
                     cmd,
                     stdout=f,
@@ -1106,10 +1141,12 @@ def lerobot_train(
             if not session_info:
                 return {"status": "error", "content": [{"text": f"Session '{session_name}' not found"}]}
             pid = session_info.get("pid")
-            if not pid:
-                return {"status": "error", "content": [{"text": f"No PID found for session '{session_name}'"}]}
-
-            pid_int = int(pid)
+            pid_int = recorded_pid(session_info)
+            if pid_int is None:
+                # Not a pid, so there is no process this verb could be about. The
+                # signals below would go to whatever ``int()`` of it happened to
+                # name - pid 1 for ``true``, and a live stranger for ``4321.5``.
+                return unusable_pid_result(session_name, pid)
             if psutil.pid_exists(pid_int) and not session_is_running(session_info):
                 # The pid exists but no longer holds the process this record was
                 # written for, so the run is over and the signals below would go
@@ -1166,7 +1203,7 @@ def lerobot_train(
             lines = [f"**Active Training Sessions** ({len(sessions)})", ""]
             if sessions:
                 for name, info in sessions.items():
-                    uptime_min = (time.time() - info.get("start_time", 0)) / 60
+                    _, uptime_text = session_uptime(info)
                     pid = info.get("pid")
                     is_running = session_is_running(info)
                     lines.extend(
@@ -1174,7 +1211,7 @@ def lerobot_train(
                             f"**{name}**",
                             f"   - Action: {info.get('action', 'Unknown')}",
                             f"   - PID: {pid}",
-                            f"   - Uptime: {uptime_min:.1f} min",
+                            f"   - Uptime: {uptime_text}",
                             f"   - Status: {'Running' if is_running else 'Stopped'}",
                             f"   - Policy: {info.get('policy_type', 'Unknown')}",
                             f"   - Output: {info.get('output_dir', 'Unknown')}",
@@ -1199,13 +1236,13 @@ def lerobot_train(
                 return {"status": "error", "content": [{"text": f"Session '{session_name}' not found"}]}
 
             pid = session_info.get("pid")
-            uptime = time.time() - float(session_info.get("start_time") or 0)
+            uptime, uptime_text = session_uptime(session_info)
             is_running = session_is_running(session_info)
             lines = [
                 f"**Session Status: `{session_name}`**",
                 f"PID: {pid}",
                 f"Action: {session_info.get('action', 'Unknown')}",
-                f"Uptime: {uptime / 60:.1f} min",
+                f"Uptime: {uptime_text}",
                 f"Status: {'Running' if is_running else 'Stopped'}",
                 f"Policy: {session_info.get('policy_type', 'Unknown')}",
                 f"Output dir: {session_info.get('output_dir', 'Unknown')}",
