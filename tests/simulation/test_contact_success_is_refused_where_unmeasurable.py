@@ -120,7 +120,12 @@ class TestTheResolverRefusesUpFront:
         class _Policy:
             requires_images = False
 
-        result = _runner(_StubEngine()).evaluate("bot", _Policy(), n_episodes=1, success_fn="contact")
+        result = _runner(_StubEngine()).evaluate(
+            "bot",
+            _Policy(),  # type: ignore[arg-type]
+            n_episodes=1,
+            success_fn="contact",
+        )
         assert result["status"] == "error", result
         assert "get_contacts" in result["content"][0]["text"]
 

@@ -129,9 +129,15 @@ class TestTheTranslation:
         sim = types.SimpleNamespace(
             get_contacts=lambda: {"status": "success", "content": [{"json": {"contacts": records}}]}
         )
-        assert predicates.make_predicate("contact_any")(sim) is True
-        assert predicates.make_predicate("contact_between", geom_a="cube", geom_b="gripper_link")(sim) is True
-        assert predicates.make_predicate("contact_between", geom_a="cube", geom_b="nothing")(sim) is False
+        assert predicates.make_predicate("contact_any")(sim) is True  # type: ignore[arg-type]
+        assert (
+            predicates.make_predicate("contact_between", geom_a="cube", geom_b="gripper_link")(sim)  # type: ignore[arg-type]
+            is True
+        )
+        assert (
+            predicates.make_predicate("contact_between", geom_a="cube", geom_b="nothing")(sim)  # type: ignore[arg-type]
+            is False
+        )
 
 
 def _engine() -> Any:

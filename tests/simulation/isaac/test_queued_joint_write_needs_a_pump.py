@@ -75,7 +75,11 @@ def _engine(*, pump_running: bool) -> tuple[Any, _Articulation]:
     # Recorded on THIS thread, so a call from a spawned thread is off-main.
     engine._main_tid = threading.get_ident()
     articulation = _Articulation()
-    engine._robots = {"arm": types.SimpleNamespace(articulation=articulation, joint_names=["j0", "j1"])}
+    engine._robots = {
+        "arm": types.SimpleNamespace(  # type: ignore[dict-item]
+            articulation=articulation, joint_names=["j0", "j1"]
+        )
+    }
     return engine, articulation
 
 

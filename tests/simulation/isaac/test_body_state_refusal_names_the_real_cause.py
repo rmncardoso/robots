@@ -72,7 +72,7 @@ def _engine(objects: dict[str, Any]) -> Any:
     engine._robots = {}
     engine._pump_running = False
     engine._main_tid = threading.get_ident()
-    engine._prim_body_state = lambda name: None
+    engine._prim_body_state = lambda body_name: None  # type: ignore[method-assign]
     engine._objects = objects
     return engine
 

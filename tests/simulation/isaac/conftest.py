@@ -78,8 +78,12 @@ class _FakeCloner:
 
     def clone(self, **kwargs: Any) -> None:
         self.clones.append(kwargs)
-        if type(self).fail_clone is not None:
-            raise type(self).fail_clone
+        # Bound to a local before the check: ``type(self).X is not None`` does not
+        # narrow the following ``raise type(self).X``, so the raise reads as
+        # possibly-None.
+        failure = type(self).fail_clone
+        if failure is not None:
+            raise failure
         stage = type(self).stage
         if stage is None or type(self).per_clone <= 0:
             return
@@ -92,8 +96,9 @@ class _FakeCloner:
 
     def filter_collisions(self, **kwargs: Any) -> None:
         self.filters.append(kwargs)
-        if type(self).fail_filter is not None:
-            raise type(self).fail_filter
+        failure = type(self).fail_filter
+        if failure is not None:
+            raise failure
 
 
 @pytest.fixture

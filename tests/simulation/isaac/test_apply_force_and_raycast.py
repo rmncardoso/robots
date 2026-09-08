@@ -382,7 +382,9 @@ class TestTheReplayRuleIsDerivedFromTheSource:
 
         out: list[tuple[str, str, bool, bool]] = []
         for module in (sim_mod, mp_mod):
-            src = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+            path = module.__file__
+            assert path is not None, f"{module.__name__} has no source file to read"
+            src = pathlib.Path(path).read_text(encoding="utf-8")
             tree = ast.parse(src)
             for node in ast.walk(tree):
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -400,7 +402,7 @@ class TestTheReplayRuleIsDerivedFromTheSource:
                 if steps:
                     out.append(
                         (
-                            pathlib.Path(module.__file__).name,
+                            pathlib.Path(path).name,
                             node.name,
                             "_sim_time" in seg,
                             "_reapply_wrenches" in seg,

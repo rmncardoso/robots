@@ -55,7 +55,7 @@ def _engine(*, construct: Any) -> Any:
     engine._step_count = 0
     engine._main_tid = threading.get_ident()
     engine._pump_running = False
-    engine._construct_shape_prim = construct
+    engine._construct_shape_prim = construct  # type: ignore[method-assign]
     return engine
 
 

@@ -77,8 +77,8 @@ def _engine() -> Any:
     engine._joint_cache = {}
     engine._sim_time = 0.0
     engine._step_count = 0
-    engine._revive_articulations_after_reset = lambda: None
-    engine._flush_open_episode_before_reset = lambda: None
+    engine._revive_articulations_after_reset = lambda: None  # type: ignore[method-assign]
+    engine._flush_open_episode_before_reset = lambda: None  # type: ignore[method-assign]
     engine._main_tid = threading.get_ident()
     engine._pump_running = False
     return engine

@@ -87,6 +87,19 @@ class _Camera:
         self.handle = object()
 
 
+def _no_converge(n: int = 1) -> None:
+    """``_converge_render`` with the render loop taken out. The default matches the
+    method's, so the substitution is signature-compatible."""
+    return None
+
+
+def _slow_grab(cname: str, cam: Any) -> Any:
+    """A frame grab that costs real time. Parameter names match the method it
+    replaces, so the substitution is signature-compatible."""
+    time.sleep(0.002)
+    return None
+
+
 def _engine(*, cameras: bool = False) -> Any:
     """A skeleton engine holding exactly what ``pump`` touches."""
     engine = IsaacSimulation.__new__(IsaacSimulation)
@@ -100,16 +113,18 @@ def _engine(*, cameras: bool = False) -> Any:
     engine._frame_cache = {}
     engine._pump_cameras = cameras
     engine._idle_converge = 1
-    engine._converge_render = lambda n: None
+    engine._converge_render = _no_converge  # type: ignore[method-assign]
     # The frame grab must take real time, or the camera walk finishes before any
     # mutation can land and the camera tests pass with the snapshot REMOVED -
     # measured: 15/15 either way with an instant stub. The robot walk races only
     # because _SlowArticulation sleeps; the camera walk needs the same.
-    engine._grab_frame = lambda name, handle: (time.sleep(0.002), None)[1]
+    engine._grab_frame = _slow_grab  # type: ignore[method-assign]
     for i in range(_ROBOT_COUNT):
-        engine._robots[f"r{i}"] = types.SimpleNamespace(articulation=_SlowArticulation(), joint_names=["j"])
+        engine._robots[f"r{i}"] = types.SimpleNamespace(  # type: ignore[assignment]
+            articulation=_SlowArticulation(), joint_names=["j"]
+        )
         if cameras:
-            engine._cameras[f"c{i}"] = _Camera()
+            engine._cameras[f"c{i}"] = _Camera()  # type: ignore[assignment]
     return engine
 
 
@@ -306,7 +321,12 @@ class TestThePumpStillDoesItsWork:
 
     def test_the_frame_cache_is_populated_on_the_idle_path(self) -> None:
         engine = _engine(cameras=True)
-        engine._grab_frame = lambda name, handle: (time.sleep(0.001), f"frame-{name}")[1]
+
+        def _named_grab(cname: str, cam: Any) -> Any:
+            time.sleep(0.001)
+            return f"frame-{cname}"
+
+        engine._grab_frame = _named_grab
 
         engine.pump(render=True)
 

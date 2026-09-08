@@ -64,8 +64,11 @@ class _FakeImporter:
                 "import_scene": self._config.import_scene,
             }
         )
-        if type(self).fail_with is not None:
-            raise type(self).fail_with
+        # Bound to a local before the check: ``type(self).X is not None`` does not
+        # narrow the following ``raise type(self).X``.
+        failure = type(self).fail_with
+        if failure is not None:
+            raise failure
         if type(self).write_nothing:
             return None
         stem = os.path.splitext(os.path.basename(self._config.mjcf_path))[0]

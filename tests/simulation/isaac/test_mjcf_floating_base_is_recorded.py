@@ -124,7 +124,10 @@ def _engine() -> Any:
     engine._pump_running = False
     # The USD leaf is stood in: what these grade is what ``fixed_base`` RECORDS,
     # not the stage authoring, which needs Kit.
-    engine._load_usd_robot = lambda prim_path, usd_path, position: (["hip"], _Articulation())
+    engine._load_usd_robot = lambda prim_path, usd_path, position: (  # type: ignore[method-assign]
+        ["hip"],
+        _Articulation(),
+    )
     return engine
 
 

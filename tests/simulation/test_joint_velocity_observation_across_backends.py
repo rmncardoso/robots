@@ -174,7 +174,7 @@ def _newton_engine(
     joints = list(coord_index)
     if free_base_joint is not None:
         joints = [free_base_joint, *joints]
-    engine._world = types.SimpleNamespace(
+    engine._world = types.SimpleNamespace(  # type: ignore[assignment]
         robots={"bot": types.SimpleNamespace(joint_names=joints)},
         cameras={},
         _backend_state={},

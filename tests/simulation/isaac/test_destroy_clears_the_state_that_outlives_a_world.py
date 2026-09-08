@@ -47,7 +47,7 @@ from strands_robots.simulation.isaac.config import IsaacConfig  # noqa: E402
 from strands_robots.simulation.isaac.simulation import IsaacSimulation  # noqa: E402
 
 #: The state that must not outlive a world, and a non-empty value for each.
-PER_WORLD_STATE = {
+PER_WORLD_STATE: dict[str, dict[str, Any]] = {
     "_applied_wrenches": {"cube": {"force": [0.0, 0.0, 40.0], "torque": [0.0, 0.0, 0.0]}},
     "_obs_noise": {"arm": 0.05},
     "_dr_base": {"cube": [0.1, 0.2, 0.3]},

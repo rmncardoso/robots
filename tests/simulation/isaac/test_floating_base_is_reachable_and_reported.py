@@ -260,7 +260,9 @@ class TestParityWithTheBackendsThatAlreadyDidThis:
         import strands_robots.simulation.newton.simulation as newton_sim
 
         for module in (mj_rendering, newton_sim):
-            source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+            path = module.__file__
+            assert path is not None, f"{module.__name__} has no source file to read"
+            source = pathlib.Path(path).read_text(encoding="utf-8")
             for key in _BASE_KEYS:
                 assert f'"{key}"' in source, f"{key} is not the spelling {module.__name__} uses"
 

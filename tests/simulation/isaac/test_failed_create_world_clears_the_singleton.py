@@ -81,6 +81,12 @@ class _FakeWorld:
     #: Set by a test to make the CONSTRUCTOR itself raise, after registration.
     fail_in_init: bool = False
 
+    # Annotation-only, so no class attribute is created and the runtime shape is
+    # unchanged: both are bound per instance, and both are bound in a method that
+    # runs before - or is defined above - the one that reads them.
+    _initialized: bool
+    instance_cleared: bool
+
     def __new__(cls, **kwargs: Any) -> _FakeWorld:
         if cls.instance is not None:
             return cls.instance

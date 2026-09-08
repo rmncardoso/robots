@@ -77,7 +77,7 @@ def _engine(robots: dict[str, Any]) -> Any:
     engine._objects = {}
     engine._pump_running = False
     engine._main_tid = threading.get_ident()
-    engine.robot_action_keys = lambda name: ["j0", "j1"]
+    engine.robot_action_keys = lambda robot_name: ["j0", "j1"]  # type: ignore[method-assign]
     return engine
 
 

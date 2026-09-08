@@ -106,7 +106,7 @@ def _observe(quat: list[float], ang_world: list[float]) -> dict[str, Any]:
     engine._pump_running = False
     engine._main_tid = threading.get_ident()
     engine._robots = {
-        "bot": types.SimpleNamespace(
+        "bot": types.SimpleNamespace(  # type: ignore[dict-item]
             name="bot",
             joint_names=["j0"],
             articulation=_Articulation(quat, ang_world),
@@ -264,7 +264,7 @@ class TestAFixedBaseStillReportsNothing:
         engine._pump_running = False
         engine._main_tid = threading.get_ident()
         engine._robots = {
-            "arm": types.SimpleNamespace(
+            "arm": types.SimpleNamespace(  # type: ignore[dict-item]
                 name="arm",
                 joint_names=["j0"],
                 articulation=_Articulation([1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
