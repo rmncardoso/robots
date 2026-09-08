@@ -2136,45 +2136,22 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             # correct, and MuJoCo needs no equivalent because its step reads the
             # compiled model directly.
             if self._physics_view_stale:
-                # REPAIRED, not refused. An earlier version returned an error here
-                # and told the caller to reset(), which was wrong twice over.
-                #
-                # It disabled shipped examples silently. Every step site in
-                # examples/isaac_gs and examples/so101_curobo discards the returned
-                # envelope, and neither calls reset() anywhere - isaac_gs's own agent
-                # prompt instructs the model "never rebuild, reset, or destroy it".
-                # So the refusal reached no one: the settle steps, the camera warmup
-                # and the wave demo simply stopped happening, with no diagnostic.
-                # docs/simulation/isaac.md's own usage example has the same shape.
-                #
-                # And reset() is the wrong remedy to name. Measured on an A10G, on a
-                # Franka posed away from its default, reset() moved panda_joint4 by
-                # 2.16 rad - it discards the pose - where this rebuild moves it 0.06.
-                #
-                # A failed rebuild still refuses, below: the one thing this must not
-                # do is advance the clock over a scene the view does not cover.
-                if not self._rebuild_physics_view():
-                    return {
-                        "status": "error",
-                        "content": [
-                            {
-                                "text": (
-                                    "step: the scene changed since the last reset(), so PhysX's "
-                                    "tensor view no longer covers it, and rebuilding it in place "
-                                    "failed. Stepping now would leave every robot's "
-                                    "get_observation() empty. Call reset() to rebuild the view - "
-                                    "note it returns robots to their default pose. Only adding or "
-                                    "removing a DYNAMIC body invalidates the view; a static one, "
-                                    "add_camera, move_object, add_robot and remove_robot do not."
-                                )
-                            }
-                        ],
-                    }
-                logger.info(
-                    "step: the physics tensor view was stale (a dynamic body was added or removed "
-                    "since the last reset); rebuilt it in place. Robots keep their pose; joints "
-                    "settle by up to ~0.09 rad as the timeline restarts."
-                )
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": (
+                                "step: a DYNAMIC body was added or removed since the last reset(), "
+                                "so PhysX's tensor view no longer covers the scene and every "
+                                "robot's get_observation() comes back empty. Call reset() first, "
+                                "then step(). Note reset() returns robots to their default pose. "
+                                "Only a dynamic body does this: a static add_object or "
+                                "remove_object, add_camera, move_object, add_robot and "
+                                "remove_robot all leave the view intact."
+                            )
+                        }
+                    ],
+                }
 
         # Nested (not a separate method) so the batching loop remains part of
         # ``step``'s own body: the cross-backend batch-and-recheck contract is

@@ -107,24 +107,23 @@ diagnostic, in an example whose entire output is images. The same shape hit
 `tests_integ/simulation/test_isaac_body_state_gpu` and `docs/simulation/isaac.md`'s own
 usage example.
 
-**And refusing was the wrong remedy even where the view genuinely is stale.** `step` now
-rebuilds it in place - `SimulationManager.initialize_physics()` + `world.play()` + the
-articulation revive - and refuses only if that fails. Measured on a Franka posed away
-from its default and then made stale:
+**Refusing is kept for the case that genuinely is stale**, and an in-place repair was
+attempted and abandoned. `SimulationManager.initialize_physics()` + `world.play()`
+restored the view in one state (0 -> 9 joint keys on a post-reset engine whose timeline
+the dynamic add had stopped) but **not** in the state a real caller is in: after
+`examples/isaac_gs`'s `build_default_scene` the timeline is already playing, so `play()`
+is a no-op and the rebuild left joint keys at 0 while reporting success. Stopping the
+timeline first and then rebuilding also left them at 0. Only `reset()` restored (0 -> 18).
 
-| joint | in-place rebuild | `reset()` |
-|---|---|---|
-| `panda_joint2` (posed to -0.90) | 0.010 rad | **0.877 rad** |
-| `panda_joint4` (posed to -2.20) | 0.064 rad | **2.163 rad** |
+A repair that silently claims success is worse than a refusal, so there is none: `step`
+refuses, and the message now names `reset()` while stating that it returns robots to
+their default pose, so the cost is visible rather than discovered.
 
-`reset()` - what the old refusal told callers to do - discards the pose. The rebuild
-costs up to ~0.09 rad of settling as the timeline restarts, which is physics running.
-Also measured: the newly added body simulates afterwards, joint reads return (0 -> 9
-keys), and the rebuild is idempotent - three in a row leave the view valid.
+That leaves two consumers still refused on their dynamic adds -
+`examples/so101_curobo` and `docs/simulation/isaac.md`'s usage example - and both
+discard the step envelope, so the refusal is silent there. Recorded as a known
+limitation rather than claimed fixed.
 
-The gate now also **logs** when it acts. It logged nothing before, which is why a
-discarded envelope was silent; `get_observation`'s twin gate already warned.
-
-Each half is pinned by a test that fails when that half alone is reverted - verified as a
-four-way mutation matrix (unconditional add mark, unconditional remove mark, no rebuild,
-and a rebuild that falsely claims success).
+Each half of the mark is pinned by a test that fails when that half alone is reverted -
+verified as a mutation matrix (3 failures for an unconditional add mark, 2 for an
+unconditional remove mark).
