@@ -84,3 +84,27 @@ implementations can drift, so the drift is measured: they are compared over 200
 random (quaternion, vector) pairs and agree to 1.3e-15. The expected values were
 cross-checked against `scipy.spatial.transform.Rotation` - one of them was written
 with the wrong sign first, and the implementation was right.
+
+**The dataset carries the base columns too.** `observation.state`'s schema is derived
+from scalar *joint* names, so the four base vectors would be dropped from a recording
+even though `get_observation` reports them. `DatasetRecorder.create` takes
+`extra_state_specs` for exactly this, and **both** sibling backends pass it - MuJoCo
+and Newton, each with the same reasoning already written down:
+
+> those base signals would be dropped and a locomotion / velocity-tracking /
+> whole-body-control policy trained on the dataset would be base-blind.
+
+Isaac was the only backend that did not. Adding `base_*` to `get_observation` without
+this left an Isaac humanoid dataset **13 columns short** of the MuJoCo one for the same
+robot, silently - a missing column is not an error. The gap only became reachable with
+this series, since before it `add_robot` created no articulation for a humanoid to have.
+
+The base is detected from `fixed_base` - the field the MJCF free-joint read records -
+rather than from a joint id, because this backend has no compiled model to interrogate.
+A fixed-base arm declares nothing, so its schema is unchanged, and that is pinned.
+
+Resume validation uses the **expanded** names. A resumed dataset's on-disk
+`observation.state` includes the base columns, so checking against the bare joint list
+would report a mismatch on every floating-base append. Pinned by reading the
+verification call's own argument, because a version that computed the expanded names and
+then verified against the joint list anyway passed a weaker check.
