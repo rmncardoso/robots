@@ -1039,6 +1039,13 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
     #: above - skeleton engines built with ``__new__`` never run ``__init__``.
     _contact_epoch: int = 0
 
+    #: Environments actually built by ``replicate()``; 1 until it runs. Declared on
+    #: the CLASS for the same reason as the flags above, and specifically because
+    #: ``__repr__`` reads it: an instance-only attribute made a skeleton engine that
+    #: HAS its config render as "partially constructed", so the repr got less
+    #: informative exactly where a traceback needs it most. 1 matches ``__init__``.
+    _num_envs_active: int = 1
+
     def __init__(self, config: IsaacConfig | None = None, **kwargs: Any) -> None:
         # Merge shortcut kwargs into config. Unknown kwargs are rejected
         # eagerly (rather than silently dropped) so a typo like
