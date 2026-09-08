@@ -79,3 +79,23 @@ would act on ticks the clock never saw. A grader derives both halves from the
 module AST, so an eighth call site is graded the hour it lands. The shipped test
 had exercised only `engine.step(...)`, which is why every latch case passed.
 
+
+**`remove_object` drops the removed body's latch.** The wrench is keyed by object
+name and stores the PhysX body handle beside it, and that handle is
+`sdfPathToInt` of a prim path this backend derives deterministically from the same
+name - so a later `add_object` under a removed name rebuilds the identical path and
+therefore **the identical body int**. Left in place, `_reapply_wrenches` pushed the
+deleted object's force onto a body nobody had called `apply_force` on. Measured on a
+stand-in: `apply_force('cube', 40 N up)` → `remove_object('cube')` → register a
+different body under `'cube'` → the replay fired on it, unrequested. With nothing
+registered under the name the replay instead fires the dangling body int with the
+position falling back to the world origin.
+
+`reset()` clears every latch, so `remove → reset → step` was already safe. The
+exposed paths are the ones that replay without a reset between: `send_action`,
+`run_multi_policy`, `_warmup_camera`, the motion primitives - and `load_scene`'s
+per-episode reload, which removes the previous objects and re-adds **the same MJCF
+names**, which is exactly the same-name collision.
+
+It drops only the named entry, never `.clear()` - the contract is per-body, and
+clearing here would stop every other body's force, the opposite bug.
