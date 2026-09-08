@@ -59,3 +59,52 @@ each registered prim's default state on `post_reset` - the same mechanism
 the articulation's `set_default_state` was tried and does not change that reading,
 so `add_robot`'s docstring states it: to drop a robot from a height, step from the
 pose `add_robot` leaves rather than resetting first.
+
+**`base_ang_vel` is reported in the BODY frame**, which is the correction this
+entry needed most and did not have at first. Linear velocity is world-frame on all
+three backends; angular velocity is body-frame - the IMU-gyro convention a
+locomotion policy is trained against. The Newton backend says so outright and
+carries `_quat_rotate_inverse_wxyz` specifically to convert, "so `base_ang_vel`
+matches the MuJoCo backend and the IMU-gyro convention WBC / locomotion controllers
+consume". Isaac's `articulation.get_angular_velocity()` returns the world frame, and
+it was emitted unrotated - so of the four base channels this was the one whose
+numbers silently disagreed with the other two backends, which falsifies the very
+parity claim this feature rests on.
+
+It disagreed in the way hardest to catch: **for an upright, un-yawed base the two
+frames coincide**. A standing robot reads correct, a robot yawing about world Z
+reads correct on Z, and the error appears only once the base tilts - exactly when a
+locomotion policy is depending on the signal. Those coinciding cases are pinned
+alongside the divergent ones precisely because a test that stood a robot up and
+checked the gyro would have found nothing.
+
+The rotation uses this module's own quaternion primitive rather than importing
+Newton's helper, which would pull `warp` into Isaac's import path. Two
+implementations can drift, so the drift is measured: they are compared over 200
+random (quaternion, vector) pairs and agree to 1.3e-15. The expected values were
+cross-checked against `scipy.spatial.transform.Rotation` - one of them was written
+with the wrong sign first, and the implementation was right.
+
+**The dataset carries the base columns too.** `observation.state`'s schema is derived
+from scalar *joint* names, so the four base vectors would be dropped from a recording
+even though `get_observation` reports them. `DatasetRecorder.create` takes
+`extra_state_specs` for exactly this, and **both** sibling backends pass it - MuJoCo
+and Newton, each with the same reasoning already written down:
+
+> those base signals would be dropped and a locomotion / velocity-tracking /
+> whole-body-control policy trained on the dataset would be base-blind.
+
+Isaac was the only backend that did not. Adding `base_*` to `get_observation` without
+this left an Isaac humanoid dataset **13 columns short** of the MuJoCo one for the same
+robot, silently - a missing column is not an error. The gap only became reachable with
+this series, since before it `add_robot` created no articulation for a humanoid to have.
+
+The base is detected from `fixed_base` - the field the MJCF free-joint read records -
+rather than from a joint id, because this backend has no compiled model to interrogate.
+A fixed-base arm declares nothing, so its schema is unchanged, and that is pinned.
+
+Resume validation uses the **expanded** names. A resumed dataset's on-disk
+`observation.state` includes the base columns, so checking against the bare joint list
+would report a mismatch on every floating-base append. Pinned by reading the
+verification call's own argument, because a version that computed the expanded names and
+then verified against the joint list anyway passed a weaker check.

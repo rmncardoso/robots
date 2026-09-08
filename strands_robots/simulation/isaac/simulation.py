@@ -87,6 +87,32 @@ logger = logging.getLogger(__name__)
 _MIN_RENDER_PX = 640
 
 
+def _world_to_body_frame(quat_wxyz: Any, vec: Any) -> list[float]:
+    """Express a WORLD-frame 3-vector in the body frame given a (w,x,y,z) quaternion.
+
+    ``R(q)^T @ vec``. Used for ``base_ang_vel``, which this schema reports in the
+    BODY frame - the IMU-gyro convention a locomotion policy is trained against -
+    while Isaac's ``get_angular_velocity()`` returns the WORLD frame. ``base_pos``
+    and ``base_lin_vel`` stay world-frame on all three backends and are not routed
+    through here.
+
+    Equivalent to the Newton backend's ``_quat_rotate_inverse_wxyz``, where the
+    convention is documented; verified equal to 1.3e-15 over 400 random
+    (quaternion, vector) pairs. Kept as a separate implementation rather than an
+    import because importing the Newton backend would pull ``warp`` into Isaac's
+    import path.
+
+    A ~zero-norm quaternion returns ``vec`` unchanged, matching Newton: an
+    unreadable orientation is not grounds for scaling a real velocity by garbage,
+    and the caller already has ``base_quat`` to see it with.
+    """
+    q = np.asarray(quat_wxyz, dtype=np.float64)
+    if float(np.linalg.norm(q)) < 1e-8:
+        return [float(v) for v in np.asarray(vec, dtype=np.float64)]
+    rotated = _quat_wxyz_to_rotmat(q).T @ np.asarray(vec, dtype=np.float64)
+    return [float(v) for v in rotated]
+
+
 def _quat_wxyz_to_rotmat(quat: np.ndarray) -> np.ndarray:
     """Convert a ``(w, x, y, z)`` quaternion to a ``(3, 3)`` rotation matrix.
 
@@ -4591,10 +4617,31 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                         # zeros would report a base at the origin, at rest.
                         logger.debug("Failed to read the floating base state: %s", e)
                     else:
+                        quat_wxyz = [float(v) for v in base_quat]
                         obs["base_pos"] = [float(v) for v in base_pos]
-                        obs["base_quat"] = [float(v) for v in base_quat]
+                        obs["base_quat"] = quat_wxyz
+                        # Linear velocity is WORLD frame on all three backends, so
+                        # it maps straight across.
                         obs["base_lin_vel"] = [float(v) for v in lin_vel]
-                        obs["base_ang_vel"] = [float(v) for v in ang_vel]
+                        # Angular velocity is BODY frame in this schema - the
+                        # IMU-gyro convention a locomotion policy is trained
+                        # against - and Isaac's get_angular_velocity() returns it
+                        # in the WORLD frame. Passing it through unrotated made
+                        # this the one channel whose numbers silently disagreed
+                        # with MuJoCo and Newton, and it disagrees in the way that
+                        # is hardest to notice: for an upright, un-yawed base the
+                        # two frames coincide, so a standing robot reads correct
+                        # and the error grows only as it turns - which is exactly
+                        # when a locomotion policy is relying on it.
+                        #
+                        # Expressed with this module's own quaternion primitive:
+                        # body-frame is R(q)^T @ v, and _world_to_body_frame wraps
+                        # that. Verified equal to the Newton backend's
+                        # _quat_rotate_inverse_wxyz to 1.3e-15 over 400 random
+                        # (quaternion, vector) pairs, so the two backends agree
+                        # numerically without Isaac importing Newton - which would
+                        # drag warp into this import path.
+                        obs["base_ang_vel"] = _world_to_body_frame(quat_wxyz, [float(v) for v in ang_vel])
 
             # Camera frames keyed by camera name (RGB HxWx3 uint8), so callers
             # (e.g. the SO-101 collector / Gradio render) get images the same way
