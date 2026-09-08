@@ -4293,6 +4293,29 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             if prim_path in self._prim_registry:
                 self._prim_registry.remove(prim_path)
 
+            # Drop the latched wrench too. It is keyed by object NAME, and the PhysX
+            # body handle it stores is ``sdfPathToInt`` of a prim path this backend
+            # derives deterministically from that same name - so a later
+            # ``add_object`` under the removed name rebuilds the identical path and
+            # therefore the identical body int. Left in place, ``_reapply_wrenches``
+            # then pushed the deleted object's force onto a body nobody ever called
+            # ``apply_force`` on. Measured on a stand-in: apply_force('cube', 40 N
+            # up) -> remove_object('cube') -> register a different body under 'cube'
+            # -> the replay fired ``apply_force_at_pos`` on it, unrequested.
+            #
+            # With nothing registered under the name the replay instead fires the
+            # dangling body int with the position falling back to the world origin,
+            # which is the other half of the same leak.
+            #
+            # ``reset()`` clears every latch, so remove -> reset -> step was already
+            # safe; the exposed paths are the four stepping loops that replay without
+            # a reset in between (send_action, run_multi_policy, _warmup_camera, the
+            # motion primitives) and load_scene's per-episode reload, which removes
+            # the previous objects and re-adds the SAME MJCF names.
+            wrenches = getattr(self, "_applied_wrenches", None)
+            if wrenches is not None:
+                wrenches.pop(name, None)
+
             logger.info("Removed object '%s' (prim=%s)", name, prim_path)
             # Deleting a prim PhysX holds a shape for invalidates the tensor
             # view outright - Isaac logs "the physics.tensors simulationView was
