@@ -914,13 +914,15 @@ def non_negative_whole_number_error(value: Any, param: str, context: str) -> str
     """Error text when ``value`` is not a usable non-negative whole number.
 
     Shared domain for two families of discrete quantity whose ``0`` is a real
-    setting rather than a degenerate one: the number of physics steps a caller
-    asks a simulation to advance - the ``n_steps`` of every backend's
-    :meth:`~strands_robots.simulation.base.SimEngine.step` - and the two
-    whole-number teleop knobs :mod:`~strands_robots.tools.lerobot_teleoperate`
-    puts on the lerobot CLI, where ``dataset_reset_time_s=0`` is "no operator
-    pause between recorded episodes" and ``replay_episode=0`` is the first
-    episode.
+    setting rather than a degenerate one:
+
+    * The number of physics steps a caller asks a simulation to advance - the
+      ``n_steps`` of every backend's
+      :meth:`~strands_robots.simulation.base.SimEngine.step`.
+    * The two whole-number teleop knobs
+      :mod:`~strands_robots.tools.lerobot_teleoperate` puts on the lerobot CLI,
+      where ``dataset_reset_time_s=0`` is "no operator pause between recorded
+      episodes" and ``replay_episode=0`` is the first episode.
 
     Not the only physics-step count in the tree, and the difference is the
     floor rather than the scalar policy: the ``n_substeps`` of
@@ -1058,7 +1060,7 @@ def step_aborted_msg(completed: int, requested: int, *, context: str = "step") -
 def positive_count_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable positive integer count.
 
-    Shared domain for four families of discrete quantity:
+    Shared domain for five families of discrete quantity:
 
     * The knobs that count iterations of a control or rollout loop - the
       simulation's ``n_episodes`` / ``max_steps`` / ``control_substeps`` /
@@ -1084,6 +1086,16 @@ def positive_count_error(value: Any, param: str, context: str) -> str | None:
       building live resources - a physics engine per environment, an OS thread
       per worker - so a count the caller did not mean is not a bad number but
       the wrong number of engines.
+    * The speed a serial bus is opened at - the ``baudrate`` of
+      :mod:`~strands_robots.tools.serial_tool` and the ``baud_rate`` of every
+      surface that opens one: :class:`~strands_robots.drivers.feetech.driver.FeetechDriver`,
+      :class:`~strands_robots.drivers.dynamixel.driver.DynamixelDriver`,
+      :class:`~strands_robots.drivers.feetech.bus.FeetechBus` and
+      ``pose_tool``'s motor controller. They all reach one ``serial.Serial``,
+      which takes the speed through its own ``int()`` and refuses only a
+      negative - so a speed that is not a count is applied rather than
+      reported: ``2.7`` opens the port at 2 baud and ``0`` opens it
+      successfully at a speed no servo answers.
 
     It lives here rather than beside one of its callers because those callers
     sit in different layers (:mod:`strands_robots.hardware_robot` must not
@@ -1303,7 +1315,7 @@ def dial_host_error(value: Any, param: str, context: str) -> str | None:
 def non_negative_count_error(value: Any, param: str, context: str) -> str | None:
     """Error text when ``value`` is not a usable non-negative integer count.
 
-    Shared domain for two families of discrete quantity whose ``0`` is a
+    Shared domain for three families of discrete quantity whose ``0`` is a
     first-class value rather than a degenerate one:
 
     * The number of control steps a loop executes while an inference request is
@@ -1311,12 +1323,14 @@ def non_negative_count_error(value: Any, param: str, context: str) -> str | None
       (:attr:`~strands_robots.policies.base.Policy.rtc_observed_delay_steps`).
       That count is exactly ``0`` in the dominant case: a synchronous eval loop
       pauses the world during inference, so no step elapses.
-    * A reproducibility seed
-      (:attr:`~strands_robots.training.base.TrainSpec.seed`), where ``0`` is
-      simply a seed. Its appliers disagree about everything outside this domain:
-      ``torch.manual_seed`` reduces a negative seed modulo ``2**64`` (so ``-1``
-      silently becomes ``2**64 - 1`` and collides with a seed a caller could
-      have named), while NumPy's legacy seeder refuses a negative or a float.
+    * A reproducibility seed -
+      :attr:`~strands_robots.training.base.TrainSpec.seed` and the ``seed`` of
+      :meth:`~strands_robots.streaming_dataset.StreamingDatasetReader.open` -
+      where ``0`` is simply a seed. Its appliers disagree about everything
+      outside this domain: ``torch.manual_seed`` reduces a negative seed modulo
+      ``2**64`` (so ``-1`` silently becomes ``2**64 - 1`` and collides with a
+      seed a caller could have named), while NumPy's legacy seeder refuses a
+      negative or a float.
     * The episode counts of the dataset-integrity gate
       (:func:`strands_robots.verify_dataset.verify_dataset`'s ``expected`` and
       ``min_frames``, and the sim facade's
@@ -1327,8 +1341,8 @@ def non_negative_count_error(value: Any, param: str, context: str) -> str | None
       only for a threshold above zero, so a negative or non-finite one disables
       the check instead of failing it.
 
-    Refusing ``0`` would reject the common configuration for both, which is why
-    this is a separate domain rather than a caller of
+    Refusing ``0`` would reject the common configuration for all three, which is
+    why this is a separate domain rather than a caller of
     :func:`positive_count_error`.
 
     In every other respect it mirrors :func:`positive_count_error`: only a true
@@ -1364,9 +1378,10 @@ def declared_count(value: object) -> int | None:
     :func:`~strands_robots.dataset_recorder.read_dataset_episode_indices`, the
     metadata-drift check in
     :func:`~strands_robots.verify_dataset.verify_dataset`, the validation-split
-    denominator in ``strands_robots.training.lerobot``, and the episode count the
-    ``lerobot_train`` tool splits - so the answer lives here: one file, one
-    value, one verdict.
+    denominator in ``strands_robots.training.lerobot``, the episode count the
+    ``lerobot_train`` tool splits, and the task count
+    :func:`validation_split_error` decides that split against - so the answer
+    lives here: one file, one value, one verdict.
 
     A declaration outside the domain is ``None`` (the header declares no count),
     never a nearby number, because every alternative is silently destructive at
@@ -1380,8 +1395,8 @@ def declared_count(value: object) -> int | None:
       a perfectly readable file raises out of readers whose documented answer for
       an unusable header is "unknown", and past a tool envelope.
     * ``bool`` is an ``int`` subclass, so a bare type test reads ``true`` as a
-      one-episode dataset; the neighbouring ``total_tasks`` reader in
-      ``strands_robots.tools.lerobot_train`` already excludes it for that reason.
+      one-episode dataset - and, at the sibling ``total_tasks`` header this same
+      domain grades, as a single-task one.
     * A ``str`` digit and an integral ``float`` are refused rather than coerced,
       because coercing is what let the readers disagree: one accepted ``"2"`` as
       two episodes while another refused it as unusable.
@@ -2966,12 +2981,21 @@ def validation_split_error(val_episodes: int, total_tasks: Any, context: str, *,
     number of episodes than asked, callers refuse and point at the fraction,
     which addresses the per-task behaviour directly.
 
-    A ``total_tasks`` of 0 or ``None`` means the dataset does not record a task
-    count (lerobot's own field defaults to 0), which is treated as single-task.
+    A ``total_tasks`` of 0, or no header at all, means the dataset does not
+    record a task count (lerobot's own field defaults to 0), which is treated as
+    single-task. A header that declares something which is NOT a count is a
+    THIRD outcome and refused on its own terms: the count is what decides
+    whether the request is expressible, so an unusable declaration is neither
+    single-task nor multi-task, and honoring it as the former is exactly how a
+    multi-task dataset reached lerobot's per-task ceiling. The declaration is
+    graded by :func:`declared_count`, the one owner every reader of a LeRobot
+    header count shares, so callers hand this the value their ``meta/info.json``
+    carried rather than a number of their own.
 
     Args:
         val_episodes: The requested held-out episode count, for the message.
-        total_tasks: ``total_tasks`` from the dataset's ``meta/info.json``.
+        total_tasks: The value the dataset's ``meta/info.json`` carried under
+            ``total_tasks``, verbatim, or ``None`` when there is no header.
         context: Caller label the message is prefixed with.
         passthrough_param: Name of the caller's own raw-flag passthrough
             parameter, interpolated into the remedy. Required rather than
@@ -2984,11 +3008,25 @@ def validation_split_error(val_episodes: int, total_tasks: Any, context: str, *,
     Returns:
         The error text, or None when the count can be honored exactly.
     """
-    if not isinstance(total_tasks, int) or isinstance(total_tasks, bool) or total_tasks <= 1:
+    if total_tasks is None:
+        return None
+    declared = declared_count(total_tasks)
+    if declared is None:
+        return (
+            f"{context}: val_episodes={val_episodes} cannot be checked against a dataset whose "
+            f"meta/info.json declares total_tasks={_refusal_repr(total_tasks)}, which is not a "
+            "task count. Whether one global count is expressible depends on how many tasks the "
+            "dataset holds - lerobot holds out ceil(episodes_in_task * eval_split) from every "
+            "task - so a header declaring no usable count is neither single-task nor multi-task, "
+            "and reading it as single-task is what let a three-task dataset spelling its count "
+            "3.0 past this guard. Repair meta/info.json, or pass the fraction directly, e.g. "
+            f"{passthrough_param}={{'dataset.eval_split': 0.1, 'eval_steps': 1000}}."
+        )
+    if declared <= 1:
         return None
     return (
         f"{context}: val_episodes={val_episodes} cannot be reserved exactly on a "
-        f"dataset with {_refusal_str(total_tasks)} tasks. A validation split is a per-task "
+        f"dataset with {_refusal_str(declared)} tasks. A validation split is a per-task "
         "fraction in lerobot (it holds out ceil(episodes_in_task * eval_split) "
         "from every task), so a single global count is not expressible: the "
         "ceiling would be applied once per task. Pass the fraction directly, "
