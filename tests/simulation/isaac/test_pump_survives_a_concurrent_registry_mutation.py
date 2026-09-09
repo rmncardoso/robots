@@ -88,14 +88,26 @@ class _Camera:
 
 
 def _no_converge(n: int = 1) -> None:
-    """``_converge_render`` with the render loop taken out. The default matches the
-    method's, so the substitution is signature-compatible."""
+    """``_converge_render`` with the render loop taken out.
+
+    Carries a default because the method it replaces has one and mypy rejects the
+    substitution without it; the *value* is not load-bearing, since mypy erases it
+    to ``...`` and the only caller passes ``_idle_converge`` positionally. Measured:
+    4 calls, none of them zero-argument.
+    """
     return None
 
 
 def _slow_grab(cname: str, cam: Any) -> Any:
-    """A frame grab that costs real time. Parameter names match the method it
-    replaces, so the substitution is signature-compatible."""
+    """``_grab_frame`` taking real time, for a camera walk that nothing else paces.
+
+    Parameter names match the method it replaces, so the substitution is
+    signature-compatible. This default is a backstop rather than the stub the
+    camera tests race against: measured, it is called 0 times, because every test
+    that turns cameras on installs its own grab (see the two below). Kept so a
+    future camera test that does not override still walks a paced loop rather than
+    an instant one.
+    """
     time.sleep(0.002)
     return None
 
@@ -114,10 +126,12 @@ def _engine(*, cameras: bool = False) -> Any:
     engine._pump_cameras = cameras
     engine._idle_converge = 1
     engine._converge_render = _no_converge  # type: ignore[method-assign]
-    # The frame grab must take real time, or the camera walk finishes before any
-    # mutation can land and the camera tests pass with the snapshot REMOVED -
-    # measured: 15/15 either way with an instant stub. The robot walk races only
-    # because _SlowArticulation sleeps; the camera walk needs the same.
+    # A frame grab that takes real time, because an instant one lets the camera walk
+    # finish before any mutation can land - and then the camera tests pass with the
+    # snapshot REMOVED (measured: 15/15 either way). The robot walk races only
+    # because _SlowArticulation sleeps; the camera walk needs the same. Each camera
+    # test installs its own grab over this one, so this assignment is the default
+    # for a camera test that does not, not the pacing those tests rely on.
     engine._grab_frame = _slow_grab  # type: ignore[method-assign]
     for i in range(_ROBOT_COUNT):
         engine._robots[f"r{i}"] = types.SimpleNamespace(  # type: ignore[assignment]
