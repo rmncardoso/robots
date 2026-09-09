@@ -1450,11 +1450,16 @@ class DatasetRecordingMixin:
 
         Args:
             repo_id: HF dataset id (e.g. ``"lerobot/svla_so100_pickplace"``) or
-                a local repo_id paired with ``root=``.
+                a ``repo_id`` that is itself a path, which streams the directory
+                it recorded to with no ``root`` restated
+                (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
             **kwargs: Forwarded to
                 :meth:`StreamingDatasetReader.open` - e.g. ``root``,
-                ``delta_timestamps``, ``episodes``, ``shuffle``, ``buffer_size``,
-                ``max_num_shards``, ``drop_videos`` (proprio-only,
+                ``delta_timestamps``, ``episodes``, ``shuffle`` (which decides
+                cross-epoch reproducibility, NOT read order - see that method's
+                "Ordering" note), ``buffer_size`` and ``max_num_shards`` (both
+                ``1`` to read in capture order),
+                ``drop_videos`` (proprio-only,
                 torchcodec-free; requires ``delta_timestamps`` with at least one
                 non-video key, else ValueError), ``repo_type`` (``"dataset"`` or
                 ``"bucket"``; ``"bucket"`` requires lerobot>=0.6.1, else
@@ -1468,7 +1473,7 @@ class DatasetRecordingMixin:
                 "local/agent_demo", root="/tmp/strands_agent_dataset",
                 delta_timestamps={"observation.state": [-0.0667, 0.0],
                                   "action": [0.0, 0.0667]},
-                shuffle=False,
+                buffer_size=1, max_num_shards=1,  # capture order for replay
             )
             for frame in reader:
                 ...

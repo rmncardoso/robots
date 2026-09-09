@@ -194,11 +194,11 @@ absent `root` there outright, because the directory it would derive for a writer
 is the revision-safe Hub snapshot cache; resolving here is what keeps the append
 reachable on the same arguments the recording was made with.
 
-Reading back applies the same rule, so a path-like `repo_id` replays and
-transforms the directory it recorded to with no `root` restated. Only that rule
-is applied on the read side: an `owner/name` id keeps its absent root so LeRobot
-resolves its own revision-safe snapshot cache for a download - which is already
-the directory a local recording under that id wrote to.
+Reading back applies the same rule, so a path-like `repo_id` replays, streams
+and transforms the directory it recorded to with no `root` restated. Only that
+rule is applied on the read side: an `owner/name` id keeps its absent root so
+LeRobot resolves its own revision-safe snapshot cache for a download - which is
+already the directory a local recording under that id wrote to.
 
 Passing an existing **empty** directory - for example one returned by
 `tempfile.mkdtemp()` - is accepted and recorded into:
@@ -994,13 +994,14 @@ from strands_robots import Robot
 
 sim = Robot("so100")
 reader = sim.stream_dataset(
-    "user/my_dataset",                 # or a local repo_id + root=
+    "user/my_dataset",                 # a path-like repo_id needs no root=
     root="/tmp/my_dataset",
     delta_timestamps={                 # optional: stacked time windows + *_is_pad masks
         "observation.state": [-0.0667, -0.0333, 0.0],
         "action": [0.0, 0.0333, 0.0667],
     },
-    shuffle=False,                     # chronological for replay/eval
+    buffer_size=1,                     # capture order for replay/eval:
+    max_num_shards=1,                  # one reservoir slot, one shard
 )
 print(reader.num_episodes, reader.num_frames, reader.fps)
 for frame in reader:
@@ -1011,7 +1012,28 @@ for batch in reader.dataloader(batch_size=64, num_workers=4):
     ...
 ```
 
+A `repo_id` that is itself a path (no `owner/name` slash, or `./`-prefixed) is
+resolved to the directory recording wrote to, so the record -> read-back loop
+needs no `root` restated:
+
+```python
+sim.start_recording(repo_id="sim_recording", task="pick the cube", fps=30)
+...
+sim.stop_recording()
+reader = sim.stream_dataset("sim_recording")   # ./sim_recording, not the Hub
+```
+
 Equivalently, the standalone reader: `from strands_robots import StreamingDatasetReader`.
+
+`shuffle` is **not** the read-order knob, and `shuffle=False` on its own reads
+shuffled frames with nothing reporting it. It selects only which generator
+drives the reordering (a generator reseeded from `seed` on every exhaustion, or
+the dataset's advancing one), so it decides reproducibility *across epochs* —
+lerobot documents it as "whether to shuffle the dataset across exhaustions".
+`StreamingLeRobotDataset` reorders either way: it samples a shard at random per
+frame and yields from a reservoir buffer. Capture order is therefore
+`buffer_size=1` (a reservoir of one cannot reorder) plus `max_num_shards=1`
+(a single shard has nothing to interleave), as above.
 
 Useful kwargs (forwarded to `StreamingLeRobotDataset`, version-tolerant):
 `episodes=[...]` (subset without download), `buffer_size`, `max_num_shards`,
@@ -1030,6 +1052,29 @@ and then stream **zero frames**, a `buffer_size` of `0` raised out of NumPy
 part-way through iteration, and a `tolerance_s` of `inf` switched off the
 delta-grid check below. `tolerance_s=0` is accepted and means "require an exact
 grid match"; `seed=0` is accepted and is simply a seed.
+
+The five boolean kwargs (`streaming`, `shuffle`, `return_uint8`,
+`validate_deltas`, `drop_videos`) are checked there too, on the same domain the
+recording postures use ([A posture flag must be a
+boolean](#a-posture-flag-must-be-a-boolean)) and for the same reason - read by
+truthiness, each selected the branch the caller was opting *out* of:
+
+```python
+reader = sim.stream_dataset("user/d", drop_videos="false")  # ValueError: drop_videos must be a boolean
+reader = sim.stream_dataset("user/d", validate_deltas=0)    # same refusal
+```
+
+`drop_videos="false"` (also `"no"`, `"off"`, `"0"`) is truthy, so it *removed*
+the camera keys from `delta_timestamps` - the opposite of the opt-out it spells -
+and when nothing but camera keys were requested it reported
+`drop_videos=True requires ...`, naming a value the caller had never passed and
+pointing at a remedy that lands on the silent proprio-only stream. Falsy
+non-booleans took the other branch just as silently: `validate_deltas=0` skipped
+the delta-grid check, so an off-grid `delta_timestamps` that `validate_deltas=True`
+refuses opened and streamed; `return_uint8=None` streamed float32 at ~4x the
+bandwidth with the warning about that cost suppressed by the same truthiness; and
+`streaming=0` failed inside LeRobot on `num_shards`. `reader.dataloader(shuffle=...)`
+needs no such check - it discards the key whatever it held.
 
 One kwarg is **not** tolerant-forwarded because its absence changes semantics:
 `repo_type="bucket"` requires `lerobot>=0.6.1`, which the `[lerobot]` extra
