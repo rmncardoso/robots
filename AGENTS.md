@@ -2064,6 +2064,16 @@ which side the enum is on.
   limits, recoverable only by re-calibrating the hardware - while the tool reported
   ``Overwrite mode: `false` `` beside a restored count of 1. Pinned by
   `tests/tools/test_calibration_restore_overwrite_flag_domain.py`.
+  The asset cache is the third one, and the only one whose deletion takes a file the
+  package never authored: `download_robots(force=)` and the `download_assets` facade both
+  read it, and a re-fetch removes the cached directory for a robot whose assets are
+  already present - the directory `_copy_external_tree` filters on read rather than
+  cleaning afterwards, precisely so a README or notes kept beside the assets survive a
+  download. `force="false"` was indistinguishable from `force=True`: measured with one
+  present robot, the directory was replaced, a file kept beside its assets was gone, and
+  the call reported `downloaded: 1`. `_needs_download` had returned the flag verbatim as
+  its own `bool` verdict, so an unchecked value became a partition decision rather than an
+  argument error. Pinned by `tests/test_asset_download_force_flag_domain.py`.
 - **A flag whose misread only shows up in a rendered frame is checked at construction.**
   Where the branch a flag selects is applied later - a fitted transform, a compositing
   decision - the misread has no error to surface at, so it reads as a scene that looks
@@ -2077,11 +2087,55 @@ which side the enum is on.
   supplied it, not where the branch is taken. Pinned by
   `tests/rendering/test_gsplat_background_posture_flag_domain.py`, which measures the
   branch each of the four selects.
+- **A flag that gates whether a numeric row is READ is checked ahead of the numeric
+  guard.** `lerobot_camera` refuses `timeout_ms` only under `async_mode`, because the
+  synchronous read consumes no budget and an option no handler reads must not be
+  refused - so the numeric table's own row is switched on and off by a posture flag
+  from outside the table. Read by truthiness, that gate admitted `timeout_ms=-5` under
+  `async_mode=0` (`status="success"` on an unusable budget) and, under
+  `async_mode="false"`, refused the *budget* by name for a caller whose only mistake was
+  the flag. The order is the point: a posture guard placed after the numeric guard still
+  refuses, but names the value the gate selected rather than the gate, sending the
+  caller to correct the wrong parameter. Scope the roster per action, as
+  `_ACTION_POSTURE_FLAGS` mirrors `_ACTION_NUMERIC_OPTIONS`, so `discover` and `list` -
+  which consume none of the three flags - refuse none of them. Pinned by
+  `tests/tools/test_lerobot_camera_posture_flag_domain.py`, which derives the roster
+  from the tool's own signature so a fourth flag cannot be added without the domain,
+  and whose ordering cell fails when the two guards are swapped.
+  A gate whose flag defaults to `True` inverts in the sharper direction, because a falsy
+  non-boolean then *removes* a behaviour the caller never asked to leave. `pose_tool`'s
+  `smooth` chooses between interpolating towards the joint targets over
+  `steps * step_delay` seconds and writing each goal position once, and it decides whether
+  those two options are read - so `smooth="false", steps=0` was refused for `steps`, and
+  `smooth=0` wrote 2 goal positions where `True` writes 42 over 21 increments, sending the
+  arm to the far end of its travel in one write: the full-travel jump the same module
+  already refuses `steps=True` for. Pinned by
+  `tests/tools/test_pose_tool_smooth_posture_flag_domain.py`.
+- **A facade that binds its numeric knobs to the tool-error envelope binds its flags the
+  same way, and a surface that submits to a worker checks them before the submit.**
+  `SimEngine.run_policy` validates `control_frequency`, `seed`, `action_horizon` and the
+  rest through `_validate_*` bindings of the shared numeric domains, while the four
+  posture flags in the same signature - `fast_mode`, `reset_between`,
+  `wbc_install_torque_control` and `async_rtc` - were read by truthiness one layer down:
+  `reset_between=0` on a two-episode call started episode two from wherever episode one
+  left the arm, and `async_rtc="false"` reported `rtc_async_enabled=True` beside the
+  background inference thread the caller had declined. `_validate_posture_flags` is the
+  binding, called ahead of robot resolution so a refused call builds no policy. A flag
+  whose `None` is a documented sentinel (`async_rtc` on `run_policy`, "resolve from the
+  policy") is checked only when supplied; the same name declared as a plain `bool` on
+  `eval_policy` refuses `None` with everything else. MuJoCo's `start_policy` repeats the
+  check before `executor.submit`, for the reason its sibling knobs already do: a refusal
+  produced on the worker is discarded with the future and the caller reads "started". The
+  `run_policy` tool checks its own `fast_mode` before `start_recording(overwrite=True)`,
+  so the facade's refusal cannot arrive after the dataset it was asked to record into has
+  been emptied. Pinned by `tests/simulation/test_run_policy_posture_flag_domain.py`,
+  whose roster is read from the facade's signature so a fifth flag cannot skip the domain.
 - Pinned by `tests/simulation/mujoco/test_actuate_robot_posture_flag_domain.py`,
   `tests/simulation/test_recording_posture_flag_domain.py`,
   `tests/tools/test_lerobot_teleoperate_flag_domain.py`,
   `tests/mesh/test_iot_provisioning_flag_domain.py`,
-  `tests/rendering/test_key_light_posture_flag_domain.py` and
+  `tests/rendering/test_key_light_posture_flag_domain.py`,
+  `tests/tools/test_pose_tool_smooth_posture_flag_domain.py` and
   `tests/test_ros2_command_surface_flag_domain.py`, each of which parametrizes over
   `boolean_flag_error` itself rather than a copied spelling list, so a spelling added to
   the shared domain is covered without an edit.
