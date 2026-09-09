@@ -726,13 +726,6 @@ _KNOWN_STEP_COUNT_SURFACES: dict[tuple[str, str], tuple[str, ...]] = {
     ("mujoco", "run_multi_policy"): ("_resolve_horizon",),
     ("newton", "step"): ("non_negative_whole_number_error",),
     ("isaac", "step"): ("non_negative_whole_number_error",),
-    # Isaac grew a run_policy override to lower ``policy_running`` on exit, and it
-    # spells the shared parameter list out rather than absorbing it into
-    # ``**kwargs`` - so it takes ``n_steps`` and forwards it, with no local
-    # validator of its own. Same empty tuple as MuJoCo's run_policy above, for the
-    # same reason: the horizon is resolved once, by the shared implementation both
-    # of them delegate to.
-    ("isaac", "run_policy"): (),
     ("isaac", "run_multi_policy"): ("_resolve_horizon",),
 }
 

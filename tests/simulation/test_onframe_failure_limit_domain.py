@@ -392,12 +392,6 @@ class TestNoOnframeFailureLimitSurfaceDrifts:
             "base.py::SimEngine.run_policy",
             "policy_runner.py::PolicyRunner.run",
             "simulation.py::MuJoCoSimEngine.run_policy",
-            # The Isaac backend grew a run_policy override to lower
-            # ``policy_running`` on exit, and it spells the shared parameter list
-            # out rather than absorbing it into ``**kwargs`` - so it takes this
-            # parameter too and forwards it. A sink would have kept this roster
-            # unchanged while silently accepting every misspelling.
-            "simulation.py::IsaacSimulation.run_policy",
         }, names
 
     def test_every_public_surface_validates_or_forwards(self):
