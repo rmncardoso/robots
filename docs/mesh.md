@@ -49,6 +49,34 @@ results = sim_a.mesh.broadcast({"action": "status"}, timeout=2.0)
 sim_a.mesh.emergency_stop()   # STRANDS_MESH_AUDIT_DIR overrides log location
 ```
 
+## What a fleet e-stop reaches
+
+`emergency_stop()` broadcasts `{"action": "stop"}` with no `robot_name`, so each
+peer decides which of its own robots that reaches. A hardware peer stops its
+task. A simulation peer asks every rollout it could be running: the rollouts its
+backend reports as in flight where it keeps such a registry (MuJoCo prunes
+finished ones), and otherwise every robot the engine lists. `stop_policy` is
+idempotent and reports `was_running` itself, so asking an idle robot costs
+nothing and the verdict is read rather than guessed - `stopped` names only the
+robots whose answer did not say they were idle.
+
+The peer's `ok` is derived from those per-robot answers, never assumed:
+
+```python
+responses = sim_a.mesh.emergency_stop()
+# {"ok": True,  "stopped": ["arm"], "results": {...}}          the rollout halted
+# {"ok": True,  "stopped": [],      "results": {...}}          asked, none was running
+# {"ok": False, "stopped": [], "not_stopped": ["arm"], ...}    a stop was refused
+```
+
+A refusal puts the peer in `peers_not_stopped`, which `emergency_stop()` logs at
+CRITICAL and carries in the safety envelope. A backend that keeps no durable
+per-robot rollout claim refuses, and that refusal is what you want: on the safety
+path an acknowledgement that nothing was running is an affirmative answer given
+on no evidence. Bound such a rollout instead of stopping it -
+`run_policy(n_steps=...)` caps its length and `run_policy(stop_when={...})` ends
+it as soon as the world reaches a state.
+
 ## Recovering from an emergency stop
 
 `emergency_stop()` latches a **lockout** on every peer that receives it. While a
@@ -101,10 +129,11 @@ will not make the next heartbeat tick drop every peer it can still hear.
 process's reading of when it last heard from a peer, and the `peer_id` a peer is
 filed under is the one its topic and certificate bind - not a field inside the
 payload. A presence payload is merged into what you read about a peer so you get
-its capabilities (`tool_name`, `connected`, `cameras`, ...), and those four
-locally decided keys - `peer_id`, `type`, `hostname`, `age` - win a name
-collision with it. A peer heartbeating `"age": 0` does not report itself fresh,
-and one naming another peer's id does not answer a lookup for that peer.
+its capabilities (`tool_name`, `connected`, `cameras`, ...), and those five
+locally decided keys - `peer_id`, `type`, `hostname`, `age`, `reachable` - win a
+name collision with it. A peer heartbeating `"age": 0` does not report itself
+fresh, one claiming `"reachable": true` does not report itself in contact, and
+one naming another peer's id does not answer a lookup for that peer.
 
 Repeated wrong codes arm a brute-force cooldown
 (`STRANDS_MESH_RESUME_MAX_FAILS`, `STRANDS_MESH_RESUME_BACKOFF_S`): during the
@@ -206,8 +235,11 @@ each with an `active` flag:
 ```
 
 `active` means *this robot is executing a policy right now*. It is read from the
-same running-policy registry the `status` command answers `robots_running` from,
-so polling the topic and asking a peer directly never disagree. The scene's idle
+same in-flight population the `status` command answers `robots_running` from,
+so polling the topic and asking a peer directly never disagree. A rollout counts
+however it was launched: one submitted in the background by `start_policy` and one
+being driven right now by the blocking `run_policy`, which registers no future,
+both read `true`. The scene's idle
 arms read `false`, which is what makes the one arm running a rollout
 identifiable, and the flag clears when that policy is stopped or its duration
 expires. Which robots *exist* is a separate question, answered by `sim_robots` on
@@ -228,6 +260,38 @@ identically). `theta` and `quat` are decomposed from the same matrix, so they
 always agree: both describe the full rotation for every orientation, including
 the half of SO(3) past 120 degrees that a robot turning back the way it came
 lands in.
+
+### Out of contact vs gone
+
+A peer that stops heartbeating is *unreachable* after `PEER_TIMEOUT` (10 s)
+and, by default, deleted from the registry at that same moment. For fleets
+whose silence is planned - a rover in an RF shadow, a warehouse robot crossing
+a Wi-Fi dead zone, a satellite between ground-station passes - deletion answers
+"was it ever here?" with "no": a dispatcher reading absence as loss fails work
+over to another robot, and a fleet view renders a planned silence as a
+vanished peer.
+
+Set `STRANDS_MESH_PEER_RETENTION_S` to keep such peers on the books instead.
+The peer stays in `mesh.peers` with `reachable: false` (a locally-derived
+verdict the peer cannot claim about itself - it shares the collision rule
+`age` has) until its silence exceeds `max(PEER_TIMEOUT, retention)`, at which
+point it is gone for real. Retention off (the default) is byte-identical to
+the historic behavior. The `STRANDS_MESH_MAX_PEERS` eviction cap still
+outranks retention: at the cap, the longest-silent peer is evicted first.
+
+Readers that *act* on a peer record can state the freshness their decision
+needs instead of parsing `age` themselves:
+
+```python
+row = robot.mesh.get_peer(peer_id, max_age_s=30.0)
+if row is None:
+    ...  # unknown OR older than 30 s - for this decision, the same thing
+```
+
+`max_age_s=None` (default) accepts any age - right for displays that render
+staleness themselves. The bound must be positive and finite: `nan` would make
+the comparison answer False for every age, a bound failing open on exactly
+the stale record it was written to refuse, so it is refused instead.
 
 ### Rejoining the mesh
 

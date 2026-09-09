@@ -133,6 +133,7 @@ from strands_robots.simulation.mujoco.spec_builder import (
     _validate_size,
     material_spec_error,
 )
+from strands_robots.simulation.observers import RunPolicyObserver
 from strands_robots.simulation.policy_runner import CooperativeStop
 from strands_robots.simulation.recording import undriven_robot_state
 from strands_robots.simulation.terrain import SUPPORTED_TERRAINS, validate_difficulty, validate_terrain
@@ -144,6 +145,7 @@ from strands_robots.utils import (
     entity_name_error,
     finite_vector_error,
     non_negative_whole_number_error,
+    optional_callable_error,
     positive_count_error,
     positive_finite_number_error,
     positive_whole_number_error,
@@ -215,9 +217,17 @@ def _compiled_geom_extent(mj: Any, model: Any, geom_name: str) -> list[float] | 
 
     Reads MuJoCo's own ``geom_aabb`` row (centre plus half-extent per local
     axis) rather than re-deriving the extent from the request, so the number
-    describes the geometry that actually compiled. For a primitive that
-    reproduces the caller's ``size``; for a mesh it is the asset's own extent,
-    which no request component defines.
+    describes the geometry that actually compiled. That is the same number the
+    request carries only for a shape that consumes every component: a box or an
+    ellipsoid. A sphere consumes one component and a cylinder or capsule two, so
+    the rest of their request describes nothing; a capsule's caps add its radius
+    to each end of the height that was asked for; and a mesh takes its extent
+    from the asset. This read is what makes those four cases reportable.
+
+    A ``plane`` is the one shape this cannot describe: it is infinite for
+    collision, so MuJoCo's own bounding box for it is the ~2e10 m sentinel
+    rather than the visual patch a caller sized. Read
+    :func:`_compiled_plane_half_widths` for that one instead.
 
     Args:
         mj: the cached ``mujoco`` module, for the ``mjtObj`` enum.
@@ -235,7 +245,73 @@ def _compiled_geom_extent(mj: Any, model: Any, geom_name: str) -> list[float] | 
     if geom_id < 0:
         return None
     aabb = model.geom_aabb[geom_id]
-    return [round(float(2.0 * aabb[3 + axis]), 4) for axis in range(3)]
+    # Rounded only to collapse binary noise (a mesh extent integrated off the
+    # asset arrives as 0.30000000000000004). The resolution has to stay finer
+    # than any extent a caller can ask for, because halving a float to a
+    # half-extent and doubling it back is exact: a primitive reads back as
+    # PRECISELY the requested number, and quantising to 0.1 mm would report a
+    # 0.12345 m box as 0.1235 m -- a value the geom does not have, which is the
+    # class of report this read exists to remove. A micron is below the
+    # resolution of every physical claim in this package.
+    return [round(float(2.0 * aabb[3 + axis]), 6) for axis in range(3)]
+
+
+def _compiled_plane_half_widths(mj: Any, model: Any, geom_name: str) -> list[float] | None:
+    """Visual half-widths in meters of a compiled plane geom.
+
+    A plane is infinite for collision, so its bounding box says nothing about
+    the patch a caller sized (:func:`_compiled_geom_extent` reports MuJoCo's
+    ~2e10 m sentinel for one). The two leading ``geom_size`` components are what
+    the compile actually kept, and they are what
+    :meth:`MuJoCoSimEngine.add_object` reports: a plane's ``size[1]`` mirrors
+    ``size[0]`` when omitted, and its third component is MuJoCo's grid spacing,
+    which the builder sets itself, so neither is readable from the request.
+
+    Args:
+        mj: the cached ``mujoco`` module, for the ``mjtObj`` enum.
+        model: a compiled ``MjModel``.
+        geom_name: name of the geom to measure, resolved through
+            :func:`~strands_robots.simulation.mujoco.backend.mj_name_to_id`.
+
+    Returns:
+        ``[x, y]`` visual half-widths, or ``None`` when ``geom_name`` resolves to
+        no geom.
+    """
+    geom_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_GEOM, geom_name)
+    if geom_id < 0:
+        return None
+    return [round(float(model.geom_size[geom_id][axis]), 6) for axis in range(2)]
+
+
+def _compiled_geometry_detail(mj: Any, model: Any, shape: str, geom_name: str) -> str:
+    """Describe the geometry a just-added geom compiled to, for a result text.
+
+    One owner for every shape, because the request is a faithful description of
+    the compiled geom for only two of the seven (:func:`_compiled_geom_extent`
+    records which). Reporting a measurement instead of the request is what the
+    mesh row already did; the read is correct for the rest as well, so nothing
+    is echoed.
+
+    Args:
+        mj: the cached ``mujoco`` module.
+        model: the compiled ``MjModel`` the geom now lives in.
+        shape: the requested shape, which selects how the geom is described.
+        geom_name: name of the compiled geom (``"<object>_geom"``).
+
+    Returns:
+        The geometry clause of ``add_object``'s success text. Says the value is
+        unavailable rather than falling back to the request when the geom cannot
+        be resolved, which is the case the request would misdescribe silently.
+    """
+    if shape == "plane":
+        half_widths = _compiled_plane_half_widths(mj, model, geom_name)
+        patch = "extent unavailable" if half_widths is None else f"size={half_widths} visual half-widths"
+        return f"{patch} (infinite for collision)"
+    extent = _compiled_geom_extent(mj, model, geom_name)
+    if shape == "mesh":
+        geometry = "extent unavailable" if extent is None else f"extent={extent}m from the asset"
+        return f"{geometry} (collision uses its convex hull)"
+    return "size unavailable" if extent is None else f"size={extent}"
 
 
 def _validated_mesh_handle(mesh: Any) -> Any:
@@ -3026,6 +3102,16 @@ class MuJoCoSimEngine(
         # spec + action dispatcher; listing them completes the start/stop/list
         # lifecycle on the discovery surface (the resource-management sibling of
         # run_policy's blocking rollout).
+        # start_policy's inherited entry states the base engine's SYNCHRONOUS
+        # reading, which is wrong for this backend -- and it is the entry a
+        # caller reads to tell the two apart, so it is corrected here rather
+        # than left describing another engine.
+        base["methods"]["start_policy"] = (
+            "(robot_name: str, policy_provider='mock', ...) -> dict  # on THIS "
+            "engine it submits the rollout to the ThreadPoolExecutor and returns "
+            "immediately (background, non-blocking); stop_policy ends it and "
+            "list_policies_running reports what is in flight"
+        )
         base["methods"]["stop_policy"] = (
             "(robot_name: str) -> dict  # cooperatively stop the background "
             "policy started by start_policy on robot_name; idempotent (succeeds "
@@ -3397,14 +3483,23 @@ class MuJoCoSimEngine(
 
         * ``box`` / ``ellipsoid``: ``[x, y, z]`` full edge lengths per axis.
         * ``sphere``: ``size[0]`` is the diameter (``size[1:]`` ignored).
-        * ``cylinder`` / ``capsule``: ``size[0]`` diameter, ``size[2]`` full
-          height (``size[1]`` ignored).
+        * ``cylinder``: ``size[0]`` diameter, ``size[2]`` full height
+          (``size[1]`` ignored).
+        * ``capsule``: ``size[0]`` diameter, ``size[2]`` the length of the
+          cylindrical section (``size[1]`` ignored). The two hemispherical caps
+          add ``size[0] / 2`` at each end, so the object's total height is
+          ``size[2] + size[0]`` -- a 0.9 m capsule 0.05 m across stands 0.95 m
+          tall.
         * ``plane``: ``size[0]`` / ``size[1]`` are visual half-widths; planes are
           infinite for collision and are forced static.
         * ``mesh``: ``size`` is ignored -- the asset's own units define the
-          extent (requires ``mesh_path``). Because no component is consumed, the
-          success text reports the compiled extent read back off the geom
-          instead of echoing the request.
+          extent (requires ``mesh_path``).
+
+        The success text describes the geometry that **compiled**, read back off
+        the geom, never the request. The two are the same number only for a
+        ``box`` or an ``ellipsoid``; for every other shape the request holds
+        components the geom does not carry (see the table above), and a report
+        that echoed them stated an extent the object does not have.
 
         A free (non-static) body rests on a horizontal support at
         ``rest_z = support_top + size_z / 2`` -- e.g. a 5 cm cube on a table
@@ -3696,21 +3791,19 @@ class MuJoCoSimEngine(
                 "content": [{"text": f"Failed to inject '{name}' into live scene: {e}"}],
             }
 
-        # A mesh consumes no 'size' component (``_SIZE_LAYOUT["mesh"]`` is 0),
-        # so echoing the request back reports an extent this add never applied:
-        # the default read as a 5 cm object for an asset of any size, and an
-        # explicit vector read as honoured. Report what compiled instead -- the
-        # asset's own extent, and the collision geometry, which for every mesh
-        # geom is its convex hull rather than the surface that renders. Both are
-        # what a caller placing a robot or an object against the asset needs, and
-        # neither is derivable from the request. Primitive shapes keep echoing
-        # ``size``: there it is the extent, and the geom compiles to it.
-        if shape == "mesh":
-            extent = _compiled_geom_extent(self._mj, self._world._model, f"{name}_geom")
-            geometry = "extent unavailable" if extent is None else f"extent={extent}m from the asset"
-            detail = f"{geometry} (collision uses its convex hull)"
-        else:
-            detail = f"size={obj.size}"
+        # Echoing the request back reports an extent this add did not apply
+        # wherever the shape does not consume every component. A mesh consumes
+        # none (``_SIZE_LAYOUT["mesh"]`` is 0), so the default read as a 5 cm
+        # object for an asset of any size; and only ``box`` / ``ellipsoid``
+        # consume all three, so a sphere given [0.05, 0.09, 0.2] reported y and
+        # z extents of 0.09 and 0.2 for a ball that is 0.05 m across in every
+        # axis, a cylinder's unconsumed middle component reported a y extent its
+        # circular cross-section cannot have, and a capsule's caps make its true
+        # height its radius longer than the one requested. The report is read
+        # off the compiled geom for every shape instead
+        # (:func:`_compiled_geometry_detail`), which is also where the mesh's
+        # convex-hull collision geometry and the plane's infinite one are named.
+        detail = _compiled_geometry_detail(self._mj, self._world._model, shape, f"{name}_geom")
 
         return {
             "status": "success",
@@ -4874,13 +4967,63 @@ class MuJoCoSimEngine(
             self._policy_rates.pop(stale, None)
 
     def _active_policy_robots(self) -> list[str]:
-        """Names of robots with a live (not-done) policy Future.
+        """Names of robots a rollout is driving right now, in either shape.
 
-        Prunes stale entries as a side-effect so the returned list is
-        authoritative. Callers can introspect via ``list_policies_running``.
+        BOTH shapes, because a caller asking what is in flight is not asking how
+        it was launched: :meth:`start_policy` submits a Future and registers it
+        here, while :meth:`run_policy` drives the rollout on its caller's thread
+        and registers nothing. This answered from the Future table alone, so a
+        blocking rollout was invisible to every reader of this population for as
+        long as it drove the arm - measured on one arm at 20 Hz:
+
+        * :meth:`list_policies_running` answered "No policies running.",
+        * the mesh ``status`` command answered ``idle`` with an empty
+          ``robots_running``, and its state topic published ``active=False``,
+        * the ``{"action": "stop"}`` fanout
+          :meth:`~strands_robots.mesh.Mesh.emergency_stop` broadcasts answered
+          ``ok=True, "no policies running"`` and halted nothing, which
+          :func:`~strands_robots.mesh.core._peers_that_did_not_stop` reads as a
+          peer that stopped - so the operator was told the fleet had halted
+          while the rollout drove the arm for the remaining 8 of its 10 seconds.
+          That is the affirmative lie the surrounding stop branches are
+          commented against, reached through the population instead of the
+          verdict.
+
+        :meth:`stop_policy` was the one surface that read the per-robot claim as
+        well, so it and ``list_policies_running`` reported opposite facts about
+        the same instant ("Stopped on 'arm'" with ``was_running=True`` against
+        "No policies running.") - the two-sources drift #2833 is about, and the
+        thing ``docs/simulation/overview.md`` promised could not happen. The
+        union is spelled once, here, and every reader inherits it.
+
+        ``policy_running`` is the flag the launching thread raises around every
+        rollout this engine drives (``_announce_rollout``) and
+        :meth:`_release_run_policy_hook` lowers in a ``finally`` when the
+        rollout ends for any reason, so it covers the shape the Future table
+        cannot see and a finished rollout leaves it down.
+
+        Returns:
+            The names, Future-backed rollouts first in registration order and
+            then any robot holding the claim without one, each robot once.
+            Prunes stale Future entries as a side effect, so the list is
+            authoritative. :meth:`list_policies_running` is the public reader.
         """
         self._prune_done_futures()
-        return list(self._policy_threads.keys())
+        names = list(self._policy_threads.keys())
+        world = self._world
+        if world is None:
+            return names
+        registered_names = set(names)
+        # Snapshot the registry: this read must answer for a status command and
+        # for a stop, and a scene teardown racing either would otherwise raise
+        # "dictionary changed size during iteration" out of a surface whose
+        # whole job is to answer.
+        names.extend(
+            name
+            for name, robot in tuple(world.robots.items())
+            if name not in registered_names and getattr(robot, "policy_running", False)
+        )
+        return names
 
     def _active_rollout_rates(self) -> dict[str, float]:
         """Capture rate of every ``start_policy`` rollout still in flight.
@@ -5096,6 +5239,16 @@ class MuJoCoSimEngine(
 
         A second ``start_policy`` on the *same* robot is still rejected.
 
+        Every request :meth:`run_policy` refuses is refused here too, before the
+        submit: the horizon, the seed, the video config, the provider keyword
+        bags, the recording rate, and the policy configuration itself (provider
+        resolution plus the provider's own
+        :meth:`~strands_robots.policies.base.Policy.preflight` hook, via
+        :meth:`~strands_robots.simulation.base.SimEngine._preflight_policy_config`).
+        A refusal raised on the worker instead would be discarded with the
+        future, leaving the caller a ``status="success"`` for a rollout that
+        never produced an action.
+
         accepts ``n_steps`` (primary) or legacy ``max_steps`` as an
         alternate horizon specification; run_policy converts to duration.
         """
@@ -5164,11 +5317,21 @@ class MuJoCoSimEngine(
         # frames separately, which is correct for live control but interleaves
         # for a shared recorder. start_policy while recording is left to the
         # caller's intent (run_multi_policy is the recommended recording path).
-        # Resolve the provider synchronously. run_policy performs this check
-        # too, but it runs on the worker below: a raise there is captured in
-        # the future and this method would still report "Policy started",
-        # leaving the caller with a success for a rollout that never began.
-        if err := self._unresolvable_policy_provider_error(policy_provider, policy_config):
+        # Pre-flight the whole policy configuration synchronously. run_policy
+        # performs this check too, but it runs on the worker below, and nothing
+        # reads that future's result: an error returned there is discarded while
+        # this method has already reported "Policy started", so the caller holds
+        # a success for a rollout that never produced an action and
+        # ``list_policies_running`` then reports nothing running - the same
+        # reading as a rollout that completed. Both halves of the verdict have
+        # to be given here, not just provider resolution: the provider's own
+        # ``preflight`` hook refuses a configuration it can see up front (a
+        # camera the model's image features cannot be routed from, an
+        # unexecutable action-chunk count), and that refusal is what run_policy
+        # returns to a blocking caller. This builds no policy and downloads no
+        # weights, and it is skipped for a pre-built ``policy_object`` for the
+        # same reason run_policy skips it - the provider is then unused.
+        if policy_object is None and (err := self._preflight_policy_config(robot_name, policy_provider, policy_config)):
             return err
 
         # Claim the robot on THIS thread, before the submit. A stop issued
@@ -5401,6 +5564,7 @@ class MuJoCoSimEngine(
         rtc_inference_timeout_s: float | None = None,
         wbc_install_torque_control: bool = True,
         stop_when: dict[str, Any] | Callable[[SimEngine], bool] | None = None,
+        observer: RunPolicyObserver | None = None,
     ) -> dict[str, Any]:
         """MuJoCo ``run_policy`` override: pre-flight world check + graceful stop.
 
@@ -5423,6 +5587,13 @@ class MuJoCoSimEngine(
         validates it against the closed predicate registry; see its docstring
         for the schema and the ``stopped_reason`` telemetry contract.
         """
+        # This override claims the robot before delegating to the base facade,
+        # so it must enforce the shared observer domain first. An invalid
+        # callback is configuration, not a rollout, and must not inspect the
+        # world, resolve a robot, or raise ``policy_running``.
+        if observer_error := optional_callable_error(observer, "observer", "run_policy"):
+            return {"status": "error", "content": [{"text": observer_error}]}
+
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
 
@@ -5457,6 +5628,7 @@ class MuJoCoSimEngine(
             rtc_inference_timeout_s=rtc_inference_timeout_s,
             wbc_install_torque_control=wbc_install_torque_control,
             stop_when=stop_when,
+            observer=observer,
         )
 
     def run_multi_policy(
@@ -6243,16 +6415,17 @@ class MuJoCoSimEngine(
         if self._world is None or not registered(self._world.robots, robot_name):
             return {"status": "error", "content": [{"text": self._unknown_robot_msg(robot_name)}]}
         robot = self._world.robots[robot_name]
-        # Answer from the same source :meth:`list_policies_running` answers
-        # from, not from the flag alone. A rollout is in flight from the moment
-        # its Future is registered, and the two surfaces reported opposite facts
-        # about the same instant while the flag was still down (#2833). The flag
-        # is now raised by the launcher, so the union only widens the answer at
-        # the tail of a rollout whose Future has not yet been pruned - where
-        # "there was one" is still the honest reading.
+        # Read the population :meth:`_active_policy_robots` owns instead of
+        # re-deriving it: both rollout shapes count, and that verb is where both
+        # are spelled. This surface used to be the only one that unioned the
+        # per-robot claim in, which is why it and :meth:`list_policies_running`
+        # reported opposite facts about a blocking rollout at the same instant
+        # (#2833).
         was_running = robot_name in self._active_policy_robots()
         # Durable: moves this robot's claim out of date, so a worker that has
-        # not yet reached its first frame cannot raise the flag back over it.
+        # not yet reached its first frame cannot raise the flag back over it. Its
+        # own return stays in the OR because the claim can be raised in the
+        # window between the read above and this write.
         was_running = robot.request_policy_stop() or was_running
         msg = f"Stopped on '{robot_name}'" if was_running else f"Was not running on '{robot_name}'"
         # The verdict travels as data as well as prose. A programmatic caller -

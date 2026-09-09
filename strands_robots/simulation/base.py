@@ -50,12 +50,14 @@ if TYPE_CHECKING:
 # AST). Instead, we reference ``OnFrame`` in the ``evaluate_benchmark``
 # signature as a *string* annotation; ``from __future__ import
 # annotations`` (already in effect) makes that a no-op at runtime.
+from strands_robots.simulation.observers import RunPolicyObserver
 from strands_robots.simulation.policy_runner import PolicyRunner, VideoConfig
 from strands_robots.utils import (
     FREE_CAMERA_TOKENS,
     dds_domain_id_error,
     is_boolean,
     non_negative_count_error,
+    optional_callable_error,
     positive_count_error,
     positive_finite_number_error,
     process_rss_mb,
@@ -1284,34 +1286,6 @@ class SimEngine(ABC):
         except ValueError as e:
             return {"status": "error", "content": [{"text": str(e)}]}
         return None
-
-    def _unresolvable_policy_provider_error(
-        self,
-        policy_provider: str,
-        policy_config: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        """Report an unresolvable ``policy_provider`` as a structured error.
-
-        For surfaces that cannot use :meth:`_preflight_policy_config` because
-        they build the policy elsewhere -- notably a ``start_policy`` that
-        submits the rollout to a worker thread -- this gives the same verdict
-        synchronously, so the caller is refused instead of being told a
-        rollout started that could never build its policy.
-
-        Args:
-            policy_provider: Provider name / smart string.
-            policy_config: Provider kwargs (the policy_config).
-
-        Returns:
-            A ``status=error`` dict when the provider cannot be resolved;
-            ``None`` when it resolves.
-        """
-        from strands_robots.policies import policy_provider_error
-
-        reason = policy_provider_error(policy_provider, **(policy_config or {}))
-        if reason is None:
-            return None
-        return {"status": "error", "content": [{"text": reason}]}
 
     # Object management
 
@@ -2654,6 +2628,7 @@ class SimEngine(ABC):
         rtc_inference_timeout_s: float | None = None,
         wbc_install_torque_control: bool = True,
         stop_when: dict[str, Any] | Callable[[SimEngine], bool] | None = None,
+        observer: RunPolicyObserver | None = None,
     ) -> dict[str, Any]:
         """Run a policy loop in the simulation (blocking).
 
@@ -2866,6 +2841,32 @@ class SimEngine(ABC):
                 dict (the tool surface accepts dicts only). ``None`` (default)
                 keeps the pure step-budget horizon. The result json reports
                 why the rollout ended via ``stopped_reason``.
+            observer: Optional read-only rollout observer, forwarded verbatim to
+                :meth:`PolicyRunner.run`. Receives one
+                :class:`~strands_robots.simulation.observers.RunPolicyStarted`,
+                one :class:`~strands_robots.simulation.observers.RunPolicyStep`
+                per completed ``send_action`` call and one
+                :class:`~strands_robots.simulation.observers.RunPolicyEnded`,
+                carrying the per-key ``send_action`` verdict, authoritative
+                ``observation_age_steps`` (with the narrower
+                ``observation_is_chunk_reused`` chunk-position flag), and what
+                the backend's own ``on_frame`` hook did. Must be ``None`` or
+                callable; another value is refused before policy construction,
+                backend hook creation, or rollout side effects.
+
+                This is a SECOND lane, not the backend's hook: the hook slot is
+                filled from ``_make_run_policy_hook`` (cancellation, trajectory,
+                mesh telemetry, dataset recording) and is not available to
+                callers, which is exactly why a read-only consumer needs this.
+                Installing one changes neither the actions applied nor any
+                existing field of the result json; it adds
+                ``observer_failures``. With ``n_episodes > 1`` each episode is
+                its own lifecycle with its own ``run_id``. Called synchronously,
+                so a blocking observer blocks the rollout, and payloads are
+                borrowed rather than copied - see
+                :mod:`strands_robots.simulation.observers` for the ownership
+                rules. Not yet wired into ``eval_policy``,
+                ``evaluate_benchmark`` or ``run_multi_policy``.
 
         Returns:
             The standard agent-tool envelope
@@ -2890,8 +2891,11 @@ class SimEngine(ABC):
             operational), so ``status`` alone cannot see it: a policy driving 1
             of a Panda's 8 actuators returns ``status="success"`` with
             ``action_errors=0`` and ``partial_action_failure_rate=0.875``. Gate
-            on ``partial_action_failure_rate`` and the binding-degradation
-            flags below to decide whether a rollout is worth anything. A TOTAL
+            on ``action_errors``, ``partial_action_failure_rate`` and the
+            binding-degradation flags below to decide whether a rollout is worth
+            anything. Coarse backend errors remain in ``action_errors`` but are
+            excluded from action-rate denominators rather than fabricated as
+            confirmed misses. A TOTAL
             failure - no emitted key resolving to any actuator - is reported as
             ``status="error"``.
 
@@ -2909,13 +2913,16 @@ class SimEngine(ABC):
             ``stop_policy``; ``"error"`` on error results - so an agent
             deciding whether to retry knows WHY the rollout ended).
 
-            Action health: ``action_errors`` (steps where at least one emitted
-            key did not resolve), ``action_resolution_rate`` (an
-            ``{actuator_name: fraction_of_steps_driven}`` map, so a joint stuck
-            at ``0.0`` names the actuator the policy never drove) and
-            ``partial_action_failure_rate`` (the mean fraction of the robot's
-            DOF never driven; ``0.0`` == every actuator moved every step,
-            ``~0.83`` == only 1 of 6 actuators ever moved).
+            Action health: ``action_errors`` (steps where the backend reported
+            an error), ``action_resolution_rate`` (an
+            ``{actuator_name: fraction_of_resolution-known_steps_driven}`` map,
+            so a joint stuck at ``0.0`` names an actuator not confirmed on any
+            known step) and ``partial_action_failure_rate`` (the mean fraction
+            of the robot's DOF not confirmed driven across those known steps;
+            ``0.0`` == every actuator confirmed every known step, ``~0.83`` ==
+            only 1 of 6). A coarse backend error is excluded from both rate
+            denominators instead of being counted as a physical miss; it remains
+            visible in ``action_errors`` and the human-readable diagnostic.
 
             Video: ``video_path`` (``None`` when no MP4 was written),
             ``video_frames`` and ``video_fps`` (the rate the MP4 plays at -
@@ -2974,6 +2981,11 @@ class SimEngine(ABC):
             surfaced via ``partial_action_failure_rate``.
         """
         from strands_robots.policies import create_policy
+
+        # Refuse a value outside the observer's domain before robot discovery,
+        # policy construction, backend hook creation, clocks, or rollout work.
+        if observer_error := optional_callable_error(observer, "observer", "run_policy"):
+            return {"status": "error", "content": [{"text": observer_error}]}
 
         robot_name = self._resolve_single_robot(robot_name)
 
@@ -3137,6 +3149,7 @@ class SimEngine(ABC):
                         fast_mode=fast_mode,
                         video=VideoConfig.from_dict(video),
                         on_frame=on_frame,
+                        observer=observer,
                         max_onframe_failures=max_onframe_failures,
                         control_substeps=control_substeps,
                         policy_kwargs=policy_kwargs,
@@ -3178,6 +3191,7 @@ class SimEngine(ABC):
                 async_rtc=async_rtc,
                 rtc_inference_timeout_s=rtc_inference_timeout_s,
                 stop_when=stop_when_fn,
+                observer=observer,
             )
         finally:
             if controller_cleanup is not None:
@@ -3484,6 +3498,7 @@ class SimEngine(ABC):
         async_rtc: bool | None = None,
         rtc_inference_timeout_s: float | None = None,
         stop_when: Callable[[SimEngine], bool] | None = None,
+        observer: RunPolicyObserver | None = None,
     ) -> dict[str, Any]:
         """Run ``n_episodes`` sequential rollouts; shared multi-episode driver.
 
@@ -3521,6 +3536,7 @@ class SimEngine(ABC):
                     fast_mode=fast_mode,
                     video=ep_video,
                     on_frame=on_frame,
+                    observer=observer,
                     max_onframe_failures=max_onframe_failures,
                     control_substeps=control_substeps,
                     policy_kwargs=policy_kwargs,
@@ -4043,11 +4059,24 @@ class SimEngine(ABC):
         policy_kwargs: dict[str, Any] | None = None,
         seed: int | None = None,
     ) -> dict[str, Any]:
-        """Start policy execution in a background thread (non-blocking).
+        """Run a policy rollout, in the background where the backend has one.
 
-        Default implementation: synchronous passthrough to ``run_policy``.
-        Backends that support true background execution (like MuJoCo via
-        its ``ThreadPoolExecutor``) should override.
+        DEFAULT IMPLEMENTATION IS SYNCHRONOUS: it passes through to
+        :meth:`run_policy` and returns only after the rollout has finished, so
+        its result reports a COMPLETED rollout ("Policy complete on ...") and
+        the call blocks for the whole ``duration``. The summary line used to
+        promise a background thread outright, which is what MuJoCo's override
+        does, not what a caller of this default gets - and the two backends
+        shipped on this default are the ones whose callers most need to know.
+        Backends with true background execution override this (MuJoCo, via the
+        ``ThreadPoolExecutor`` it owns) and return as soon as the rollout is
+        submitted.
+
+        Either way :meth:`stop_policy` is the counterpart, and a caller can tell
+        which of the two it holds without reading the source: this method's
+        entry in :meth:`describe` states which one this engine implements, and a
+        backend that also tracks rollouts in flight advertises
+        ``list_policies_running`` there beside it.
 
         accepts ``n_steps`` (primary) or legacy ``max_steps`` as an
         alternate to ``duration``. See ``run_policy`` for conversion rules.
@@ -4071,6 +4100,115 @@ class SimEngine(ABC):
             policy_kwargs=policy_kwargs,
             seed=seed,
         )
+
+    def stop_policy(self, robot_name: str = "") -> dict[str, Any]:
+        """Stop ``robot_name``'s rollout (cooperative) and report what was in flight.
+
+        The counterpart to :meth:`start_policy`, and the verb that OWNS the
+        question "was a rollout halted" for every backend. It lived only on the
+        MuJoCo engine, so on the other backends the attribute did not exist at
+        all: :meth:`~strands_robots.mesh.Mesh._dispatch` probes for it with
+        ``hasattr`` and answered "peer exposes no stop_task" for a sim it could
+        in fact have stopped, and the Device Connect ``stop`` RPC re-derived the
+        answer inline from the per-robot flag - a second construction of the
+        verdict that
+        :meth:`~strands_robots.simulation.models.SimRobot.request_policy_stop`
+        exists to prevent ("EVERY stop path goes through here ... so they cannot
+        drift to different answers about whether a rollout was halted"). This is
+        the same promotion :meth:`run_multi_policy` had (#2157): a capability
+        every backend is asked for answers in the tool envelope on all of them,
+        never with ``AttributeError`` because there was no contract.
+
+        The flag write itself is backend-owned, because the per-robot rollout
+        claim is: :meth:`_request_policy_stop` is the seam, the mirror of the
+        :meth:`_make_run_policy_hook` / :meth:`_release_run_policy_hook` pair
+        that raises and lowers the same flag around a rollout driven here.
+
+        This is a cooperative stop, not a join: it moves the robot's claim out
+        of date so the rollout's next frame ends it. It cannot interrupt a
+        rollout that is blocked inside a single ``send_action`` or a single
+        policy inference, and on a backend whose :meth:`start_policy` is the
+        synchronous default the caller's own thread is the one inside the
+        rollout - so the callers that reach this verb usefully are the ones on
+        another thread (the Device Connect ``stop`` RPC and the mesh fanout).
+
+        Args:
+            robot_name: The robot whose rollout to stop. Required: an empty name
+                is refused rather than silently matched against the sole robot,
+                because a stop aimed at the wrong robot reads as a stop that
+                worked.
+
+        Returns:
+            The agent-tool envelope. On success the ``json`` block reports
+            ``was_running`` - whether a rollout really was in flight when the
+            stop arrived - so a caller aggregating several answers reads the
+            verdict rather than matching on the sentence. Idempotent: a robot
+            with nothing running is ``status="success"`` with
+            ``was_running=False``, so a caller may stop unconditionally.
+            ``status="error"`` for an empty or unknown ``robot_name``, and for a
+            backend that keeps no durable per-robot claim to move - that refusal
+            names the class, because "nothing was running" would be an
+            affirmative answer given on no evidence. Isaac is on that default
+            today: its per-robot record carries a bare ``policy_running`` flag
+            and not the durable counter, and a bare flag write is the exact
+            thing a worker that has not reached its first frame overwrites
+            (#2833), so it refuses rather than reporting a stop it cannot keep.
+        """
+        if not robot_name:
+            return {"status": "error", "content": [{"text": "stop_policy requires 'robot_name'."}]}
+        if robot_name not in self.list_robots():
+            return {"status": "error", "content": [{"text": self._unknown_robot_msg(robot_name)}]}
+        was_running = self._request_policy_stop(robot_name)
+        if was_running is None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"{type(self).__name__} keeps no durable per-robot rollout claim, so a "
+                            f"rollout in flight on '{robot_name}' cannot be stopped cooperatively "
+                            "and this call reports nothing about one. Bound the rollout instead of "
+                            "stopping it: run_policy(n_steps=...) caps its length, and "
+                            "run_policy(stop_when={'predicate': ...}) ends it as soon as the world "
+                            "reaches a state. A backend whose per-robot record carries the durable "
+                            "claim (SimRobot.request_policy_stop) makes this verb work by "
+                            "overriding _request_policy_stop."
+                        )
+                    }
+                ],
+            }
+        msg = f"Stopped on '{robot_name}'" if was_running else f"Was not running on '{robot_name}'"
+        return {
+            "status": "success",
+            "content": [{"text": msg}, {"json": {"robot": robot_name, "was_running": was_running}}],
+        }
+
+    def _request_policy_stop(self, robot_name: str) -> bool | None:
+        """Move ``robot_name``'s rollout claim out of date; report what was in flight.
+
+        The backend half of :meth:`stop_policy`, and the third member of the
+        hook seam that owns the per-robot ``policy_running`` flag:
+        :meth:`_make_run_policy_hook` raises it, :meth:`_release_run_policy_hook`
+        lowers it when the rollout ends, and this lowers it when a caller asks
+        for the rollout to end early. A backend that overrides either of those
+        holds a robot registry and should override this too; the write itself
+        belongs to :meth:`~strands_robots.simulation.models.SimRobot.request_policy_stop`
+        so every stop path reports the same fact.
+
+        Args:
+            robot_name: A robot :meth:`list_robots` names, already validated by
+                :meth:`stop_policy`.
+
+        Returns:
+            Whether a rollout was in flight when the stop arrived, or ``None``
+            when this backend keeps no durable claim to move. ``None`` is a stated
+            absence of a verdict, not a ``False``: the tri-state matches
+            :func:`~strands_robots.mesh.core._reported_a_rollout_in_flight`,
+            which reads "reported neither way" as neither, so a backend with
+            nothing to report cannot be quoted as having reported an idle robot.
+            Default: ``None`` - nothing was claimed, so nothing can be released.
+        """
+        return None
 
     def replay_episode(
         self,
@@ -5174,7 +5312,19 @@ class SimEngine(ABC):
                 "'error' on failures) + steps_used so a caller can decide "
                 "whether to retry"
             ),
-            "start_policy": "(robot_name: str, policy_provider='mock', ...) -> dict",
+            "start_policy": (
+                "(robot_name: str, policy_provider='mock', ...) -> dict  # on "
+                "THIS engine it runs the rollout to completion and returns "
+                "its result (synchronous); a backend that runs it in the "
+                "background instead says so here and advertises "
+                "list_policies_running beside it, so this entry is how to "
+                "tell which one you hold"
+            ),
+            "stop_policy": (
+                "(robot_name: str) -> dict  # cooperatively end a rollout "
+                "in flight; the json block reports was_running, and "
+                "robot_name is required (never defaulted to the sole robot)"
+            ),
             "eval_policy": (
                 "(robot_name: str, policy_provider='mock', n_episodes=1, "
                 "max_steps=300, success_fn=None, ...) -> dict  # multi-episode "
