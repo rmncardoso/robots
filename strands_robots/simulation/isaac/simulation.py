@@ -5595,6 +5595,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         rtc_inference_timeout_s: float | None = None,
         wbc_install_torque_control: bool = True,
         stop_when: Any = None,
+        observer: Any = None,
     ) -> dict[str, Any]:
         """Drive a single-robot rollout, then release the robot.
 
@@ -5668,6 +5669,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             rtc_inference_timeout_s: forwarded unchanged.
             wbc_install_torque_control: forwarded unchanged.
             stop_when: forwarded unchanged.
+            observer: forwarded unchanged.
 
         Returns:
             Whatever :meth:`SimEngine.run_policy` returns, unchanged.
@@ -5696,6 +5698,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                 rtc_inference_timeout_s=rtc_inference_timeout_s,
                 wbc_install_torque_control=wbc_install_torque_control,
                 stop_when=stop_when,
+                observer=observer,
             )
         finally:
             # Lower it for whichever robot the rollout actually resolved to, not

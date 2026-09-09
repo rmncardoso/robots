@@ -274,6 +274,12 @@ class TestNoObserverSurfaceAcceptsTheLaneAndDropsIt:
             "base.py::SimEngine.run_policy",
             "policy_runner.py::PolicyRunner.run",
             "simulation.py::MuJoCoSimEngine.run_policy",
+            # The fourth surface this docstring anticipated. Isaac overrides
+            # run_policy to lower ``policy_running`` in a ``finally``, so the lane
+            # has to be threaded through that override too - and measured, nothing
+            # else pins it: accepting ``observer`` and dropping it leaves all 2810
+            # Isaac tests green, because the drop is silent rather than a TypeError.
+            "simulation.py::IsaacSimulation.run_policy",
         }
 
     def test_every_surface_consumes_or_forwards_the_lane(self) -> None:
