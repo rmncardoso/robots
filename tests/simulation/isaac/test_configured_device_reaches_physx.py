@@ -225,7 +225,8 @@ class TestTheResolverNeverRaises:
         assert _resolver()(types.SimpleNamespace()) is None
 
     def test_a_physics_context_without_a_device_answers_none(self) -> None:
-        world = types.SimpleNamespace(get_physics_context=lambda: types.SimpleNamespace())
+        context = types.SimpleNamespace()  # a physics context declaring no device
+        world = types.SimpleNamespace(get_physics_context=lambda: context)
 
         assert _resolver()(world) is None
 

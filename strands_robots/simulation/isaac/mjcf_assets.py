@@ -316,4 +316,13 @@ def _remove_tree(path: str) -> None:
         try:
             os.unlink(path)
         except OSError:
+            # Best-effort, and not silent where it would matter. The only
+            # caller that removes something load-bearing is the
+            # ``_remove_tree(target_root)`` immediately above ``os.replace``,
+            # and a removal that did not happen is reported there rather than
+            # here: renaming the staging directory onto a surviving file raises
+            # ``NotADirectoryError``, and onto a surviving directory raises
+            # ``OSError`` (``ENOTEMPTY``). Every other caller passes a staging
+            # entry, where a failed unlink leaks a temp path instead of
+            # corrupting the cache - the distinction this helper exists to keep.
             pass

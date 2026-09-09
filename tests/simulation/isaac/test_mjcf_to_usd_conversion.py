@@ -24,8 +24,12 @@ grade the caching and the failure handling, and the real one is exercised on GPU
 
 from __future__ import annotations
 
+import ast
+import errno
+import inspect
 import os
 import sys
+import textwrap
 import types
 from typing import Any
 
@@ -33,6 +37,7 @@ import pytest
 
 pytest.importorskip("strands_robots.simulation.isaac")
 
+from strands_robots.simulation.isaac import mjcf_assets  # noqa: E402
 from strands_robots.simulation.isaac.mjcf_assets import (  # noqa: E402
     MJCF_EXTENSIONS,
     USD_EXTENSIONS,
@@ -298,3 +303,90 @@ class TestTheCacheLocation:
     def test_it_honours_the_base_dir(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("STRANDS_BASE_DIR", str(tmp_path))
         assert str(tmp_path) in robot_usd_cache_dir()
+
+
+class TestTheToleratedUnlinkIsSafeBecauseTheRenameRefuses:
+    """``_remove_tree`` swallows ``OSError`` from ``os.unlink``, and that is only
+    sound while the one removal that is load-bearing stays in front of the rename.
+
+    Three of its four callers pass ``staging``, where a failed unlink leaks a temp
+    path. The fourth passes ``target_root`` - the real cache entry the conversion is
+    about to move into place - and tolerating *that* failure is safe only because
+    ``os.replace`` immediately after it refuses to rename onto an entry that is
+    still there, which ``convert_mjcf_to_usd`` already states at the top of the
+    staging block. These cells pin that reason so the tolerance cannot outlive it.
+
+    Scoped to this handler rather than to the tree: the package holds many
+    tolerated swallows and their reasons are not one idiom, so a tree-wide rule
+    here would demand a comment it cannot state on any of them.
+    """
+
+    def _handler_of_remove_tree(self) -> tuple[ast.ExceptHandler, list[str]]:
+        source = inspect.getsource(mjcf_assets._remove_tree)
+        handlers = [
+            node for node in ast.walk(ast.parse(textwrap.dedent(source))) if isinstance(node, ast.ExceptHandler)
+        ]
+        assert len(handlers) == 1, f"_remove_tree's shape changed: {len(handlers)} handlers"
+        return handlers[0], source.splitlines()
+
+    def test_the_handler_says_why_it_tolerates_the_failure(self) -> None:
+        """``py/empty-except`` is deliberately not filtered in
+        ``.github/codeql/codeql-config.yml``: a swallowed exception hides a bug
+        unless the swallow is argued, so this one has to carry its argument."""
+        handler, lines = self._handler_of_remove_tree()
+
+        assert len(handler.body) == 1 and isinstance(handler.body[0], ast.Pass)
+        window = lines[handler.lineno - 1 : handler.body[0].lineno]
+        assert any("#" in line for line in window), (
+            "the tolerated unlink in _remove_tree carries no reason, so a reader "
+            "cannot tell a considered tolerance from a swallowed bug"
+        )
+
+    def test_the_load_bearing_removal_is_the_statement_before_the_rename(self) -> None:
+        """The tolerance rests on this adjacency, so the adjacency is pinned."""
+        module = ast.parse(inspect.getsource(mjcf_assets))
+        convert = next(
+            node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "convert_mjcf_to_usd"
+        )
+        removals = [
+            index
+            for index, statement in enumerate(convert.body)
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and getattr(statement.value.func, "id", None) == "_remove_tree"
+            and statement.value.args
+            and getattr(statement.value.args[0], "id", None) == "target_root"
+        ]
+        assert len(removals) == 1, f"expected one target_root removal, found {len(removals)}"
+
+        following = convert.body[removals[0] + 1]
+        assert isinstance(following, ast.Expr) and isinstance(following.value, ast.Call)
+        assert ast.unparse(following.value).startswith("os.replace("), ast.unparse(following)
+
+    def test_a_surviving_file_makes_the_rename_refuse(self, tmp_path) -> None:
+        """If the unlink of a file at ``target_root`` failed, the rename reports it."""
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "probe.usda").write_text("#usda 1.0\n", encoding="utf-8")
+        target = tmp_path / "entry"
+        target.write_text("a file where the cache entry belongs", encoding="utf-8")
+
+        with pytest.raises(NotADirectoryError):
+            os.replace(str(staging), str(target))
+
+        assert target.read_text(encoding="utf-8") == "a file where the cache entry belongs"
+
+    def test_a_surviving_directory_makes_the_rename_refuse(self, tmp_path) -> None:
+        """And if ``rmtree(ignore_errors=True)`` left anything behind, likewise."""
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        (staging / "probe.usda").write_text("#usda 1.0\n", encoding="utf-8")
+        target = tmp_path / "entry"
+        target.mkdir()
+        (target / "leftover").write_text("survived the rmtree", encoding="utf-8")
+
+        with pytest.raises(OSError) as exc:
+            os.replace(str(staging), str(target))
+
+        assert exc.value.errno == errno.ENOTEMPTY
+        assert (target / "leftover").read_text(encoding="utf-8") == "survived the rmtree"

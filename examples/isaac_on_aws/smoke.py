@@ -230,7 +230,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    code = 1
     try:
         main()
     except BaseException:
