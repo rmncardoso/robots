@@ -299,11 +299,15 @@ class TestNarrowingStaysHonest:
     def test_newton_hides_only_verbs_it_does_not_implement(self) -> None:
         sim = _live_engine("newton")
         try:
-            hidden = sorted(set(_declared_base_methods()) - set(sim.describe()["methods"]))
+            methods = sim.describe()["methods"]
+            hidden = sorted(set(_declared_base_methods()) - set(methods))
             assert hidden == ["get_contacts", "load_scene"], f"the hidden set moved: {hidden}"
             with pytest.raises(NotImplementedError):
                 sim.get_contacts()
             with pytest.raises(NotImplementedError):
                 sim.load_scene("/nonexistent/scene.xml")
+            # Non-vacuity: an empty or collapsed mapping would satisfy the rule
+            # above by hiding everything, so name a verb that must be present.
+            assert "list_policies_running" in methods
         finally:
             sim.destroy()
