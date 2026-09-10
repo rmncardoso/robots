@@ -62,6 +62,8 @@ from strands_robots.utils import (
     positive_count_error,
     positive_finite_number_error,
     process_rss_mb,
+    refusal_container_repr,
+    refusal_repr,
     sequence_length,
 )
 
@@ -492,7 +494,11 @@ def _boolean_world_error(method: str, param: str, value: Any) -> dict[str, Any]:
     return {
         "status": "error",
         "content": [
-            {"text": (f"{method}: '{param}' must be a number, not a bool (got {value!r}). {_BOOLEAN_WORLD_REASON}")}
+            {
+                "text": (
+                    f"{method}: '{param}' must be a number, not a bool (got {refusal_repr(value)}). {_BOOLEAN_WORLD_REASON}"
+                )
+            }
         ],
     }
 
@@ -523,7 +529,7 @@ def randomization_range_error(value: Any, param: str, *, allow_zero: bool = True
     """
     # The unpack and the coercion are separate steps so the boolean check can sit
     # between them; both report the same thing to the caller.
-    not_a_pair = f"{param} must be a (lo, hi) pair of numbers, got {value!r}"
+    not_a_pair = f"{param} must be a (lo, hi) pair of numbers, got {refusal_container_repr(value)}"
     try:
         lo, hi = value
     except (TypeError, ValueError):
@@ -532,25 +538,27 @@ def randomization_range_error(value: Any, param: str, *, allow_zero: bool = True
     # (erases the quantity it multiplies), and the sampler cannot tell either
     # from a deliberate one once coerced.
     if is_boolean(lo) or is_boolean(hi):
-        return f"{param} bounds must be numbers, not bools (got {value!r}). {_BOOLEAN_WORLD_REASON}"
+        return (
+            f"{param} bounds must be numbers, not bools (got {refusal_container_repr(value)}). {_BOOLEAN_WORLD_REASON}"
+        )
     try:
         lo, hi = float(lo), float(hi)
     except (TypeError, ValueError):
         return not_a_pair
     if not (math.isfinite(lo) and math.isfinite(hi)):
-        return f"{param} bounds must be finite, got {value!r}"
+        return f"{param} bounds must be finite, got {refusal_container_repr(value)}"
     if lo > hi:
         return f"{param} lower bound {lo} exceeds upper bound {hi}"
     if allow_zero:
         if lo < 0:
-            return f"{param} bounds must be non-negative, got {value!r}"
+            return f"{param} bounds must be non-negative, got {refusal_container_repr(value)}"
     elif lo <= 0:
         detail = (
             "a zero scale erases the quantity it multiplies"
             if lo == 0
             else "a negative scale flips the sign of the quantity it multiplies"
         )
-        return f"{param} bounds must be positive, got {value!r} ({detail})"
+        return f"{param} bounds must be positive, got {refusal_container_repr(value)} ({detail})"
     return None
 
 
@@ -580,13 +588,13 @@ def finite_non_negative_error(value: Any, param: str, context: str) -> str | Non
     # not a flag disabling the noise, which is what a caller passing True
     # would most plausibly have meant.
     if is_boolean(value):
-        return f"{context}: {param} must be a number, not a bool (got {value!r}). {_BOOLEAN_WORLD_REASON}"
+        return f"{context}: {param} must be a number, not a bool (got {refusal_repr(value)}). {_BOOLEAN_WORLD_REASON}"
     try:
         fvalue = float(value)
     except (TypeError, ValueError):
-        return f"{context}: {param} must be a number, got {value!r}"
+        return f"{context}: {param} must be a number, got {refusal_repr(value)}"
     if not math.isfinite(fvalue) or fvalue < 0:
-        return f"{context}: {param} must be a finite non-negative number, got {value!r}"
+        return f"{context}: {param} must be a finite non-negative number, got {refusal_repr(value)}"
     return None
 
 
@@ -696,12 +704,12 @@ def randomization_seed_error(
             "is a global side effect an unseeded rollout must not acquire."
         )
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        return f"{context}: seed must be a non-negative integer{none_clause}, got {value!r}{entropy_hint}"
+        return f"{context}: seed must be a non-negative integer{none_clause}, got {refusal_repr(value)}{entropy_hint}"
     if int(value) < 0:
-        return f"{context}: seed must be a non-negative integer{none_clause}, got {value!r}{entropy_hint}"
+        return f"{context}: seed must be a non-negative integer{none_clause}, got {refusal_repr(value)}{entropy_hint}"
     if max_seed is not None and int(value) > max_seed:
         return (
-            f"{context}: seed must be an integer in [0, {max_seed}]{none_clause}, got {value!r} "
+            f"{context}: seed must be an integer in [0, {max_seed}]{none_clause}, got {refusal_repr(value)} "
             "(a rollout seed is applied to the legacy NumPy global RNG, which refuses a larger value)"
         )
     return None
@@ -742,7 +750,11 @@ def _non_finite_action_error(label: str, value: Any) -> dict[str, Any] | None:
     return {
         "status": "error",
         "content": [
-            {"text": (f"send_action: {label} must be finite (no nan/inf), got {value!r}. {_NON_FINITE_ACTION_REASON}")}
+            {
+                "text": (
+                    f"send_action: {label} must be finite (no nan/inf), got {refusal_repr(value)}. {_NON_FINITE_ACTION_REASON}"
+                )
+            }
         ],
     }
 
@@ -811,7 +823,11 @@ def _boolean_action_error(label: str, value: Any) -> dict[str, Any] | None:
     return {
         "status": "error",
         "content": [
-            {"text": (f"send_action: {label} must be a number, not a bool (got {value!r}). {_BOOLEAN_ACTION_REASON}")}
+            {
+                "text": (
+                    f"send_action: {label} must be a number, not a bool (got {refusal_repr(value)}). {_BOOLEAN_ACTION_REASON}"
+                )
+            }
         ],
     }
 
@@ -2204,7 +2220,7 @@ class SimEngine(ABC):
             A structured ``{"status": "error", ...}`` dict to surface, or
             ``None`` when the value is usable.
         """
-        message = f"{method}: {param} must be a finite positive number, got {timestep!r}."
+        message = f"{method}: {param} must be a finite positive number, got {refusal_repr(timestep)}."
         # is_boolean, not isinstance(timestep, bool): numpy.bool_ is not a bool
         # subclass, so the narrower check refused a hand-typed True and admitted
         # the np.True_ a comparison produces - a 1-second dt under success.
@@ -2256,7 +2272,7 @@ class SimEngine(ABC):
         except (TypeError, ValueError):
             return {
                 "status": "error",
-                "content": [{"text": f"{method}: '{param}' must be a positive number, got {mass!r}"}],
+                "content": [{"text": f"{method}: '{param}' must be a positive number, got {refusal_repr(mass)}"}],
             }
         if not math.isfinite(value) or value <= 0:
             return {
