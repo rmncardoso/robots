@@ -2629,10 +2629,11 @@ class MuJoCoSimEngine(
     def bind_policy_sim_context(self, policy: Any, robot_name: str) -> None:
         """Hand the compiled MjModel + robot namespace to policies that opt in.
 
-        Enables zero-config IK for eef/cartesian-delta policies (e.g.
-        ``VeraPolicy``): the policy auto-discovers its end-effector frame from
-        the model scoped to this robot's namespace. No-op for policies without
-        ``set_sim_context``; never fails a rollout on a binding error.
+        Enables zero-config IK for an eef/cartesian-delta policy: the policy
+        auto-discovers its end-effector frame from the model scoped to this
+        robot's namespace. No-op for policies without ``set_sim_context``, which
+        is every shipped provider today; never fails a rollout on a binding
+        error.
         """
         ctx = getattr(policy, "set_sim_context", None)
         if not callable(ctx):
@@ -5025,6 +5026,22 @@ class MuJoCoSimEngine(
         )
         return names
 
+    def _rollouts_in_flight(self) -> tuple[str, ...]:
+        """MuJoCo override: the population :meth:`_active_policy_robots` owns.
+
+        The base seam every remote reader asks
+        (:meth:`~strands_robots.simulation.base.SimEngine._rollouts_in_flight`),
+        answered by delegation rather than by a second walk of the registry:
+        the union of the Future table and the per-robot claim is spelled once,
+        in :meth:`_active_policy_robots`, and the two-sources drift that method
+        documents is exactly what a re-derivation here would reintroduce.
+
+        Returns:
+            The names, never ``None``: this engine always holds the registry, so
+            an empty result really does mean nothing is in flight.
+        """
+        return tuple(self._active_policy_robots())
+
     def _active_rollout_rates(self) -> dict[str, float]:
         """Capture rate of every ``start_policy`` rollout still in flight.
 
@@ -6449,26 +6466,6 @@ class MuJoCoSimEngine(
         return {
             "status": "success",
             "content": [{"text": msg}, {"json": {"robot": robot_name, "was_running": was_running}}],
-        }
-
-    def list_policies_running(self) -> dict[str, Any]:
-        """Return the names of robots currently running a policy.
-
-        Useful for inspecting concurrent-policy state when running two or
-        more VLA arms in the same scene (GH #114). Always returns a
-        success dict so the LLM can parse it uniformly. Prunes stale
-        completed Future entries as a side effect.
-        """
-        active = self._active_policy_robots()
-        if not active:
-            return {
-                "status": "success",
-                "content": [{"text": "No policies running."}],
-            }
-        robot_lines = "\n".join(f"  - {n}" for n in active)
-        return {
-            "status": "success",
-            "content": [{"text": f"Active policies ({len(active)}):\n{robot_lines}"}],
         }
 
     # Cleanup

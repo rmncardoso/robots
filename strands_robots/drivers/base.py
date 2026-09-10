@@ -53,10 +53,11 @@ interpreted by the driver that receives it.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
     from strands.types.tools import ToolSpec, ToolUse
 
@@ -219,6 +220,13 @@ DRIVER_CHOICES = ("auto", DEFAULT_DRIVER, "strands")
 DRIVER_SURFACE: tuple[str, ...] = tuple(sorted(name for name in dir(HardwareDriver) if not name.startswith("_")))
 
 
+#: Stand-in receiver for binding an *unbound* verb in
+#: :func:`drifted_driver_parameters`. Binding a signature that still declares
+#: ``self`` needs something in that slot, and it is never called or read - a
+#: driver class is graded before any instance of it exists.
+_UNBOUND_SELF = object()
+
+
 def missing_driver_members(candidate: object) -> tuple[str, ...]:
     """Report which :data:`DRIVER_SURFACE` members ``candidate`` does not have.
 
@@ -236,6 +244,55 @@ def missing_driver_members(candidate: object) -> tuple[str, ...]:
         satisfies the whole surface.
     """
     return tuple(name for name in DRIVER_SURFACE if not hasattr(candidate, name))
+
+
+def drifted_driver_parameters(candidate: object) -> tuple[tuple[str, str], ...]:
+    """Report verbs whose parameters ``candidate`` spells differently from the Protocol.
+
+    :func:`missing_driver_members` answers whether the *names on the class* are
+    all there, and that is all it can answer: it is ``hasattr``, so a driver
+    that renames a documented parameter satisfies it completely. A driver is
+    invoked as an agent tool, and a dispatcher that spells the contract's own
+    parameter names as keywords is the ordinary caller - so a renamed parameter
+    is not a style difference, it is a ``TypeError`` raised past dispatch in
+    place of the status envelope every verb here promises to return.
+
+    The check is the call a conforming caller makes: bind every parameter
+    :class:`HardwareDriver` declares for the verb, by keyword. That admits the
+    freedoms a driver legitimately has - extra parameters of its own, its own
+    ordering, absorbing the ones it ignores in ``**kwargs`` - and refuses only
+    the one thing no caller can work around, a required parameter reachable
+    solely under a name the contract does not document.
+
+    Args:
+        candidate: A driver class or a built driver instance.
+
+    Returns:
+        ``(verb, reason)`` pairs in sorted order, ``reason`` being the binding
+        failure; empty when every verb accepts the contract's own spelling.
+    """
+    drifted: list[tuple[str, str]] = []
+    for verb in DRIVER_SURFACE:
+        declared = getattr(HardwareDriver, verb, None)
+        implemented = getattr(candidate, verb, None)
+        if not callable(declared) or not callable(implemented):
+            continue
+        try:
+            contract = inspect.signature(declared)
+            actual = inspect.signature(implemented)
+        except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
+            continue
+        keywords = {
+            name: None
+            for name, parameter in contract.parameters.items()
+            if name != "self" and parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+        }
+        bound = actual.parameters.get("self") is not None
+        try:
+            actual.bind(*((_UNBOUND_SELF,) if bound else ()), **keywords)
+        except TypeError as e:
+            drifted.append((verb, str(e)))
+    return tuple(sorted(drifted))
 
 
 def halt_failure_detail(envelope: dict[str, Any]) -> str | None:
@@ -326,3 +383,136 @@ def undeclared_verb_error(driver: Any, action: Any) -> dict[str, Any]:
             }
         ],
     }
+
+
+#: The bytes-like types a vector telemetry field must never be read through.
+#: Every one of them iterates - as integers for the buffers, as characters for
+#: ``str`` - so a raw buffer landing on a field declared as a numeric vector
+#: would otherwise decode into a plausible-looking reading of the wrong length
+#: instead of reporting that there is no reading.
+_BYTES_LIKE: tuple[type, ...] = (str, bytes, bytearray, memoryview)
+
+
+def telemetry_float(value: Any) -> float | None:
+    """Coerce one scalar telemetry field to ``float``, or ``None`` if it is no reading.
+
+    Every caller passes ``getattr(msg, <field>, None)`` off a decoded SDK
+    message rather than a typed default, because a firmware revision that
+    renames or drops a field must cost that field and not the whole callback.
+    This is what makes that arrive at the envelope as ``None``: a typed default
+    of ``0.0`` would be indistinguishable from a real zero reading, and raising
+    would lose every other field the same message carries.
+
+    A ``bool`` is refused for the same reason. ``float(True)`` is ``1.0``, which
+    on a state-of-charge field reads as a real one-percent pack - so a field
+    that turned into a flag would report a plausible number rather than an
+    absence.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The reading, or ``None`` when ``value`` is absent or is not numeric.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def telemetry_int(value: Any) -> int | None:
+    """Coerce one scalar telemetry field to ``int``, or ``None`` if it is no reading.
+
+    The integer counterpart of :func:`telemetry_float`, for the fields an IDL
+    declares integer - a battery cycle count, a fan step, a mode enum. Same two
+    rules, and the ``bool`` refusal matters here too: ``int(False)`` is ``0``,
+    which on a cycle count reads as a factory-fresh pack.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The reading, or ``None`` when ``value`` is absent or is not numeric.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def telemetry_float_list(value: Any) -> list[float] | None:
+    """Coerce a vector telemetry field to ``list[float]``, or ``None`` if unusable.
+
+    For the sequence fields - a quaternion, an accelerometer triple, a per-cell
+    temperature vector. Three rules beyond :func:`telemetry_float`'s:
+
+    * A bytes-like value is no reading (:data:`_BYTES_LIKE`), even though it
+      iterates.
+    * All or nothing. A single element that is not a reading discards the whole
+      vector, because half a quaternion is worse than no quaternion - a
+      consumer cannot tell that it is half.
+    * The list is fresh, so a caller mutating the envelope it lands in does not
+      race the callback thread's next write into the same cache.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The vector, or ``None`` when it is absent, not iterable, bytes-like, or
+        holds an element that is not a reading.
+    """
+    return _telemetry_list(value, telemetry_float)
+
+
+def telemetry_int_list(value: Any) -> list[int] | None:
+    """Coerce a vector telemetry field to ``list[int]``, or ``None`` if unusable.
+
+    The integer counterpart of :func:`telemetry_float_list`, for the vectors an
+    IDL declares integer - foot-contact forces, a fan-state vector. Same three
+    rules.
+
+    Args:
+        value: Whatever the field held, already defaulted to ``None`` by the
+            caller's ``getattr``.
+
+    Returns:
+        The vector, or ``None`` when it is absent, not iterable, bytes-like, or
+        holds an element that is not a reading.
+    """
+    return _telemetry_list(value, telemetry_int)
+
+
+def _telemetry_list[T: (float, int)](value: Any, coerce: Callable[[Any], T | None]) -> list[T] | None:
+    """Apply ``coerce`` across a vector field, all or nothing.
+
+    Written once so the two public vector readers cannot drift apart in which
+    values they refuse - the drift this replaced was exactly that, one copy
+    guarding a bytes-like type the other did not.
+
+    Args:
+        value: The field, as the caller's ``getattr`` left it.
+        coerce: :func:`telemetry_float` or :func:`telemetry_int`.
+
+    Returns:
+        A fresh list, or ``None`` per :func:`telemetry_float_list`'s rules.
+    """
+    if value is None or isinstance(value, _BYTES_LIKE):
+        return None
+    try:
+        items = list(value)
+    except TypeError:
+        return None
+    out: list[T] = []
+    for item in items:
+        coerced = coerce(item)
+        if coerced is None:
+            return None
+        out.append(coerced)
+    return out

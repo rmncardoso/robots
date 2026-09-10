@@ -527,7 +527,6 @@ AgentTool returning `{"status", "content"}`.
 | `use_rtps` | Join a ROS 2 graph as a DDS participant - publish/echo topics, act as a robot (pure cyclonedds, no rclpy, all ROS 2 distros) |
 | `gr00t_inference` | Manage NVIDIA GR00T inference services (Docker lifecycle) |
 | `lerobot_camera` | OpenCV / RealSense camera discovery, capture, record |
-| `lerobot_calibrate` | List, view, back up, restore LeRobot calibrations |
 | `lerobot_teleoperate` | Record demonstrations, replay episodes |
 | `pose_tool` | Store, recall, and execute named robot poses |
 | `harness_memory` | Persist task solution traces + global success rules / failure models across agent sessions (Harness-VLA-style memory) |
@@ -608,7 +607,6 @@ create_policy("lerobot/act_aloha_sim_transfer_cube")   # local HF inference
 | `lerobot_local` | HuggingFace | Direct ACT / Pi0 / SmolVLA / Diffusion inference, no server |
 | `lerobot_async` | HuggingFace via gRPC | Offload a LeRobot policy to a remote `PolicyServer` over lerobot's native async-inference gRPC transport (edge/light robot host) |
 | `remote` | any policy, over WebSocket | Drop-in client that forwards observations to a remote `PolicyServer` and returns its action chunk: `create_policy("remote", endpoint="ws://gpu-box:8765")` (or the smart string `create_policy("ws://gpu-box:8765")`). For a light robot host with a GPU box elsewhere; mirrors the server policy's RTC support |
-| `vera` | MIT VERA (DFoT/WAN planner + Jacobian IDM) | Two-stage video-to-action over a WebSocket GPU server (Docker); PushT + MimicGen, IK for eef-delta arms. **Git-only** (not on PyPI, no extra): `pip install 'vera @ git+https://github.com/sizhe-li/VERA.git'` plus `websockets msgpack numpy` |
 
 ```mermaid
 classDiagram

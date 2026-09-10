@@ -1192,11 +1192,13 @@ class SimEngine(ABC):
     def bind_policy_sim_context(self, policy: Any, robot_name: str) -> None:
         """Give a policy the backend sim context it needs to close the loop.
 
-        Default no-op. The MuJoCo engine overrides this to hand policies that
-        opt in (e.g. ``VeraPolicy.set_sim_context``) the compiled ``MjModel`` +
-        the robot's namespace, so eef/cartesian-delta policies can auto-configure
-        their IK end-effector frame with zero manual wiring. Policies that don't
-        expose ``set_sim_context`` are unaffected.
+        Default no-op. The MuJoCo engine overrides this to hand a policy that
+        opts in - by exposing a callable ``set_sim_context`` - the compiled
+        ``MjModel`` + the robot's namespace, so an eef/cartesian-delta policy can
+        auto-configure its IK end-effector frame with zero manual wiring. No
+        shipped provider opts in today; this is the extension point an
+        out-of-tree one uses. Policies that do not expose ``set_sim_context``
+        are unaffected.
         """
         return None
 
@@ -4276,6 +4278,86 @@ class SimEngine(ABC):
             Default: ``None`` - nothing was claimed, so nothing can be released.
         """
         return None
+
+    def _rollouts_in_flight(self) -> tuple[str, ...] | None:
+        """Names of this world's robots a rollout is driving right now.
+
+        The reporting counterpart of :meth:`_request_policy_stop`, and the one
+        population every remote reader of "is a rollout in flight" asks for:
+        :meth:`~strands_robots.mesh.Mesh._dispatch`'s ``status`` command and the
+        ``robots`` section of its state topic. Reporting a rollout is a strictly
+        weaker requirement than halting one - a backend whose per-robot record
+        carries a bare flag cannot keep a stop it promises (#2833), but that flag
+        is a perfectly good answer to what is running - so a backend may well
+        answer here and still refuse :meth:`stop_policy`.
+
+        Tri-state, for the reason ``_request_policy_stop`` is: ``None`` is a
+        stated absence of a verdict and not an empty population. A backend
+        keeping no rollout claim that answered ``()`` would have every reader
+        publish "nothing is running" on no evidence, which is the affirmative
+        lie :meth:`stop_policy` and
+        :func:`~strands_robots.mesh.core._reported_a_rollout_in_flight` are both
+        written against - and the state topic renders an empty population as
+        ``active=false`` on every robot in the world.
+
+        Returns:
+            The names, in any order, when this backend can enumerate the
+            rollouts it is driving; ``()`` when it can and none is; ``None``
+            when it keeps no such claim, or when the world it would read is
+            gone. Default: ``None`` - the ABC itself owns no registry.
+        """
+        return None
+
+    def list_policies_running(self) -> dict[str, Any]:
+        """Name the robots a rollout is driving right now.
+
+        The public reader of the in-flight population, promoted here from the
+        MuJoCo engine so it answers on every backend: ``docs/simulation/overview.md``
+        lists it in the Policy action table with no backend qualifier, and
+        documents :meth:`stop_policy` -- on this ABC since a robot's stop became
+        a base contract -- as deriving its verdict from "the same in-flight
+        population ``list_policies_running`` reads". Only one of that documented
+        pair existed on Newton and Isaac; asking for the other raised
+        ``AttributeError``. ``docs/device-connect.md`` makes the same promise for
+        the Device Connect stop, whose driver runs on any backend.
+
+        The population comes from :meth:`_rollouts_in_flight`, the one seam the
+        mesh's reporting surfaces also ask, so a peer polled over the wire and a
+        caller holding the engine cannot be told different things about the same
+        instant. MuJoCo's override of that seam delegates to its own registry
+        reader, so the prune this verb used to perform still happens.
+
+        Returns:
+            ``status="success"`` naming the robots in flight, or reporting that
+            none are, when this backend reports a population.
+            ``status="error"`` when it reports none at all: "no policies
+            running" is an affirmative claim, and a backend that cannot
+            enumerate its rollouts has no evidence for it. That mirrors
+            :meth:`stop_policy`, which refuses rather than reporting a halt it
+            cannot stand behind, and names the seam to override.
+        """
+        names = self._rollouts_in_flight()
+        if names is None:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"list_policies_running: {type(self).__name__} keeps no rollout registry, so "
+                            "which robots are running a policy cannot be reported. Reporting none would be "
+                            "an affirmative claim about robots this backend cannot see. Fix by overriding "
+                            "_rollouts_in_flight."
+                        )
+                    }
+                ],
+            }
+        if not names:
+            return {"status": "success", "content": [{"text": "No policies running."}]}
+        robot_lines = "\n".join(f"  - {n}" for n in names)
+        return {
+            "status": "success",
+            "content": [{"text": f"Active policies ({len(names)}):\n{robot_lines}"}],
+        }
 
     def replay_episode(
         self,

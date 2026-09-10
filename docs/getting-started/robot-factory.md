@@ -163,6 +163,47 @@ naming what may still be moving; `strands_robots.drivers.halt_failure_detail` re
 reason out of one. Discarding it returns from shutdown reporting the robot as stopped on the
 one surface that has no way to say otherwise.
 
+A driver that decodes its own telemetry decides, field by field, whether a reading exists. The
+convention is to read every field as `getattr(msg, name, None)` and coerce it, because a *typed*
+default is a well-formed value: a firmware that renames a field would publish a plausible constant
+rather than an absence. `strands_robots.drivers.base` owns that coercion -- `telemetry_float`,
+`telemetry_int`, `telemetry_float_list`, `telemetry_int_list` -- so the answer does not depend on
+which driver asked. Each returns `None` for anything that is not a reading, including a `bool`
+(`float(True)` is `1.0`, indistinguishable from a real one-percent pack) and a bytes-like value
+(`str`, `bytes`, `bytearray`, `memoryview` all iterate, so a raw buffer would otherwise decode as a
+vector of the wrong length). The vector readers are all-or-nothing and return a fresh list, so a
+caller mutating the envelope does not race the callback thread's next write.
+
+The rule covers the scalars a decoder sends back out, not only the ones it publishes. The Unitree
+`mode_machine` is read from `rt/lowstate` and echoed on every `LowCmd_`, and the firmware drops a
+frame whose layout id does not match the one it announced -- so an id that came from something other
+than a number is a write the robot silently ignores. A bare `int()` is the wrong coercion for that:
+`int(True)` is `1` and `int(False)` is `0`, both valid uint8 ids, so a flag on the field would be
+indistinguishable from a reading. `telemetry_int` refuses both. A float is still truncated, because
+that is the shared answer and a decoder stricter than its sibling on a value both accept is the
+drift these functions exist to prevent.
+
+A refused scalar leaves the cached value at the last reading that parsed, rather than clearing it.
+That matters when a gate reads the cache: `mode_machine` gates every G1 motion write and its refusal
+reads "lowstate has not delivered yet", which one unreadable frame should not make true of a robot
+whose lowstate is arriving.
+
+The coercion has to be *per field* for that to hold at the frame level too. A decoder that builds its
+whole record inside one `try` loses every field a message carried because one of them stopped reading,
+and the staleness that leaves behind looks like a dropped wire rather than one renamed field. The
+record keeps the key either way and lets the value be `None`, so a consumer asking for a field always
+gets an answer and the answer can be "the robot did not report this"; a frame in which *nothing* read
+is simply not cached, for the same reason a refused scalar does not clear its own cache.
+
+The rule matters most where a reading is also a *command* source. `BoosterDriver.send_action` holds
+every uncommanded upper-body joint at its last observed position, so the T1's `joints` vector is what
+the next `LowCmd` writes. A defaulted `0.0` there is finite and full-width, clears the "is this a
+frame" guards, gets cached, and gets commanded -- eight arm joints driven to exactly zero from a frame
+that carried no positions at all. Reporting the absence instead reaches the refusal the driver already
+spells for a robot that has reported nothing yet. All-or-nothing matters for the same reason: `held_q`
+is indexed by slot, so a vector short one element would renumber every slot after the gap and hold the
+wrong joint at each of them.
+
 Asking for a driver that is not there is refused, never quietly substituted:
 
 ```python

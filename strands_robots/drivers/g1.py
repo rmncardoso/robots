@@ -49,7 +49,13 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from typing import TYPE_CHECKING, Any, cast
 
-from strands_robots.drivers.base import undeclared_verb_error
+from strands_robots.drivers.base import (
+    telemetry_float,
+    telemetry_float_list,
+    telemetry_int,
+    telemetry_int_list,
+    undeclared_verb_error,
+)
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.tools.g1 import HANDSHAKE_FSMS, WALK_FSMS, decode_code
 from strands_robots.tools.g1._dds_engine import DDSPublisher, DDSSubscriberSet
@@ -1351,20 +1357,62 @@ class G1Driver:
         motion-switcher API and arrives on a different topic.  Writing this
         field to :attr:`_mode_machine` (rather than :attr:`_fsm_id`) keeps the
         two ranges separate: ``[0, 255]`` for the echo, arbitrary for the gate.
+
+        Each ``IMUState_`` vector is read through ``getattr(imu, name, None)``
+        and coerced by
+        :func:`~strands_robots.drivers.base.telemetry_float_list`, so a field
+        the message does not carry lands ``None`` rather than a typed default.
+        The twin driver
+        :meth:`~strands_robots.drivers.go2.Go2Driver._on_lowstate`
+        reads the same four names the same way, and it is the stricter half of
+        the rule here: a default-carrying read cannot fail, and every default
+        this IMU could take is a well-formed
+        reading of a robot that is fine -- ``[0.0, 0.0, 0.0]`` rpy is perfectly
+        level, ``[1.0, 0.0, 0.0, 0.0]`` is upright, and a zero accelerometer is
+        free fall, which a standing robot never reports because gravity is
+        always on one axis.  Those constants are published to
+        ``strands/{peer_id}/imu`` by
+        :class:`~strands_robots.mesh.sensors.SensorLoopsMixin` for as long as
+        the robot runs, so a fleet reading attitude off the wire would be told
+        a falling humanoid is level.  ``None`` says the field was not read,
+        which is what the ``g1_imu`` verb documents for every one of them.
+
+        Because each field is coerced on its own, one unreadable vector reports
+        itself as ``None`` and leaves the other three intact, rather than
+        raising past the dict and abandoning a frame that carried three good
+        readings.
+
+        ``mode_machine`` is read the same way, through
+        :func:`~strands_robots.drivers.base.telemetry_int`.  It is a reading
+        like any other and it is the one this method sends back out: the
+        firmware drops a ``LowCmd_`` whose layout id does not match, so an id
+        built from something that was not a number is a write the robot
+        silently ignores.  ``int()`` read a ``bool`` as ``1``/``0``, both valid
+        uint8 layout ids, so a flag on the field was indistinguishable from a
+        reading; it also raised on a buffer or a word, which the shared
+        ``except`` then logged as a failure of the whole lowstate rather than of
+        one field.  A float is still truncated, because that is the owner's own
+        answer and the Go2 accepts it too.
+
+        A refused reading leaves :attr:`_mode_machine` at its previous value,
+        matching :meth:`_refresh_fsm_id` two ranges over: the layout id does
+        not change while the robot is powered, so the last reading that parsed
+        is a better answer than ``None`` - which the gate reads as "lowstate
+        has not delivered yet".
         """
         try:
             imu = getattr(msg, "imu_state", None)
             if imu is not None:
                 self._imu = {
-                    "rpy": [float(x) for x in getattr(imu, "rpy", [0.0, 0.0, 0.0])[:3]],
-                    "gyroscope": [float(x) for x in getattr(imu, "gyroscope", [0.0, 0.0, 0.0])[:3]],
-                    "accelerometer": [float(x) for x in getattr(imu, "accelerometer", [0.0, 0.0, 0.0])[:3]],
-                    "quaternion": [float(x) for x in getattr(imu, "quaternion", [1.0, 0.0, 0.0, 0.0])[:4]],
+                    "rpy": telemetry_float_list(getattr(imu, "rpy", None)),
+                    "gyroscope": telemetry_float_list(getattr(imu, "gyroscope", None)),
+                    "accelerometer": telemetry_float_list(getattr(imu, "accelerometer", None)),
+                    "quaternion": telemetry_float_list(getattr(imu, "quaternion", None)),
                     "t": time.time(),
                 }
-            mode_machine = getattr(msg, "mode_machine", None)
+            mode_machine = telemetry_int(getattr(msg, "mode_machine", None))
             if mode_machine is not None:
-                self._mode_machine = int(mode_machine)
+                self._mode_machine = mode_machine
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
             logger.debug("%s: lowstate decode failed: %s", self._tool_name, exc)
 
@@ -1372,7 +1420,7 @@ class G1Driver:
         """Decode ``rt/lf/bmsstate`` into :attr:`_battery`.
 
         Every field is read through ``getattr(msg, name, None)`` and coerced
-        by :func:`_to_float` / :func:`_to_int`, so a name the message does
+        by :func:`telemetry_float` / :func:`telemetry_int`, so a name the message does
         not carry lands ``None`` in the record rather than a typed default.
         That distinction is the whole contract here: ``getattr`` with a
         ``0`` default cannot fail and ``0`` is a well-formed reading, so a
@@ -1391,9 +1439,9 @@ class G1Driver:
         """
         try:
             self._battery = {
-                "pct": _to_float(getattr(msg, "soc", None)),
-                "current": _to_float(getattr(msg, "current", None)),
-                "cycle": _to_int(getattr(msg, "cycle", None)),
+                "pct": telemetry_float(getattr(msg, "soc", None)),
+                "current": telemetry_float(getattr(msg, "current", None)),
+                "cycle": telemetry_int(getattr(msg, "cycle", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001
@@ -1404,22 +1452,31 @@ class G1Driver:
 
         The names read here are the ones ``LidarState_`` declares: the MID-360
         reports its fault code as ``error_state`` and its scan rate as
-        ``cloud_frequency``. Reading a name the IDL does not define is
-        indistinguishable from a healthy reading in this record, because
-        ``getattr``'s default is what lands in it - so a unit whose lidar had
-        faulted would publish ``code=-1`` and ``freq=0.0`` for as long as it
-        ran, and the fleet card would read that as "no reading yet".
+        ``cloud_frequency``. Each is read as ``getattr(msg, name, None)`` and
+        coerced by :func:`~strands_robots.drivers.base.telemetry_int` /
+        :func:`~strands_robots.drivers.base.telemetry_float`, the rule every
+        other decoder in this class follows, so a name the message does not
+        carry lands ``None`` for that key rather than a constant shaped like a
+        reading. The typed defaults this read used to carry were all such
+        constants: ``-1`` renders as a fault code, ``0.0`` on ``cloud_frequency``
+        is a unit that has stopped scanning, and ``int(False)`` on
+        ``error_state`` is ``0``, which :func:`decode_code` renders as ``OK`` - a
+        healthy lidar fabricated from a flag. ``g1_lidar_state`` documents every
+        field as "or ``None``", and this is what makes that reachable once a
+        message has arrived.
 
-        ``error_state`` is read once and used for both the numeric code and its
-        rendered text so the two cannot come to describe different fields.
+        ``code_text`` renders the coerced ``code``, not the raw field, so the
+        two describe one reading: a numeric string on the field used to publish
+        ``code=3`` beside ``code_text="'3'"``. A code that is no reading has no
+        text.
         """
         try:
-            error_state = getattr(msg, "error_state", -1)
+            code = telemetry_int(getattr(msg, "error_state", None))
             self._lidar_state = {
-                "code": int(error_state),
-                "code_text": decode_code(error_state),
-                "freq": float(getattr(msg, "cloud_frequency", 0.0)),
-                "sys_rotation_speed": float(getattr(msg, "sys_rotation_speed", 0.0)),
+                "code": code,
+                "code_text": None if code is None else decode_code(code),
+                "freq": telemetry_float(getattr(msg, "cloud_frequency", None)),
+                "sys_rotation_speed": telemetry_float(getattr(msg, "sys_rotation_speed", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001
@@ -1440,17 +1497,25 @@ class G1Driver:
         for a cap to apply to. ``count`` is therefore the cloud's true size: a
         MID-360 that drops from 24000 points to 3000 is reporting a fault, and
         clamping the number would hide exactly that.
+
+        For the same reason a header field the message does not carry is
+        ``None``, not ``0``. Each is read as ``getattr(msg, name, None)`` and
+        coerced by :func:`~strands_robots.drivers.base.telemetry_int`, so a
+        renamed ``width`` reports no reading rather than a zero-point cloud -
+        which is precisely the shape of the fault ``count`` exists to show.
+        ``count`` needs both dimensions, so it is ``None`` when either is; a
+        field that is unreadable costs that field, not the frame, so the header
+        fields that did parse still reach the record.
         """
         try:
-            width = int(getattr(msg, "width", 0))
-            height = int(getattr(msg, "height", 0))
-            count = width * height
+            width = telemetry_int(getattr(msg, "width", None))
+            height = telemetry_int(getattr(msg, "height", None))
             self._lidar_summary = {
-                "count": count,
+                "count": None if width is None or height is None else width * height,
                 "width": width,
                 "height": height,
-                "point_step": int(getattr(msg, "point_step", 0)),
-                "row_step": int(getattr(msg, "row_step", 0)),
+                "point_step": telemetry_int(getattr(msg, "point_step", None)),
+                "row_step": telemetry_int(getattr(msg, "row_step", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001
@@ -1480,10 +1545,10 @@ class G1Driver:
         """
         try:
             self._mainboard = {
-                "fan_state": _to_int_list(getattr(msg, "fan_state", None)),
-                "temperature": _to_float_list(getattr(msg, "temperature", None)),
-                "value": _to_float_list(getattr(msg, "value", None)),
-                "state": _to_int_list(getattr(msg, "state", None)),
+                "fan_state": telemetry_int_list(getattr(msg, "fan_state", None)),
+                "temperature": telemetry_float_list(getattr(msg, "temperature", None)),
+                "value": telemetry_float_list(getattr(msg, "value", None)),
+                "state": telemetry_int_list(getattr(msg, "state", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
@@ -1509,10 +1574,10 @@ class G1Driver:
         """
         try:
             self._pressure = {
-                "pressure": _to_float_list(getattr(msg, "pressure", None)),
-                "temperature": _to_float_list(getattr(msg, "temperature", None)),
-                "lost": _to_int(getattr(msg, "lost", None)),
-                "reserve": _to_int(getattr(msg, "reserve", None)),
+                "pressure": telemetry_float_list(getattr(msg, "pressure", None)),
+                "temperature": telemetry_float_list(getattr(msg, "temperature", None)),
+                "lost": telemetry_int(getattr(msg, "lost", None)),
+                "reserve": telemetry_int(getattr(msg, "reserve", None)),
                 "t": time.time(),
             }
         except Exception as exc:  # noqa: BLE001 - IDL message can be anything
@@ -1533,82 +1598,6 @@ class G1Driver:
             if value is None:
                 return None
             return dict(value)
-
-
-def _to_int(value: Any) -> int | None:
-    """Coerce ``value`` to ``int``, or return ``None`` if it will not.
-
-    ``BmsState_.cycle`` is declared integer, but the value landing here comes
-    from ``getattr(msg, name, None)`` at :meth:`G1Driver._on_bms`, so a
-    firmware that renames the field yields ``None`` at this call.  Returning
-    ``None`` decidably rather than raising keeps the DDS thread's decoder
-    swallowing nothing silently, and the ``g1_battery`` verb reports the
-    missing field as ``None`` in the envelope instead of dropping the whole
-    reading.  The same rule is why no caller passes a typed default: ``0``
-    would be indistinguishable from a real zero-cycle pack.
-    """
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float(value: Any) -> float | None:
-    """Coerce ``value`` to ``float``, or return ``None`` if it will not.
-
-    The float counterpart of :func:`_to_int`, for ``BmsState_``'s ``soc`` and
-    ``current``.  Same rule: the caller passes ``getattr(msg, name, None)``
-    rather than a typed default, so a renamed or undeclared field reaches the
-    ``g1_battery`` envelope as ``None`` instead of a plausible ``0.0``.
-    """
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_int_list(value: Any) -> list[int] | None:
-    """Coerce ``value`` (a vector IDL field) to ``list[int]``, or ``None``.
-
-    Vector fields on the ``MainBoardState_`` IDL - ``fan_state`` -- arrive as
-    an iterable whose element type is declared integer on the current
-    firmware.  Copying into a plain ``list`` here (rather than storing the
-    IDL sequence) means the ``_snapshot`` accessor's ``dict(value)`` copy
-    already carries a list a caller can mutate without racing the DDS
-    thread's next write, and it turns a bytes-like or string value (which
-    would otherwise iterate as characters) into ``None``.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (str, bytes, bytearray)):
-        return None
-    try:
-        return [int(item) for item in value]
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_float_list(value: Any) -> list[float] | None:
-    """Coerce ``value`` (a vector IDL field) to ``list[float]``, or ``None``.
-
-    Vector fields on the ``MainBoardState_`` IDL - ``temperature`` -- are a
-    float sequence on the current firmware.  Same copy-into-list rule as
-    :func:`_to_int_list`: the returned list is fresh, so a caller mutating
-    the ``g1_mainboard`` verb's envelope does not race the DDS thread that
-    writes the cache.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (str, bytes, bytearray)):
-        return None
-    try:
-        return [float(item) for item in value]
-    except (TypeError, ValueError):
-        return None
 
 
 def _refuse(reason: str) -> dict[str, Any]:
@@ -1935,6 +1924,16 @@ class _ControlLoop:
         ``_stop_event.is_set()`` at the top of every step, and once more
         after the policy returns and before the frame publishes.
 
+        ``reason`` is recorded *before* the signal.  The loop's ``finally``
+        stashes its terminal snapshot on the driver while this call is still
+        inside ``join()``, so a reason written after the join reaches
+        ``_exit_reason`` but never the stashed copy
+        :meth:`G1Driver.get_task_status` reads once the loop has cleared
+        itself - which reported a finished rollout with no exit reason at
+        all.  Recording first costs nothing: :meth:`_ControlLoop._set_exit` is
+        first-writer-wins, so a loop that already ended on its own budget
+        keeps that more specific reason.
+
         Returns:
             ``True`` when the thread joined within ``timeout``.  ``False``
             when the loop is still running - a caller-supplied policy that
@@ -1943,17 +1942,13 @@ class _ControlLoop:
             :meth:`stop_task` envelope rather than a ``success`` claim the
             payload's ``running=True`` contradicts.
         """
+        self._set_exit(reason, None)
         self._stop_event.set()
         thread = self._thread
         joined = True
         if thread is not None:
             thread.join(timeout=timeout)
             joined = not thread.is_alive()
-        with self._lock:
-            # The loop itself may have set an exit_reason (budget expiry
-            # racing the caller's stop); if not, the caller wins.
-            if self._exit_reason is None:
-                self._exit_reason = reason
         return joined
 
     def snapshot(self) -> dict[str, Any]:

@@ -33,7 +33,6 @@ strands_robots/
 ├── registry/              # JSON registry for policy discovery
 ├── tools/                 # Strands @tool functions
 │   ├── gr00t_inference.py # GR00T inference tool
-│   ├── lerobot_calibrate.py
 │   ├── lerobot_camera.py
 │   ├── lerobot_teleoperate.py
 │   ├── pose_tool.py
@@ -110,9 +109,9 @@ hatch run format            # ruff check --fix, ruff format
     and a HIGH advisory. State the floor in `[tool.uv] constraint-dependencies`,
     at the first version clearing the advisory rather than the version currently
     resolved, and name the GHSA id in a comment beside it. Use a constraint and
-    not an override: measured on this manifest, `gymnasium>=1.1.1` as a constraint
-    fails `uv lock` and names the `[vera-sim]` extra's contradicting
-    `gymnasium==0.29.1`, while the same floor as an override resolves silently and
+    not an override: measured against an extra pinning `gymnasium==0.29.1`,
+    `gymnasium>=1.1.1` as a constraint fails `uv lock` and names the contradicting
+    pin, while the same floor as an override resolves silently and
     discards that requirement - so an override hides exactly the signal a security
     floor exists to raise. `[project]` is the wrong home while the package stays
     transitive; move the bound there if it ever becomes direct. Pinned by
@@ -285,11 +284,26 @@ hatch run format            # ruff check --fix, ruff format
    as a separate `headRepositoryId`. Step 5 already says "from your fork"; step 1
    is where that stops being a preference.
 
-   Before you start, check that no open pull request already claims the issue:
+   Before you start, check that no open pull request already claims the issue,
+   and that none already edits the file the defect lives in:
 
    ```
-   python3 scripts/check_duplicate_claim.py --repo strands-labs/robots --issue <N>
+   python3 .github/scripts/check_duplicate_claim.py --repo strands-labs/robots --issue <N>
+   python3 scripts/check_merge_base_overlap.py --github-repo strands-labs/robots --paths <the paths you are about to edit>
    ```
+
+   The second read is the one with recall on this repository's duplicate pairs.
+   Five of them are recorded on #3169, and on every one the claim key was silent
+   (`Closes` against `Refs`), the fragment key was silent (two slugs, or the issue
+   number against the PR number) and the shared-edited-test key was silent (two
+   new test files). The one thing two fixes of one defect cannot avoid sharing is
+   the file the defect lives in, and that path is known before any commit exists.
+   #3368 was open and approved for 31 minutes before #3370's first commit against
+   the same three files; this read would have named it, and instead the pair spent
+   a second external approval - the scarcest resource here - on a diff `main`
+   already had. A hit is a pull request to read before writing a line, not a
+   refusal to work: if it is a different change to the same file it is a
+   merge-order question, which `--all-open` answers once yours is open.
 
    Name the repository rather than leaving it to be inferred. `$GITHUB_REPOSITORY`
    is where the command is *running*, which for a scheduled agent need not be a
@@ -324,7 +338,7 @@ hatch run format            # ruff check --fix, ruff format
    question:
 
    ```
-   python3 scripts/check_duplicate_claim.py --repo strands-labs/robots --all-open
+   python3 .github/scripts/check_duplicate_claim.py --repo strands-labs/robots --all-open
    ```
 
    It reports only pairs that **create the same thing**, which over the 2002 pairs
@@ -358,12 +372,15 @@ hatch run format            # ruff check --fix, ruff format
    complementary rather than nested: no issue-keyed pair shares an added path, and
    no claim-free pair claims an issue.
 
-   This one cannot be asked before you start, and not for want of trying: a path
-   set is a property of a pushed branch, so there is nothing to read at intake. It
-   caps the review cost of a collision rather than preventing the work, which is
-   why it belongs here and `--issue` belongs above. It still arrives early enough
-   to matter - both claim-free pairs opened inside the same ~35-minute window every
-   other observed collision shares, 14m 41s and 29m 26s apart.
+   The pairwise form cannot be asked before you start: a path set is a property of
+   a pushed branch, so with no branch there is no pair. But one side of the pair is
+   known at intake - the file you are about to edit - and `--paths` (step 1 above)
+   reads the open set against it, which is the same relation with a path list
+   standing in for the branch that does not exist yet. So the sweep here caps the
+   review cost of a collision the intake read missed, rather than being the first
+   chance to see one. It still arrives early enough to matter - both claim-free
+   pairs opened inside the same ~35-minute window every other observed collision
+   shares, 14m 41s and 29m 26s apart.
 2. Make changes, run `hatch run format && hatch run lint && hatch run test`.
    If you narrow the test run to the area you changed (`pytest tests/drivers/ -k g1`),
    run `hatch run whole-tree-check` alongside it. Ninety-odd graders take
@@ -501,8 +518,8 @@ hatch run format            # ruff check --fix, ruff format
    you is the part that does not survive a context rebuild, so ask a command:
 
    ```
-   python3 scripts/check_thread_is_answered.py --repo strands-labs/robots --pr <N>
-   python3 scripts/check_thread_is_answered.py --repo strands-labs/robots --all-open
+   python3 .github/scripts/check_thread_is_answered.py --repo strands-labs/robots --pr <N>
+   python3 .github/scripts/check_thread_is_answered.py --repo strands-labs/robots --all-open
    ```
 
    `settled` is not work. `awaiting-the-author` is a reply, `answered` is the
@@ -1100,11 +1117,11 @@ hatch run format            # ruff check --fix, ruff format
      checks above:
 
      ```
-     python3 scripts/check_pr_head_is_current.py --repo <owner/name> --all-open
+     python3 .github/scripts/check_pr_head_is_current.py --repo <owner/name> --all-open
      ```
 
      It agreed with `git ls-remote` on all 10 open pull requests, so it needs no
-     clone. Pinned by tests/test_pr_head_is_current.py. See #2538.
+     clone. See #2538.
    - *And that the tree you are deriving from is that tip.* The third answer is
      `refs/pull/N/head`, and it is the one every checkout reaches for and the
      only one with no signal at all. It is a mirror ref GitHub refreshes on its
@@ -1149,7 +1166,7 @@ hatch run format            # ruff check --fix, ruff format
      itself and exits 1 on a stale tree, so it can sit in front of the work:
 
      ```
-     python3 scripts/check_checkout_is_pr_head.py --repo <owner/name> --pr <N>
+     python3 .github/scripts/check_checkout_is_pr_head.py --repo <owner/name> --pr <N>
      ```
 
      It compares by **ancestry, not equality**: a clone sitting at its own
@@ -1157,7 +1174,7 @@ hatch run format            # ruff check --fix, ruff format
      state between a commit and its push and is not a finding. A tip missing
      from the local object database is `stale-checkout` rather than
      indeterminate - a clone that never fetched a commit cannot contain it.
-     Pinned by tests/test_checkout_is_pr_head.py. See #2520, which records four
+     See #2520, which records four
      instances: #2511 (one thread, four author replies), #2566 and #2577 (two
      runs deriving one fix, the duplicate discarded only because a plain push
      was refused) and #2678 above. That refusal is load-bearing by accident -
@@ -1303,8 +1320,8 @@ hatch run format            # ruff check --fix, ruff format
    Rather than infer which of these is operating, read it:
 
    ```
-   python3 scripts/check_merge_blockers.py --repo strands-labs/robots --pr <N>
-   python3 scripts/check_merge_blockers.py --repo strands-labs/robots --all-open
+   python3 .github/scripts/check_merge_blockers.py --repo strands-labs/robots --pr <N>
+   python3 .github/scripts/check_merge_blockers.py --repo strands-labs/robots --all-open
    ```
 
    It reads the branch ruleset - so a rule that is changed in settings cannot
@@ -1349,7 +1366,6 @@ hatch run format            # ruff check --fix, ruff format
 
    It composes `check_last_push_approval.py` rather than restating it, so what
    counts as a current approval has one owner. Neither script gates a merge.
-   Pinned by tests/test_merge_blockers.py.
 
    This is worth the words because the failure mode is silent and expensive in the
    opposite direction from the usual one. Treating an advisory red as a merge
@@ -1425,7 +1441,7 @@ hatch run format            # ruff check --fix, ruff format
    | #1763, which broke `main` | `diverged  ahead_by=2  behind_by=1` | owed |
    | #2012, which raised the same alarm | `ahead  ahead_by=3  behind_by=0` | none exists |
 
-   #2012 edited `strands_robots/policies/vera/provider.py`, which #1992 had
+   #2012 edited a policy provider module, which #1992 had
    touched earlier the same day, so it met the trigger condition verbatim - but
    #1992 sat 13 commits back in the branch's own ancestry
    (`compare/<#1992 squash>...<head>` -> `ahead  behind_by=0`) rather than
@@ -2057,13 +2073,6 @@ which side the enum is on.
   after the deletion it was refusing. Pinned by
   `tests/test_dataset_recorder_posture_flag_domain.py`, which also records why
   the neighbouring surfaces are out of scope.
-  A calibration restore is the same shape with no recovery path: neither
-  `LeRobotCalibrationManager.restore_calibrations` nor the `lerobot_calibrate` facade
-  checked the `overwrite` they share, so `overwrite="false"` wrote the backup over every
-  existing calibration - a physical measurement of one arm's homing offset and travel
-  limits, recoverable only by re-calibrating the hardware - while the tool reported
-  ``Overwrite mode: `false` `` beside a restored count of 1. Pinned by
-  `tests/tools/test_calibration_restore_overwrite_flag_domain.py`.
   The asset cache is the third one, and the only one whose deletion takes a file the
   package never authored: `download_robots(force=)` and the `download_assets` facade both
   read it, and a re-fetch removes the cached directory for a robot whose assets are
@@ -2180,18 +2189,6 @@ which side the enum is on.
   the remedy names the `robots=` that caller passed rather than the `names=` it never
   did. Pinned by `tests/test_asset_download_selection_domain.py`, whose controls pin the
   three tolerated spellings so the narrowing stays deliberate rather than incidental.
-- **A provider keyword is the same surface, and the erasure can happen before the read.**
-  `VeraPolicy(image_keys=...)` selects which of the observation's own image keys are
-  width-concatenated into the one frame the video planner acts on, and `[]` was stored as
-  `None` - so the selection was gone before the resolver ran, and a caller who excluded
-  every camera drove the arm from all of them, in a *wider* frame, under a success result.
-  Four sites spell one parameter there (shape guard, store, resolver, and the docstring
-  that documented `None` alone), and the guard being gated on a truthy value is what let
-  `""` widen too - it never reached the bare-string refusal it was already owed. Fix the
-  store and the resolver together: one alone leaves the other free to widen. Pinned by
-  `tests/policies/vera/test_vera_image_keys_selection_domain.py`, whose controls pin the
-  documented spellings under both handshake cases and the `action_mapping` carve-out one
-  line below, which is a rename map rather than a subset and is correct as it stands.
 - Pinned by `tests/test_teleop_device_selection_domain.py`, whose controls assert that the
   documented spellings (`names=None`, a real subset, `detach_teleop(None)`) are unchanged,
   and by the render path's `cameras` resolution, which has read the same kind of selector
@@ -2316,7 +2313,7 @@ which side the enum is on.
 
 - **State the encoding on every on-disk text read and write** - `open()`, `Path.read_text`/`write_text`, `os.fdopen` and `tempfile.NamedTemporaryFile` all fall back to `locale.getencoding()`, so a file whose bytes are fixed answers differently in two processes that differ only in `LC_ALL`. Nothing this package reads is a locale-encoded document: a benchmark spec or policy config is authored in an editor, and lerobot writes `meta/info.json` with `encoding="utf-8"` and `ensure_ascii=False`. Under a non-UTF-8 locale that made a valid UTF-8 spec unreadable (`UnicodeDecodeError` out of `register_benchmark_from_file`) and a three-task dataset's `total_tasks` read as absent, which `validation_split_error` honours as single-task. Pass `encoding="utf-8"`; binary modes take no encoding and a child process's stdout is a separate decision (it encoded with the locale). Pinned by `tests/test_on_disk_text_io_states_utf8.py`. The *error handler* on a child's stream is decided by the bullet below.
 
-- **Decode a child process's stream with `errors="replace"`** - `subprocess` in text mode decodes with `errors="strict"`, so one byte the codec cannot decode replaces the whole captured stream with `UnicodeDecodeError`. A child's stdout is not this process's text: it is whatever bytes an arbitrary program wrote to a pipe - ffmpeg copying a latin-1 metadata tag, a container printing a log line byte for byte, a USB descriptor string a vendor chose - so a byte that is not valid UTF-8 is expected there. The same bytes read from the detached child's *log file* were already read with `errors="replace"`, and the MuJoCo GL probe decodes both of its child's streams the same way; the pipe readers did not, and `sync_dataset_to_bucket` - which documents "Never raises on `hf` failure" and which `stop_recording` calls unguarded on that promise - raised past a completed upload, while the VERA log pump died on the byte so the server lines its readiness error tells an operator to read stopped arriving. Pass `errors="replace"` on every read of a child's stream (`capture_output=True` or a `PIPE`); a pipe this process *writes* stays strict, because substituting on the way out mangles a command instead of refusing to send it. Pinned by `tests/test_child_stream_decode_substitutes.py`.
+- **Decode a child process's stream with `errors="replace"`** - `subprocess` in text mode decodes with `errors="strict"`, so one byte the codec cannot decode replaces the whole captured stream with `UnicodeDecodeError`. A child's stdout is not this process's text: it is whatever bytes an arbitrary program wrote to a pipe - ffmpeg copying a latin-1 metadata tag, a container printing a log line byte for byte, a USB descriptor string a vendor chose - so a byte that is not valid UTF-8 is expected there. The same bytes read from the detached child's *log file* were already read with `errors="replace"`, and the MuJoCo GL probe decodes both of its child's streams the same way; the pipe readers did not, and `sync_dataset_to_bucket` - which documents "Never raises on `hf` failure" and which `stop_recording` calls unguarded on that promise - raised past a completed upload, Pass `errors="replace"` on every read of a child's stream (`capture_output=True` or a `PIPE`); a pipe this process *writes* stays strict, because substituting on the way out mangles a command instead of refusing to send it. Pinned by `tests/test_child_stream_decode_substitutes.py`.
 
 ### Testing Patterns
 - **Use `monkeypatch.setenv`, never `os.environ[...] = ...`** - direct mutation leaks if the test raises before `finally`, and `del os.environ[...]` can `KeyError` under parallel runs. The pytest fixture handles teardown atomically.
