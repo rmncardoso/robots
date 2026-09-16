@@ -1067,6 +1067,17 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
                     reached = True
                     break
 
+            # Not reached: name the commanded joints at a bound from the same
+            # FK readback the residual was measured on. Kit-side contacts are
+            # not queried here, so the report says so (contacts_total None)
+            # rather than claiming the robot is free of them.
+            obstruction: dict[str, Any] | None = None
+            if not reached:
+                obstruction = {
+                    "contacts": [],
+                    "contacts_total": None,
+                    "joints_at_limit": self._joints_at_limit(mj, model, q_fk, arm_map),
+                }
             return self._move_to_result(
                 name,
                 target_world,
@@ -1083,6 +1094,7 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
                 orientation_error=orientation_error,
                 orientation_tol=orientation_tol,
                 ik_orientation_residual=ik_orientation_residual,
+                obstruction=obstruction,
             )
 
         return self._run_primitive_on_kit("move_to", _move)
@@ -1356,6 +1368,18 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
                 if yaw_error <= float(tol):
                     reached = True
                     break
+            # Not reached: name the wrist bound from the same readback the
+            # residual was measured on. Kit-side contacts are not queried
+            # here, so the report says so (contacts_total None) rather than
+            # claiming the robot is free of them.
+            obstruction: dict[str, Any] | None = None
+            if not reached:
+                record = None if span is None else self._joint_limit_record(wrist_name, final_yaw, *span)
+                obstruction = {
+                    "contacts": [],
+                    "contacts_total": None,
+                    "joints_at_limit": [record] if record is not None else [],
+                }
             return self._rotate_wrist_result(
                 name,
                 float(tol),
@@ -1366,6 +1390,7 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
                 target_yaw=target_yaw,
                 final_yaw=final_yaw,
                 yaw_error=yaw_error,
+                obstruction=obstruction,
             )
 
         return self._run_primitive_on_kit("rotate_wrist", _servo)

@@ -20,6 +20,8 @@ bridge tests use. They assert that:
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
 import threading
 import time
@@ -248,6 +250,57 @@ def test_hardware_bridge_publishes_identically_to_sim(fake_ros: dict[str, Any]) 
     (sim_msg,) = sim_pub.messages
     assert hw_msg.name == sim_msg.name == ["shoulder_pan", "elbow"]
     assert hw_msg.position == sim_msg.position == [0.1, 0.2]
+
+
+class TestJointStateArraysAreRefusedWhenTheyDisagree:
+    """A ``JointState`` whose two arrays name different joints never reaches the wire.
+
+    ``name`` and ``position`` are paired by index, so a caller that supplies a
+    different number of each has no pose to publish: a consumer's
+    ``zip(name, position)`` reports every joint after the gap under its
+    neighbour's name and the tail unreported. Dropped whole, with the reason
+    logged, for the reason :meth:`_command_action` refuses a malformed inbound
+    command whole rather than applying part of it.
+    """
+
+    @pytest.mark.parametrize(
+        ("names", "positions"),
+        [
+            (["hip", "knee", "ankle"], [0.1, 0.2]),  # a value column short by one
+            (["hip", "knee"], [0.1, 0.2, 0.3]),  # a name column short by one
+            (["hip"], []),  # every value missing
+        ],
+    )
+    def test_a_mismatched_pair_publishes_nothing(
+        self, fake_ros: dict[str, Any], caplog: pytest.LogCaptureFixture, names: list[str], positions: list[float]
+    ) -> None:
+        bridge = HardwareRosBridge()
+        with caplog.at_level(logging.WARNING):
+            bridge.publish_joint_states("so101", names, positions)
+
+        assert [m for pub in fake_ros["nodes"][0].publishers for m in pub.messages] == []
+        # The reason names both counts, so the caller can see which column is short.
+        assert f"{len(names)} joint name(s) and {len(positions)} position(s)" in caplog.text
+        assert "no partial publication" in caplog.text
+
+    def test_a_matching_pair_still_publishes(self, fake_ros: dict[str, Any]) -> None:
+        # Control: the guard refuses no more than the mismatch.
+        bridge = HardwareRosBridge()
+        bridge.publish_joint_states("so101", ["hip", "knee"], [0.1, 0.2])
+
+        (pub,) = fake_ros["nodes"][0].publishers
+        (msg,) = pub.messages
+        assert msg.name == ["hip", "knee"]
+        assert msg.position == [0.1, 0.2]
+
+    def test_two_empty_arrays_are_a_valid_empty_state(self, fake_ros: dict[str, Any]) -> None:
+        # Control: JointState allows empty arrays; equal lengths agree.
+        bridge = HardwareRosBridge()
+        bridge.publish_joint_states("so101", [], [])
+
+        (pub,) = fake_ros["nodes"][0].publishers
+        (msg,) = pub.messages
+        assert msg.name == [] and msg.position == []
 
 
 def test_hardware_bridge_sets_domain_env(fake_ros: dict[str, Any]) -> None:
@@ -631,4 +684,125 @@ def test_start_spin_is_idempotent(fake_ros: dict[str, Any]) -> None:
     bridge._start_spin()
     assert bridge._spin_thread is first
     assert _live_command_threads() == 1
+    bridge.shutdown()
+
+
+# --- a refused construction costs the process nothing ------------------------
+
+#: Every constructor argument :class:`HardwareRosBridge` documents a
+#: ``ValueError`` for, paired with a value from outside its domain. That the
+#: refusal happens is already pinned elsewhere; what these cells pin is where it
+#: happens - the base constructor writes the process-wide ``ROS_DOMAIN_ID``,
+#: initializes the rclpy context when nothing else has, and creates the node, so
+#: a guard placed after it charges a rejected caller for state no one can
+#: release: ``__init__`` raised, so there is no bridge to call ``shutdown`` on.
+_REFUSED_CONSTRUCTIONS: list[tuple[str, dict[str, Any]]] = [
+    ("domain_id", {"domain_id": 233}),
+    ("qos_depth", {"qos_depth": 0}),
+    ("spin_period", {"spin_period": 0.0}),
+    ("enable_commands", {"enable_commands": "false"}),
+    ("joint_limits/order", {"joint_limits": {"j0.pos": (1.0, -1.0)}}),
+    ("joint_limits/non-finite", {"joint_limits": {"j0.pos": (1.0, float("nan"))}}),
+    ("command_robot_name/truthy-non-str", {"command_robot_name": 7}),
+    ("command_robot_name/falsy-non-str", {"command_robot_name": 0}),
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [kwargs for _, kwargs in _REFUSED_CONSTRUCTIONS],
+    ids=[param for param, _ in _REFUSED_CONSTRUCTIONS],
+)
+def test_a_refused_bridge_leaves_the_process_as_it_found_it(
+    fake_ros: dict[str, Any], monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, Any]
+) -> None:
+    """No refusal writes ROS_DOMAIN_ID, starts rclpy, or creates a node.
+
+    Each cell asks for a bridge on domain 42 with one argument outside its
+    domain, from a process whose shell pointed at domain 7. A refusal that lands
+    after the base constructor leaves 42 behind for every later participant to
+    inherit, the rclpy context up, and a live node in the graph.
+    """
+    monkeypatch.setenv("ROS_DOMAIN_ID", "7")
+    with pytest.raises(ValueError):
+        HardwareRosBridge(_FakeDrivableRobot(), **{"domain_id": 42, **kwargs})  # type: ignore[arg-type]
+
+    assert os.environ["ROS_DOMAIN_ID"] == "7"
+    assert fake_ros["inited"] is False
+    assert fake_ros["nodes"] == []
+
+
+def test_a_refused_bridge_does_not_strand_the_rclpy_context(
+    fake_ros: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrected retry can still release the context, because nothing took it.
+
+    ``_owns_context`` is recorded from ``rclpy.ok()``, so whichever bridge starts
+    the context is the only one that will shut it down. When a refused
+    construction starts it, that bridge is never returned: the retry sees the
+    context already up, declines ownership, and its ``shutdown`` releases the
+    node it made but not the context or the node the refusal left behind.
+    """
+    monkeypatch.setenv("ROS_DOMAIN_ID", "7")
+    with pytest.raises(ValueError, match="min .* > max"):
+        HardwareRosBridge(_FakeDrivableRobot(), joint_limits={"j0.pos": (1.0, -1.0)})  # type: ignore[arg-type]
+
+    bridge = HardwareRosBridge(_FakeDrivableRobot(), joint_limits={"j0.pos": (-1.0, 1.0)})  # type: ignore[arg-type]
+    assert bridge._owns_context is True
+    bridge.shutdown()
+
+    assert fake_ros["shutdown"] is True
+    assert fake_ros["inited"] is False
+    assert [node.name for node in fake_ros["nodes"] if not node.destroyed] == []
+
+
+# --- the command namespace is the one caller-supplied name in a topic --------
+
+#: ``command_robot_name`` values that cannot name a topic segment, paired with
+#: how each one failed before it was graded. A truthy value reached the
+#: sanitiser's ``re.sub`` and raised ``TypeError`` naming no parameter; a falsy
+#: one was filtered by the ``command_robot_name or <derived>`` default and never
+#: raised at all, so the bridge read commands under a namespace the caller had
+#: not asked for.
+_UNNAMEABLE_COMMAND_NAMESPACES: list[Any] = [7, ["left_arm"], b"left_arm", 0, [], False]
+
+
+@pytest.mark.parametrize("name", _UNNAMEABLE_COMMAND_NAMESPACES, ids=repr)
+def test_a_command_namespace_that_cannot_name_a_topic_is_refused(fake_ros: dict[str, Any], name: Any) -> None:
+    """The refusal names the parameter and the input that restores the default.
+
+    The old failures named neither: ``TypeError: expected string or bytes-like
+    object, got 'int'`` came out of the sanitiser, and the falsy values produced
+    no message because the default-selecting ``or`` swallowed them.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        HardwareRosBridge(_FakeDrivableRobot(), command_robot_name=name)  # type: ignore[arg-type]
+
+    message = str(excinfo.value)
+    assert "'command_robot_name'" in message
+    assert type(name).__name__ in message
+    assert "Pass None" in message
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_topic"),
+    [
+        (None, "/so101/joint_command"),
+        ("", "/so101/joint_command"),
+        ("left_arm", "/left_arm/joint_command"),
+    ],
+    ids=["derive/None", "derive/empty", "override"],
+)
+def test_an_accepted_command_namespace_selects_the_topic_it_names(
+    fake_ros: dict[str, Any], name: Any, expected_topic: str
+) -> None:
+    """Both documented ways of asking for the default still get it.
+
+    ``None`` and ``""`` select the bound robot's own name - the namespace this
+    bridge publishes ``joint_states`` under - and a string overrides it. Pinned
+    alongside the refusals so the guard cannot be satisfied by refusing more than
+    it should.
+    """
+    bridge = HardwareRosBridge(_FakeDrivableRobot(), command_robot_name=name)  # type: ignore[arg-type]
+    assert [sub.topic for sub in fake_ros["nodes"][0].subscriptions] == [expected_topic]
     bridge.shutdown()

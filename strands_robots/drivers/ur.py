@@ -73,6 +73,7 @@ from typing import TYPE_CHECKING, Any, cast
 from strands_robots.drivers.base import policy_step, undeclared_verb_error
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.registry import resolve_name
+from strands_robots.registry.policies import policy_requires_error
 from strands_robots.utils import (
     finite_number_error,
     positive_count_error,
@@ -1102,6 +1103,16 @@ class URDriver:
     ) -> dict[str, Any]:
         """Build a policy from the provider registry and roll it out in the background.
 
+        A provider that cannot be built is refused, never raised: this is the one
+        driver in the fleet that builds a policy from the provider registry, and
+        it is reached as an agent tool, where an exception is not something the
+        caller can handle. A provider missing a keyword the registry names as
+        required is refused before the build, because several build without it
+        and fail only once the rollout asks for its first action - by which time
+        this verb has answered "started" and a live arm is held by a rollout that
+        can never take a step. See
+        :func:`~strands_robots.registry.policies.policy_requires_error`.
+
         Args:
             instruction: Natural-language instruction handed to the policy.
             policy_port: Port the policy server listens on; ``None`` uses the
@@ -1113,16 +1124,44 @@ class URDriver:
 
         Returns:
             The envelope :meth:`run_policy` returns for the rollout it started,
-            or a refusal naming the provider that could not be built.
+            or a refusal naming the provider that could not be built - or the
+            keyword it needed and was not given.
         """
         from strands_robots.policies import create_policy
 
         kwargs: dict[str, Any] = {"host": policy_host, **policy_kwargs}
         if policy_port is not None:
             kwargs["port"] = policy_port
+        # Judged before the build, because several providers build without the
+        # keyword they cannot act without and only fail on the worker thread,
+        # once this verb has answered "started" and the rollout holds an arm
+        # that is already live. ``kwargs`` is what the caller supplied, so
+        # nothing is ignored here: unlike the real-arm surface, this verb funnels
+        # ``policy_port`` into it, so the same guard judges the port too.
+        if reason := policy_requires_error(
+            policy_provider,
+            kwargs,
+            "start_task",
+            "the rollout would start on a live arm and fail at its first action",
+        ):
+            return _refuse(reason)
         try:
             policy = create_policy(policy_provider, **kwargs)
-        except (ImportError, TypeError, ValueError) as exc:
+        # Recovery path: catch broadly. The refusal below is this verb's
+        # documented answer to a provider it cannot build, and the exceptions a
+        # build raises are not enumerable. Naming
+        # ``(ImportError, TypeError, ValueError)`` covered neither half of the
+        # real population: nine of the twenty-nine registered provider
+        # spellings raised past the envelope, ``lerobot_local`` among them,
+        # because :func:`~strands_robots.policies.create_policy`'s own
+        # documented ``UntrustedRemoteCodeError`` is a ``RuntimeError``; and a
+        # provider whose constructor resolves a checkpoint off disk raises
+        # ``FileNotFoundError`` from a path the caller mistyped. Widening the
+        # tuple to cover today's classes would re-break on the next provider,
+        # and ``register_policy`` lets a caller add one this package never sees.
+        # The rollout loop catches this broadly for the same reason one step
+        # later - see :meth:`_Rollout._run`.
+        except Exception as exc:  # noqa: BLE001 - an unbuildable provider is refused, not raised
             return _refuse(f"start_task: could not build the {policy_provider!r} policy: {exc}")
         return self.run_policy(policy, instruction=instruction, duration=duration)
 

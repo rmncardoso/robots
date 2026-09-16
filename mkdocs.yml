@@ -5,6 +5,7 @@ repo_url: https://github.com/strands-labs/robots
 repo_name: strands-labs/robots
 extra_css:
 - stylesheets/extra.css?v=2
+- stylesheets/robot-cards.css
 extra_javascript:
 - https://unpkg.com/mermaid@10/dist/mermaid.min.js
 - assets/mermaid-init.js
@@ -30,6 +31,7 @@ nav:
   - Isaac Sim Backend (GPU): simulation/isaac.md
 - Device Connect: device-connect.md
 - Multi-robot Mesh: mesh.md
+- Dashboard: dashboard.md
 - ROS 2 Integration: ros2-integration.md
 - rosbridge Integration: rosbridge-integration.md
 - Pure-RTPS ROS 2: rtps-integration.md
@@ -69,10 +71,18 @@ nav:
   - Overview: examples/overview.md
 - Architecture: architecture.md
 - API Reference: api-reference.md
+- Configuration: reference/configuration.md
 - Security: security.md
 - Tool Result Contract: contracts.md
 - Contributing: contributing.md
 - Troubleshooting: troubleshooting.md
+hooks:
+  - docs/hooks/numbers.py
+  - docs/hooks/robot_cards.py
+validation:
+  links:
+    anchors: warn
+
 theme:
   name: material
   logo: assets/strands-logo.svg

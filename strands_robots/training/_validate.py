@@ -162,6 +162,83 @@ def rl_replay_problems(spec: TrainSpec, *, context: str) -> list[str]:
     return problems
 
 
+def warmup_batch_relation_problems(spec: TrainSpec, *, context: str) -> list[str]:
+    """Report ``learning_starts``, and a warmup too short to fill a first batch.
+
+    ``learning_starts >= batch_size`` is a relation between two counts, so BOTH
+    operands are asked of the shared count domain and the relation only of two
+    values that are counts. Asking it of ``batch_size`` alone was not enough: a
+    non-finite ``learning_starts`` makes ``<`` answer False (every comparison
+    against ``nan`` is False, and ``inf`` is below no int), so the relation
+    passed and both consumers then read a value that is not a count.
+    ``collect_rollout`` tests ``buffer.size < learning_starts`` to decide the
+    random warmup and ``train`` tests ``buffer.size >= learning_starts`` to
+    decide whether ``update()`` runs at all, so ``nan`` skips the warmup and
+    takes zero gradient steps while ``inf`` warms up forever and takes zero
+    gradient steps - a run that reports success having learned nothing, which is
+    the outcome :func:`rl_replay_problems` exists to refuse for ``buffer_size``.
+
+    This relation sizes the FIRST batch only; making the threshold *reachable*
+    is the separate rule in :func:`warmup_reachability_problems`, which both
+    off-policy backends consult on the next line. Both halves of one warmup
+    contract, and both live here rather than in each backend that shares them
+    verbatim.
+    """
+    learning_starts = getattr(spec, "learning_starts", 1)
+    error = positive_count_error(learning_starts, "learning_starts", context)
+    if error is not None:
+        return [error]
+    batch_size = getattr(spec, "batch_size", 1)
+    if positive_count_error(batch_size, "batch_size", context) is None and learning_starts < batch_size:
+        return [
+            f"learning_starts ({learning_starts}) must be >= batch_size ({batch_size}) "
+            "so the first gradient step can sample a full batch"
+        ]
+    return []
+
+
+def warmup_reachability_problems(spec: TrainSpec, *, context: str) -> list[str]:
+    """Report a ``learning_starts`` threshold an off-policy run never reaches.
+
+    ``learning_starts`` is the replay fill the first gradient step waits for,
+    and two caller-supplied counts bound the fill a run ever reaches: the step
+    budget it collects, ``max(1, total_timesteps // steps) * steps`` for
+    ``steps = rollout_steps * num_envs``, and ``buffer_size``, the ring
+    buffer's own capacity. Either one below the threshold takes **zero**
+    gradient steps for the whole run, which still reports ``status="success"``
+    with a written checkpoint and an exported policy - the outcome
+    :func:`rl_replay_problems` and the ``learning_starts >= batch_size``
+    relation each cite as the one they exist to refuse, reached here by plain
+    positive counts that pass every per-field domain.
+
+    Both operands are reported when both are short, so a caller sees every
+    count it has to raise. Every operand is asked of the count domain first:
+    the relation is only meaningful between counts, and each field already has
+    a gate that reports a non-count as one, so a non-count is left to that gate
+    rather than described as an unreachable threshold.
+    """
+    fields = ("total_timesteps", "rollout_steps", "num_envs", "learning_starts", "buffer_size")
+    values = {field: getattr(spec, field, 1) for field in fields}
+    if any(positive_count_error(value, field, context) is not None for field, value in values.items()):
+        return []
+
+    steps = values["rollout_steps"] * values["num_envs"]
+    collected = max(1, values["total_timesteps"] // steps) * steps
+    threshold = values["learning_starts"]
+    problems: list[str] = []
+    if collected < threshold:
+        problems.append(
+            f"learning_starts ({threshold}) is never reached: total_timesteps "
+            f"({values['total_timesteps']}) collects {collected} steps, so the run takes zero gradient steps"
+        )
+    if values["buffer_size"] < threshold:
+        problems.append(
+            f"learning_starts ({threshold}) is never reached: buffer_size ({values['buffer_size']}) "
+            "caps the replay buffer below it, so the run takes zero gradient steps"
+        )
+    return problems
+
+
 def launch_topology_problems(spec: TrainSpec, *, context: str) -> list[str]:
     """Report ``num_gpus`` and ``num_nodes``, each a count.
 
@@ -229,6 +306,41 @@ def streaming_problems(spec: TrainSpec, *, context: str) -> list[str]:
     return _posture_flag_problems(spec, ("streaming",), context=context)
 
 
+def observation_normalization_problems(spec: TrainSpec, *, context: str) -> list[str]:
+    """Report ``normalize_obs``: a ``bool``.
+
+    The flag decides whether an RL backend wraps both observation streams in
+    ``EmpiricalNormalization`` or feeds them to the networks raw, and every
+    backend reads it as ``... if spec.normalize_obs else None``. Read by
+    truthiness, ``"false"``, ``"no"`` and ``"0"`` build the normalizers a caller
+    opted out of, and ``0`` or ``None`` skips them without being a declared
+    spelling of ``False``.
+    """
+    return _posture_flag_problems(spec, ("normalize_obs",), context=context)
+
+
+def advantage_normalization_problems(spec: TrainSpec, *, context: str) -> list[str]:
+    """Report ``normalize_advantage``: a ``bool``.
+
+    Read by the on-policy backend only, at the two sites that decide whether
+    advantages are standardized per batch before the surrogate loss.
+    """
+    return _posture_flag_problems(spec, ("normalize_advantage",), context=context)
+
+
+def temperature_autotune_problems(spec: TrainSpec, *, context: str) -> list[str]:
+    """Report ``autotune_alpha``: a ``bool``.
+
+    The flag selects whether SAC builds a temperature optimizer and moves
+    ``log_alpha`` against ``target_entropy``, or holds the temperature at
+    ``init_alpha`` for the whole run. It also gates whether ``alpha_lr`` is read
+    at all, which is why :func:`temperature_learning_rate_problems` reads it
+    only once this gate has passed: a misread posture is then refused by the
+    flag's own name rather than as the rate it would have selected.
+    """
+    return _posture_flag_problems(spec, ("autotune_alpha",), context=context)
+
+
 def lora_hyperparameter_problems(spec: TrainSpec, *, context: str) -> list[str]:
     """Report ``lora_r`` and ``lora_alpha``, each a count when supplied.
 
@@ -284,8 +396,16 @@ def optimization_epochs_problems(spec: TrainSpec, *, context: str) -> list[str]:
 
 
 def temperature_learning_rate_problems(spec: TrainSpec, *, context: str) -> list[str]:
-    """Report ``alpha_lr``: a rate. Empty unless ``autotune_alpha`` is set."""
-    if not getattr(spec, "autotune_alpha", False):
+    """Report ``alpha_lr``: a rate. Empty unless ``autotune_alpha`` is ``True``.
+
+    The rate is read only on the branch the flag selects, so the flag has to be
+    a usable boolean before it can select anything: a value outside the
+    ``bool`` domain is :func:`temperature_autotune_problems`' to report, and a
+    verdict on the rate beside it would send the caller to fix a knob the
+    posture they spelled does not read.
+    """
+    autotune = getattr(spec, "autotune_alpha", False)
+    if boolean_flag_error(autotune, "autotune_alpha", context) is not None or not autotune:
         return []
     error = positive_finite_number_error(getattr(spec, "alpha_lr", 3e-4), "alpha_lr", context)
     return [error] if error is not None else []

@@ -28,9 +28,11 @@ from typing import Any
 
 import pytest
 
-import strands_robots.tools.lerobot_train as train_mod
-from strands_robots.tools import _process_stop
-from tests.tool_result_contract import tool_json
+pytest.importorskip("psutil")
+
+import strands_robots.tools.lerobot_train as train_mod  # noqa: E402
+from strands_robots.tools import _process_stop  # noqa: E402
+from tests.tool_result_contract import tool_json  # noqa: E402
 
 build_train_command = train_mod.build_train_command
 lerobot_train = train_mod.lerobot_train
@@ -506,6 +508,35 @@ def test_status_requires_session_name(tmp_path: Path) -> None:
     result = lerobot_train(action="status", dataset_root=str(root))
     assert result["status"] == "error"
     _assert_ascii(_texts(result))
+
+
+def test_session_verbs_do_not_require_a_dataset_root() -> None:
+    """``status``/``stop``/``list`` look a session up by name and never read the dataset.
+
+    ``dataset_root`` was the tool's one required parameter, so an agent had to
+    invent a dataset path to ask about a run, and a Python caller of
+    ``lerobot_train(action="list")`` got a ``TypeError`` instead of a result.
+    Only ``start`` reads it, so only ``start`` is refused without it.
+    """
+    required = lerobot_train.tool_spec["inputSchema"]["json"].get("required") or []
+    assert "dataset_root" not in required
+
+    listed = lerobot_train(action="list")
+    assert listed["status"] == "success"
+    assert tool_json(listed)["count"] == 0
+
+    status = lerobot_train(action="status", session_name="nope")
+    assert status["status"] == "error"
+    assert "not found" in _texts(status)
+
+    stop = lerobot_train(action="stop", session_name="nope")
+    assert stop["status"] == "error"
+    assert "not found" in _texts(stop)
+
+    start = lerobot_train(action="start")
+    assert start["status"] == "error"
+    assert "dataset_root required" in _texts(start)
+    _assert_ascii(_texts(listed) + _texts(status) + _texts(stop) + _texts(start))
 
 
 def test_unknown_action_errors(tmp_path: Path) -> None:

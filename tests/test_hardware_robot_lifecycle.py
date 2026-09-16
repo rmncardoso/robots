@@ -737,16 +737,17 @@ class TestStatusSurface:
 
         ``get_status`` is the operator's health probe; a raising serial/USB
         backend must never propagate out of it and crash the caller. Instead
-        it reports ``task_status="error"`` with the failure text and a safe
+        it reports ``task_status="error"`` with the failure text and
         ``is_connected=False``, so a supervising agent can react rather than
         take an unhandled exception.
         """
 
         class _RaisingDevice:
             name = "raising_arm"
+            is_connected = False
 
             @property
-            def is_connected(self) -> bool:
+            def config(self) -> object:
                 raise RuntimeError("serial bus fault")
 
         hw = _make_robot()
@@ -756,6 +757,32 @@ class TestStatusSurface:
         assert status["is_connected"] is False
         assert status["robot_name"] == "test_arm"
         assert "serial bus fault" in status["error"]
+        hw.cleanup()
+
+    def test_a_connection_that_cannot_be_probed_is_not_a_failed_probe(self):
+        """``is_connected`` raising is one unreadable fact, not a dead probe.
+
+        It is the only fact here that is a live probe, and every shipped
+        lerobot arm folds its cameras into it, so a camera unplugged mid-run
+        raises through it. Degrading the whole probe then reported
+        ``is_connected=False`` and ``task_status="error"`` for an arm that was
+        connected and driving - two false statements about a healthy task.
+        """
+
+        class _UnreadableConnection:
+            name = "raising_arm"
+            config = None
+
+            @property
+            def is_connected(self) -> bool:
+                raise OSError("VIDIOC_QUERYCAP: No such device")
+
+        hw = _make_robot()
+        hw.robot = _UnreadableConnection()
+        status = asyncio.run(hw.get_status())
+        assert "error" not in status
+        assert status["is_connected"] is None  # not read, so not False
+        assert status["task_status"] == "idle"  # the task was never the thing that failed
         hw.cleanup()
 
     def test_get_status_surfaces_task_error_message(self):
@@ -1057,6 +1084,14 @@ class _FakeReceiver:
         return {"source": "src", "frames_received": 10, "hz_actual": 50.0}
 
 
+class _PollableTeleop:
+    """Satisfies the teleoperator contract - what the publisher does with the
+    action is not under test here, only that a session is registered."""
+
+    def get_action(self) -> dict[str, float]:
+        return {"a.pos": 0.0}
+
+
 class TestTeleopPublish:
     def test_publish_requires_active_mesh(self):
         hw = _make_robot()
@@ -1073,7 +1108,7 @@ class TestTeleopPublish:
         hw = _make_robot()
         hw.mesh = _FakeMesh(alive=True)
         hw.peer_id = "peer-1"
-        result = hw.start_teleop_publish(teleoperator=object(), device_name="leader", method="arm", hz=50.0)
+        result = hw.start_teleop_publish(teleoperator=_PollableTeleop(), device_name="leader", method="arm", hz=50.0)
         assert result["status"] == "success"
         assert "peer-1" in result["content"][0]["text"]
         assert hw._input_publishers["leader"].started is True
@@ -1086,9 +1121,9 @@ class TestTeleopPublish:
         hw = _make_robot()
         hw.mesh = _FakeMesh(alive=True)
         hw.peer_id = "peer-1"
-        hw.start_teleop_publish(teleoperator=object(), device_name="leader")
+        hw.start_teleop_publish(teleoperator=_PollableTeleop(), device_name="leader")
         first = hw._input_publishers["leader"]
-        hw.start_teleop_publish(teleoperator=object(), device_name="leader")
+        hw.start_teleop_publish(teleoperator=_PollableTeleop(), device_name="leader")
         assert first.stopped is True
         assert hw._input_publishers["leader"] is not first
         hw.cleanup()

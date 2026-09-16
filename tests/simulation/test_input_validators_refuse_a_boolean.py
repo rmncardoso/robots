@@ -549,6 +549,39 @@ _NOT_AN_INPUT_DOMAIN = {
     # tests/simulation/test_rollout_duration_must_produce_a_control_step.py fails
     # when either delegation is dropped.
     "_validate_duration": "coerces only factors their own domains accepted",
+    # Holds already-coerced coordinates to MuJoCo's mjMAXVAL ceiling. Every
+    # caller runs its own domain first - set_joint_positions through
+    # _coerce_joint_state_map, move_object / add_object through
+    # coerce_pose_vector and coerce_orientation_quaternion - and each of those
+    # refuses a boolean by name, so one is answered with its own reason and
+    # never reaches this float(). Pinned behaviourally rather than only claimed
+    # here: tests/simulation/mujoco/
+    # test_a_qpos_write_beyond_mujocos_ceiling_is_refused.py fails when any of
+    # those delegations is dropped.
+    "qpos_ceiling_error": "coerces only coordinates their own domains accepted",
+    # Names the horizontal axis of ``ee_pos - base_pos``, and the ``str | None``
+    # it returns is that axis rather than a refusal - the _prim_body_state shape.
+    # The end-effector frame and the live floating-base pose are read off mjData.
+    # The third leg of that base is caller-named: a model with several root
+    # bodies has no one measured base pose, so get_robot_state falls back to the
+    # ``add_robot`` ``position``. That request went through coerce_pose_vector,
+    # which refuses a boolean component by name, so a boolean cannot reach this
+    # float() from there either. Pinned behaviourally rather than only claimed
+    # here: tests/simulation/test_pose_vector_domain_across_backends.py fails
+    # when add_robot stops routing its position through that shared domain, or
+    # when the domain stops refusing a boolean.
+    "reach_axis": "reads an end-effector offset out of the engine",
+    # Formats a suggested starting pose for a mounted camera. Its four float()
+    # calls coerce vectors measured out of mjData - the end-effector site
+    # position in the parent body's frame, and the approach axis derived from
+    # it - never a parameter: it takes ``parent_body: str`` and an engine-looked-up
+    # ``parent_id: int``, and coerces neither. The caller's own position and
+    # target go through coerce_pose_vector, which refuses a boolean component by
+    # name, before the mount rule is asked at all. Pinned behaviourally rather
+    # than only claimed here:
+    # tests/simulation/mujoco/test_add_camera_mounted_needs_a_pose_in_the_body_frame.py
+    # fails when a boolean coordinate stops being refused ahead of the mount refusal.
+    "_mounted_camera_start": "formats a pose read out of the engine",
 }
 
 _GUARDED_VALIDATORS = {

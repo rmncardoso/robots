@@ -44,6 +44,117 @@ from strands_robots.utils import (
 logger = logging.getLogger(__name__)
 
 
+def recorded_cameras_line(
+    joint_names: Sequence[str],
+    recorded_cameras: Mapping[str, str],
+    scene_cameras: Sequence[str],
+    cameras: Sequence[str] | None,
+    fps: float,
+) -> str:
+    """The schema line of ``start_recording``'s reply, naming the cameras.
+
+    ``"6 joints, 1 cameras @ 10fps"`` told an agent how many image columns the
+    dataset has but not which: a replayed agent read it, then asked ``render``
+    for ``top_camera`` - the name it assumed the recording used - and got "not
+    found. Available: ['default']". The count is replaced by the cameras
+    themselves, so the names an agent needs next are in the reply that created
+    the columns.
+
+    The name it lists is the SCENE camera name, because that is the one every
+    camera surface accepts: ``render``, ``render_depth``, ``get_frame``,
+    ``get_camera_params`` and ``start_cameras_recording`` resolve a name
+    through the compiled model (or a registered alias), and ``cameras=`` on the
+    next ``start_recording`` takes either spelling. The dataset column is named
+    by :func:`~strands_robots.utils.camera_schema_key`, which collapses the
+    ``/`` of a robot-scoped camera to ``__`` because a LeRobot feature name
+    cannot carry it - so listing the column key instead would hand back
+    ``so101__wrist`` for a camera the render surfaces only answer for as
+    ``so101/wrist``, reproducing the very refusal above one namespace deeper.
+    Both names matter (the column is what a policy's ``input_features`` and a
+    dataset reader see), so when they differ the column is named too rather
+    than chosen between.
+
+    When no camera is recorded, a second line says what the dataset WILL carry
+    (joint state and actions, no ``observation.images.*``) and why - which is
+    read off the scene rather than assumed, because the three causes have three
+    different remedies: a scene with no camera needs ``add_camera(...)``, a
+    ``cameras=`` that scoped every camera out needs a different subset, and a
+    scene whose cameras produce no frame (Isaac's ``render_mode="headless"``)
+    needs neither and would be sent on a false errand by either.
+
+    Args:
+        joint_names: The scalar joint columns of ``observation.state``.
+        recorded_cameras: Scene camera name -> dataset column key, in dataset
+            column order. Empty when the dataset carries no image column.
+        scene_cameras: Every camera the scene offers, recorded or not, which is
+            what distinguishes "there are none" from "none was recorded".
+        cameras: The caller's ``cameras=`` argument, ``None`` when it recorded
+            every camera. Only its presence is read - an empty selection is the
+            one cause the scene alone cannot explain.
+        fps: The dataset frame rate, as reported. Not the caller's raw value:
+            :func:`dataset_recording_option_error` has already refused anything
+            but a positive whole number inside the range of a 64-bit float, so
+            this renders a number rather than an arbitrary object.
+
+    Returns:
+        The schema line, newline-terminated, plus the no-camera line when there
+        is one.
+    """
+    names = list(recorded_cameras)
+    word = "camera" if len(names) == 1 else "cameras"
+    line = f"{len(joint_names)} joints, {len(names)} {word} {names} @ {fps}fps\n"
+    if names:
+        renamed = [(name, key) for name, key in recorded_cameras.items() if name != key]
+        if renamed:
+            columns = ", ".join(f"{name!r} -> observation.images.{key}" for name, key in renamed)
+            line += (
+                f"Dataset columns: {columns} (a dataset feature name cannot carry '/', so it "
+                "collapses to '__'; render and cameras= take the scene name above).\n"
+            )
+        return line
+    if not scene_cameras:
+        return line + (
+            "No cameras in the scene: the dataset carries joint state and actions only, "
+            "no observation.images.*. Call add_camera(...) before start_recording to record "
+            "images.\n"
+        )
+    if cameras is not None:
+        return line + (
+            f"No cameras recorded (cameras= scoped out {sorted(scene_cameras)}): the dataset "
+            "carries joint state and actions only, no observation.images.*. Omit cameras= or "
+            "name the ones to keep.\n"
+        )
+    return line + (
+        f"No cameras recorded: the scene's camera(s) {sorted(scene_cameras)} produce no frame to "
+        "record, so the dataset carries joint state and actions only, no observation.images.* "
+        "(the reason is logged as a warning above).\n"
+    )
+
+
+def resumed_dataset_line(*, episodes: int, frames: int) -> str:
+    """The line ``start_recording``'s reply adds when it resumed a dataset.
+
+    ``start_recording`` read exactly the same on a fresh dataset and on one it
+    appended to, so nothing told an agent recording demonstrations in a loop
+    that the episodes it was about to capture would join episodes already on
+    disk - nor how to start over instead. Every backend that resumes says so
+    through this one wording, because the counts named here are the counts
+    :meth:`DatasetRecordingMixin.stop_recording` measures the session against.
+
+    Args:
+        episodes: Episodes already in the dataset being resumed.
+        frames: Frames already in the dataset being resumed.
+
+    Returns:
+        One newline-terminated line, for interpolation into the reply.
+    """
+    return (
+        f"Resuming the existing dataset ({episodes} episode(s), {frames} frames); "
+        "this session's episodes are appended. Pass overwrite=True to record "
+        "from scratch instead.\n"
+    )
+
+
 def dataset_recording_option_error(method: str, fps: Any) -> dict[str, Any] | None:
     """Reject a LeRobotDataset recording option no dataset can be written at.
 
@@ -128,6 +239,27 @@ def dataset_recording_posture_error(method: str, param: str, value: Any) -> dict
     return None
 
 
+def _schema_key_collisions(camera_names: Iterable[str]) -> dict[str, list[str]]:
+    """Group the camera names that collapse to one :func:`~strands_robots.utils.camera_schema_key`.
+
+    Blank names are ignored: a backend skips an unnamed camera, so it names
+    neither a dataset column nor a file.
+
+    Args:
+        camera_names: Scene camera names, in the backend's own order.
+
+    Returns:
+        ``{the shared key: the names that collapse to it}``, sorted by key and
+        holding only the keys more than one name claims.
+    """
+    groups: dict[str, list[str]] = {}
+    for name in camera_names:
+        if not name:
+            continue
+        groups.setdefault(camera_schema_key(name), []).append(name)
+    return {key: members for key, members in sorted(groups.items()) if len(members) > 1}
+
+
 def camera_schema_key_collision_error(method: str, camera_names: Iterable[str]) -> dict[str, Any] | None:
     """Error envelope when two scene cameras share one dataset feature name.
 
@@ -172,12 +304,7 @@ def camera_schema_key_collision_error(method: str, camera_names: Iterable[str]) 
         A tool-style error envelope, or ``None`` when every name has a distinct
         key.
     """
-    groups: dict[str, list[str]] = {}
-    for name in camera_names:
-        if not name:
-            continue
-        groups.setdefault(camera_schema_key(name), []).append(name)
-    collisions = {key: members for key, members in sorted(groups.items()) if len(members) > 1}
+    collisions = _schema_key_collisions(camera_names)
     if not collisions:
         return None
     described = "; ".join(f"{key!r} <- {sorted(members)}" for key, members in collisions.items())
@@ -193,6 +320,54 @@ def camera_schema_key_collision_error(method: str, camera_names: Iterable[str]) 
                     "after the other one, and if they render at different sizes the first frame is "
                     "rejected and the episode is lost. Rename one of them (add_camera(name=...)) so "
                     "the names still differ once '/' becomes '__', then record again."
+                )
+            }
+        ],
+    }
+
+
+def camera_clip_name_collision_error(method: str, camera_names: Iterable[str]) -> dict[str, Any] | None:
+    """Error envelope when two cameras would write to one MP4 clip.
+
+    A raw camera recording writes one clip per camera into ``output_dir``, and a
+    camera's ``/`` namespace separator cannot survive into a file name - there
+    it names a directory, so ``arm0/wrist`` would put the clip one level below
+    the directory the caller asked for, under a name the recording tag is
+    missing from. The separator is therefore written as ``__``
+    (:func:`~strands_robots.utils.camera_schema_key`, the same collapse that
+    names the dataset column for that camera, so a clip and its
+    ``observation.images.*`` feature are spelled alike).
+
+    That mapping is not injective: ``arm0/wrist`` and ``arm0__wrist`` are two
+    cameras in the scene and one file on disk, so one camera's clip would
+    overwrite the other's while the result reported both as written. It is
+    refused as the recording starts, before a frame is captured - where
+    :func:`camera_schema_key_collision_error` refuses the same pair of names for
+    the dataset sink.
+
+    Args:
+        method: The public method name, used to prefix the message.
+        camera_names: The cameras this recording will capture.
+
+    Returns:
+        A tool-style error envelope, or ``None`` when every camera names its own
+        clip.
+    """
+    collisions = _schema_key_collisions(camera_names)
+    if not collisions:
+        return None
+    described = "; ".join(f"{key!r} <- {sorted(members)}" for key, members in collisions.items())
+    return {
+        "status": "error",
+        "content": [
+            {
+                "text": (
+                    f"{method}: these cameras do not name distinct MP4 clips: {described}. A "
+                    "camera's '/' namespace separator cannot be part of a file name (it names a "
+                    "directory), so it is written as '__' - which makes these names one file, and "
+                    "the clip flushed first would be overwritten by the other. Rename one of them "
+                    "(add_camera(name=...)) or pass cameras=[...] naming only one of them, then "
+                    "record again."
                 )
             }
         ],
@@ -843,6 +1018,59 @@ class DatasetRecordingMixin:
         return world._backend_state
 
     @staticmethod
+    def _arm_dataset_recorder(state: dict[str, Any], recorder: Any, *, resumed: bool = False) -> str:
+        """Open a recording session on ``recorder``, and say what opening it means.
+
+        Every backend's ``start_recording`` arms the recorder through here, so
+        the shared lifecycle can measure a SESSION rather than a dataset.
+        ``DatasetRecorder.resume`` seeds ``frame_count``/``episode_count`` with
+        the dataset's totals (so the saved report covers the whole dataset),
+        which leaves those counters unable to say whether THIS session captured
+        anything: read alone they let a resumed session that captured nothing
+        clear :meth:`stop_recording`'s empty-capture guard on the PREVIOUS
+        sessions' frames and be reported as a saved episode. The counts the
+        session starts from are stashed here once, for every backend - a backend
+        that assigned ``state["dataset_recorder"]`` itself would silently get
+        that behaviour back.
+
+        Arming and announcing are one call because they are one decision: the
+        reply names the counts the session will be measured against, read back
+        out of the stash so the two can never disagree. The counters are read
+        defensively - a recorder that does not carry them opens a session at
+        zero rather than turning ``start_recording`` into "Dataset init failed".
+
+        Args:
+            state: The recording state mapping (see :meth:`_recording_state`).
+            recorder: The freshly created or resumed ``DatasetRecorder``.
+            resumed: Whether ``recorder`` was resumed from an existing dataset.
+
+        Returns:
+            The line the reply adds for a resume, or ``""`` for a fresh dataset.
+        """
+        state["dataset_recorder"] = recorder
+        state["frames_at_start"] = int(getattr(recorder, "frame_count", 0) or 0)
+        state["episodes_at_start"] = int(getattr(recorder, "episode_count", 0) or 0)
+        if not resumed:
+            return ""
+        return resumed_dataset_line(episodes=state["episodes_at_start"], frames=state["frames_at_start"])
+
+    @staticmethod
+    def _release_dataset_recorder(state: dict[str, Any]) -> None:
+        """Drop the active recorder and everything else scoped to its session.
+
+        The trajectory mirror and the start-of-session counts stashed by
+        :meth:`_arm_dataset_recorder` describe the recorder being released, so
+        they go with it rather than outliving it.
+
+        Args:
+            state: The recording state mapping (see :meth:`_recording_state`).
+        """
+        state["dataset_recorder"] = None
+        state["trajectory"] = []
+        state.pop("frames_at_start", None)
+        state.pop("episodes_at_start", None)
+
+    @staticmethod
     def _prepare_dataset_target(dataset_dir: Path, overwrite: bool) -> bool:
         """Resolve create-vs-resume and make ``dataset_dir`` safe for create().
 
@@ -950,6 +1178,58 @@ class DatasetRecordingMixin:
         last = state.get("last_dataset_root")
         return str(last) if last else None
 
+    def _active_dataset_repo_id(self) -> str | None:
+        """Id of the active or most-recently-recorded dataset.
+
+        Overrides :meth:`SimEngine._active_dataset_repo_id`, resolved exactly
+        like its :meth:`_active_dataset_root` counterpart - the live recorder
+        first, then the ``last_dataset_repo_id`` stashed at ``start_recording``.
+        """
+        recorder = self._active_recorder()
+        if recorder is not None:
+            try:
+                return str(recorder.repo_id)
+            except (AttributeError, TypeError):
+                pass
+        state = self._recording_state()
+        if state is None:
+            return None
+        last = state.get("last_dataset_repo_id")
+        return str(last) if last else None
+
+    def _stash_dataset_target(self, repo_id: str, root: str | None) -> Path:
+        """Resolve the directory a recording writes to, stashed with its id.
+
+        Every backend's ``start_recording`` resolves its target with
+        :func:`~strands_robots.dataset_recorder.resolve_dataset_dir` - the same
+        resolver ``DatasetRecorder.create()`` uses, so the facade and the
+        recorder agree on where a dataset lives (honouring ``$HF_LEROBOT_HOME``)
+        - and stashes it as ``last_dataset_root`` for the consumers that run
+        after the recorder is dropped (:meth:`_active_dataset_root`). The id it
+        was recorded under is stashed beside it, because a reader handed only an
+        ``owner/name`` id cannot derive a directory the caller chose with
+        ``root=``.
+
+        Resolving and stashing in ONE place is the point: the pair was written
+        out longhand in all three backends, so a value added to one of them left
+        the other two recording datasets no reader could locate.
+
+        Args:
+            repo_id: HuggingFace dataset id (``owner/name``) or a local path.
+            root: Explicit local dataset directory, if any.
+
+        Returns:
+            The resolved directory, for the caller's overwrite/resume logic.
+        """
+        from strands_robots.dataset_recorder import resolve_dataset_dir
+
+        dataset_dir = resolve_dataset_dir(repo_id, root)
+        state = self._recording_state()
+        if state is not None:
+            state["last_dataset_root"] = str(dataset_dir)
+            state["last_dataset_repo_id"] = repo_id
+        return dataset_dir
+
     def stop_recording(
         self,
         *,
@@ -975,6 +1255,16 @@ class DatasetRecordingMixin:
         recorder (via its ``on_frame`` hook); ``eval_policy`` / ``evaluate`` /
         ``replay_episode`` and bare ``step`` loops do not, so recording around
         those produces zero frames and is reported as an error.
+
+        The frames a ``strict=False`` recorder dropped are reported here too,
+        because this is where the recorder is released - a count left unread
+        here is a loss no caller can measure afterwards. It reaches the caller
+        two ways. When every write failed the dataset is empty for that reason
+        and the refusal names it, rather than the loop classification above,
+        which would prescribe the recipe the caller already followed. When only
+        some failed the session stays a success (``strict=False`` documents
+        dropping a failed write and completing) that reports how short it is,
+        in the text and in ``dropped_frame_count``.
 
         Takes no destination. The dataset root is chosen once, at
         ``start_recording(root=...)``, and the recorder has been writing there
@@ -1005,9 +1295,12 @@ class DatasetRecordingMixin:
             ``parquet_episode_count`` (the dataset's ``meta.total_episodes``, or
             ``None`` when the recorder exposes no dataset handle, that layout
             carries no such attribute, or the value cannot be read as an int -
-            an unreadable count is reported as no reading, never as a zero) and
+            an unreadable count is reported as no reading, never as a zero),
             ``episode_count_mismatch`` (the two counts were both read and
-            disagreed, so the on-disk one won).
+            disagreed, so the on-disk one won) and ``dropped_frame_count``
+            (frames the recorder was fed and could not write, swallowed by
+            ``strict=False``; ``frame_count`` plus this is what the session
+            attempted).
         """
         # ``push_to_hub`` selects whether the finished dataset is published, so
         # it is checked before it is read - by the idle path just below and by
@@ -1020,6 +1313,8 @@ class DatasetRecordingMixin:
             return self._stop_recording_idle(push_to_hub=push_to_hub, bucket=bucket, run_id=run_id)
 
         state["recording"] = False
+        # The step-fed frame clock belongs to the session that just closed.
+        state.pop("step_recording_due", None)
         recorder = state.get("dataset_recorder", None)
 
         if recorder is None:
@@ -1039,18 +1334,34 @@ class DatasetRecordingMixin:
         #      wrongly fail an otherwise-complete dataset.
         #   3. Nothing ever captured (frame_count == 0): fail loudly instead of
         #      writing a 0-frame dataset. This happens when the rollout was
-        #      driven by eval_policy / evaluate / replay_episode or a bare step
-        #      loop - none of which feed the active recorder (only run_policy's
-        #      on_frame hook calls add_frame). Previously stop_recording reported
+        #      driven by eval_policy / evaluate / replay_episode without a hook
+        #      (only a rollout's on_frame hook calls add_frame, and run_policy,
+        #      start_policy and run_multi_policy each launch one), or by a step
+        #      loop on a backend other than MuJoCo, whose ``step`` feeds the
+        #      recorder at the dataset fps. Previously stop_recording reported
         #      success with "0 frames, 0 episode(s)", silently producing a
         #      dataset with only meta/info.json (no parquet/video).
         pending = getattr(recorder, "episode_frame_count", 0)
-        captured = getattr(recorder, "frame_count", 0)
+        # ``frame_count`` is seeded with the dataset's total when a dataset is
+        # RESUMED, so on its own it cannot say whether THIS session captured
+        # anything: a resumed session that captured nothing used to pass the
+        # empty-capture guard below on the previous sessions' frames and report
+        # "Episode saved" for an episode that was never written. Measure the
+        # session against the count stashed at start_recording.
+        total_frames = getattr(recorder, "frame_count", 0)
+        frames_at_start = int(state.get("frames_at_start", 0) or 0)
+        episodes_at_start = int(state.get("episodes_at_start", 0) or 0)
+        captured = max(0, total_frames - frames_at_start)
+        # Frames the recorder was fed and could not write. A ``strict=False``
+        # recorder drops those and counts them here instead of raising, so they
+        # are the only record that the session lost data - and this method is
+        # where the recorder is released, so a count not reported here is a
+        # count no caller can ever read.
+        dropped = getattr(recorder, "dropped_frame_count", 0)
         if pending > 0:
             save_result = recorder.save_episode()
             if isinstance(save_result, dict) and save_result.get("status") == "error":
-                state["dataset_recorder"] = None
-                state["trajectory"] = []
+                self._release_dataset_recorder(state)
                 return {
                     "status": "error",
                     "content": [
@@ -1063,27 +1374,59 @@ class DatasetRecordingMixin:
                         }
                     ],
                 }
-        elif captured == 0:
-            state["dataset_recorder"] = None
-            state["trajectory"] = []
+        elif captured == 0 and dropped > 0:
+            # The recorder WAS fed and every write failed, so the loop
+            # classification below is the one cause that cannot apply: it would
+            # prescribe the recipe this caller already followed and never
+            # mention the drops. ``strict=False`` chose to swallow them, so the
+            # rollout reported success and this is the first refusal.
+            self._release_dataset_recorder(state)
             return {
                 "status": "error",
                 "content": [
                     {
                         "text": (
-                            "stop_recording captured no frames - dataset would be empty "
-                            "(0 frames). run_policy(...) feeds the recorder on its own: it "
-                            "installs the per-step on_frame hook that calls add_frame. "
-                            "eval_policy / evaluate_benchmark take an on_frame hook, so they "
-                            "record only when the caller passes one that calls add_frame. "
-                            "replay_episode, teleoperate and bare step loops have no such "
-                            "hook and cannot feed the recorder. To record a dataset: "
-                            "start_recording -> run_policy (once per episode) -> "
-                            "stop_recording."
+                            f"stop_recording: all {dropped} frame(s) the recorder was fed failed "
+                            "to write, so the dataset holds 0 frames. The recorder was built with "
+                            "strict=False, which drops a failed write and counts it in "
+                            "dropped_frame_count instead of raising - which is why the rollout "
+                            "reported success. Fix the write failure (the per-drop warnings from "
+                            "strands_robots.dataset_recorder name it) or record with strict=True, "
+                            "the default, so the first lost frame fails the rollout at the frame "
+                            "that lost it."
                         )
                     }
                 ],
             }
+        elif captured == 0:
+            self._release_dataset_recorder(state)
+            # A resumed session is measured against the dataset it resumed:
+            # nothing was appended, so the dataset is exactly as it was.
+            resumed_note = (
+                (
+                    f"This session captured no frames: the resumed dataset {recorder.repo_id} "
+                    f"({frames_at_start} frames, {episodes_at_start} episode(s)) is unchanged "
+                    "and no episode was saved. "
+                )
+                if frames_at_start > 0
+                else ""
+            )
+            recipe = (
+                "stop_recording captured no frames - dataset would be empty "
+                "(0 frames). run_policy(...) feeds the recorder on its own: it "
+                "installs the per-step on_frame hook that calls add_frame. "
+                "eval_policy / evaluate_benchmark take an on_frame hook, so they "
+                "record only when the caller passes one that calls add_frame. "
+                "replay_episode and teleoperate have no such hook and cannot feed "
+                "the recorder. On the MuJoCo backend step() records too: one frame per "
+                "1/fps seconds of sim time while a recording is open, so "
+                "set_joint_positions(hold=True) + step is a scripted demonstration "
+                "(a step call covering less sim time than one frame period captures "
+                "nothing, and its reply says so). To record a dataset: "
+                "start_recording -> run_policy (once per episode) or step through "
+                "the motion -> stop_recording."
+            )
+            return {"status": "error", "content": [{"text": resumed_note + recipe}]}
 
         repo_id = recorder.repo_id
         frame_count = recorder.frame_count
@@ -1153,8 +1496,19 @@ class DatasetRecordingMixin:
             elif push_result:
                 extra += f"\npush_to_hub FAILED: {push_result.get('message')}"
 
-        state["dataset_recorder"] = None
-        state["trajectory"] = []
+        self._release_dataset_recorder(state)
+        # The four facts of THIS save, kept past that teardown so
+        # get_recording_status can answer from them. It reads the trajectory
+        # mirror the release just cleared, so a 37-frame save was reported as
+        # "last episode: 0 steps" - the very sentence a sim that never recorded
+        # gives. They travel as one mapping because they describe one save: a
+        # reader must never pair this id with another save's counts.
+        state["last_save"] = {
+            "repo_id": repo_id,
+            "root": str(root),
+            "frame_count": frame_count,
+            "episode_count": episode_count,
+        }
 
         # #708 - if recorder.episode_count and parquet disagree, surface
         # it in the human-readable text too so an operator scanning the
@@ -1167,10 +1521,33 @@ class DatasetRecordingMixin:
         else:
             text_episode_note = ""
 
+        # A partial best-effort loss is reported rather than refused:
+        # ``strict=False`` documents dropping a failed write and completing, so
+        # the session is a success that is short by a measured amount.
+        if dropped:
+            logger.warning(
+                "stop_recording: %d frame(s) were dropped by this session (strict=False); "
+                "the dataset holds %d of the %d frames the recorder was fed",
+                dropped,
+                frame_count,
+                frame_count + dropped,
+            )
+            text_dropped_note = (
+                f"\n{dropped} frame(s) failed to write and were dropped (strict=False): "
+                f"the dataset holds {frame_count} of the {frame_count + dropped} frames recorded"
+            )
+        else:
+            text_dropped_note = ""
+
+        session_note = (
+            f" (+{captured} frames, +{max(0, episode_count - episodes_at_start)} episode(s) this session)"
+            if frames_at_start > 0
+            else ""
+        )
         text = (
             f"Episode saved to LeRobotDataset\n"
-            f"{repo_id} -- {frame_count} frames, {episode_count} episode(s)"
-            f"{text_episode_note}\n"
+            f"{repo_id} -- {frame_count} frames, {episode_count} episode(s){session_note}"
+            f"{text_episode_note}{text_dropped_note}\n"
             f"Local: {root}{extra}"
         )
 
@@ -1185,6 +1562,7 @@ class DatasetRecordingMixin:
                         "episode_count": episode_count,
                         "parquet_episode_count": parquet_episode_count,
                         "episode_count_mismatch": episode_count_mismatch,
+                        "dropped_frame_count": dropped,
                         "root": root,
                     }
                 },
@@ -1380,8 +1758,7 @@ class DatasetRecordingMixin:
             # episode buffer is in an undefined state); drop it so callers do
             # not keep appending into a poisoned recorder.
             state["recording"] = False
-            state["dataset_recorder"] = None
-            state["trajectory"] = []
+            self._release_dataset_recorder(state)
             return {
                 "status": "error",
                 "content": [{"text": f"save_episode failed: {save_result.get('message')}"}],
@@ -1477,9 +1854,12 @@ class DatasetRecordingMixin:
                 ``1`` to read in capture order),
                 ``drop_videos`` (proprio-only,
                 torchcodec-free; requires ``delta_timestamps`` with at least one
-                non-video key, else ValueError), ``repo_type`` (``"dataset"`` or
-                ``"bucket"``; ``"bucket"`` requires lerobot>=0.6.1, else
-                RuntimeError).
+                non-video key, else ValueError), ``repo_type`` (``"dataset"``
+                or ``"bucket"``, forwarded unconditionally: every
+                lerobot-bearing extra floors lerobot at
+                ``BUCKET_STREAMING_MIN_LEROBOT``, whose constructor accepts the
+                keyword, so a below-floor install surfaces lerobot's own
+                ``TypeError`` naming it rather than a refusal from here).
 
         Returns:
             A :class:`~strands_robots.streaming_dataset.StreamingDatasetReader`.
@@ -1501,25 +1881,62 @@ class DatasetRecordingMixin:
     def get_recording_status(self) -> dict[str, Any]:
         """Returns success in every lifecycle state (no world / not
         recording / recording) with a distinguishing message so callers can
-        poll it unconditionally without try/except."""
+        poll it unconditionally without try/except.
+
+        Every branch also carries a json block of the same shape - ``world``,
+        ``recording``, ``steps``, ``repo_id``, ``root``, ``last_save`` - so a
+        poller reads one mapping instead of parsing three sentences.
+
+        Idle reports the dataset this sim last SAVED, not the trajectory
+        mirror: ``stop_recording`` clears that mirror when it releases the
+        recorder, so reading it here answered "last episode: 0 steps" for a
+        37-frame save - byte-identical to the answer a sim that never recorded
+        gives, and the false confirmation of the "stopped before any frames"
+        diagnosis ``docs/troubleshooting.md`` sends an operator here to check.
+        The recipe it names carries ``root=`` so it is runnable whatever this
+        sim recorded afterwards.
+        """
         state = self._recording_state()
         if state is None:
             return {
                 "status": "success",
-                "content": [{"text": "No world. Call create_world to start recording."}],
+                "content": [
+                    {"text": "No world. Call create_world to start recording."},
+                    {"json": {"world": False, "recording": False, "steps": 0, "last_save": None}},
+                ],
             }
 
         recording = state.get("recording", False)
         steps = len(state.get("trajectory", []))
+        last = state.get("last_save")
+        last = last if isinstance(last, dict) else None
+        payload: dict[str, Any] = {
+            "world": True,
+            "recording": recording,
+            "steps": steps,
+            "last_save": last,
+        }
 
         if recording:
-            text = f"[recording] {steps} steps captured"
+            # The live recorder's own id and root, through the seams that
+            # prefer it - the dataset being written is the one fact a caller
+            # polling an open session cannot get anywhere else.
+            payload["repo_id"] = self._active_dataset_repo_id()
+            payload["root"] = self._active_dataset_root()
+            into = f" into {payload['repo_id']} at {payload['root']}" if payload["repo_id"] and payload["root"] else ""
+            text = f"[recording] {steps} steps captured{into}"
+        elif last is not None:
+            text = (
+                f"[idle] Not recording. Last saved: {last['repo_id']} - {last['frame_count']} frames, "
+                f"{last['episode_count']} episode(s) at {last['root']} "
+                f"(replay_episode(repo_id='{last['repo_id']}', root='{last['root']}') reads it back)"
+            )
         else:
-            text = f"[idle] Not recording (last episode: {steps} steps)"
+            text = "[idle] Not recording (nothing saved in this session)"
 
         return {
             "status": "success",
-            "content": [{"text": text}],
+            "content": [{"text": text}, {"json": payload}],
         }
 
     def _verify_resume_schema(

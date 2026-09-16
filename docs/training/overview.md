@@ -39,6 +39,8 @@ pip install "strands-robots[sim-mujoco,lerobot]" "lerobot[training]"   # trainin
 ```
 
 ```python
+import os
+
 from strands_robots import Robot, MockPolicy, create_policy
 from strands_robots.training import create_trainer, TrainSpec
 
@@ -64,7 +66,9 @@ if __name__ == "__main__":   # lerobot's DataLoader workers re-import this file 
     # 3. EXPORT - loadable artifact (HF-native passthrough for lerobot/groot)
     ckpt = trainer.export(spec, result.checkpoint_dir)
 
-    # 4. DEPLOY - load the freshly-trained checkpoint back as a Policy
+    # 4. DEPLOY - load the freshly-trained checkpoint back as a Policy;
+    #    lerobot_local is behind the trust-remote-code gate even for a local dir
+    os.environ.setdefault("STRANDS_TRUST_REMOTE_CODE", "1")
     policy = create_policy(ckpt, device="cpu")
     sim.run_policy(robot_name="so100", policy_object=policy,
                    instruction="pick up the red cube", n_steps=15)
@@ -99,7 +103,7 @@ launching.
 | `num_gpus` / `num_nodes` | `int` | `1` | zero, negative, fractional, `bool` |
 | `resume` / `streaming` | `bool` | `False` | a non-`bool`; `streaming` together with `val_episodes` |
 | `seed` | `int \| None` | `None` | negative |
-| `method` | `str` | `"full"` | anything but `full` / `lora` / `expert_only` / `frozen_backbone` |
+| `method` | `str` | `"full"` | anything the selected backend cannot forward - LeRobot takes `full` / `lora` / `expert_only`, GR00T `full` / `frozen_backbone` (name components with `tune` instead), Cosmos3 `full` only |
 | `lora_r` / `lora_alpha` | `int \| None` | `None` | non-positive |
 | `tune` | `dict[str, bool]` | `{}` | keys outside `llm` / `visual` / `projector` / `diffusion`; a non-`bool` value; a policy whose config has no such switches (GR00T via `groot` or `lerobot_local` `policy_type="groot"`) |
 | `embodiment` | `str \| None` | `None` | a policy whose config has no embodiment tag (only GR00T declares one; others take their shape from the dataset) |
@@ -113,7 +117,7 @@ launching.
 ```python
 from strands import Agent
 from strands_robots import Robot
-from strands_robots.tools import train_policy
+from strands_robots import train_policy
 
 agent = Agent(tools=[Robot("so100", mesh=False), train_policy])
 agent("Record 50 cube-pick episodes, then post-tune lerobot ACT on the dataset "
@@ -168,15 +172,22 @@ run: a `policy_type` whose stats want quantiles (`molmoact2`, `pi05`) on a
 dataset without `q01..q99`; a `codebase_version` older than the installed
 lerobot reads (names the converter); `val_episodes` on a streamed, multi-task,
 or count-less dataset (lerobot splits by fraction per task); `extra["relative_actions"]`
-on any policy other than `pi0` / `pi05` / `pi0_fast`.
+on any policy other than `groot` / `pi0` / `pi05` / `pi0_fast`.
 
 **Reward models train through the same trainer.** `extra["reward_model"]`
 selects a lerobot reward model (`sarm`, `robometer`, `topreward`,
 `reward_classifier`) with that type's own fields, and
 `extra["sample_weighting"]` (`type`, `progress_path`, `head_mode`, `kappa`,
-`epsilon`) weights a policy run by RA-BC progress. Both dicts are refused before
-launch for a field the chosen type has no home for, for a `type` lerobot does not
-ship, and for the pipeline-ordering mistake of weighting a reward-model run.
+`epsilon`, plus `extra_params` for a scheme's own knobs) weights a policy run by
+RA-BC progress. Neither field list is written down in this trainer: both are read
+off the installed lerobot - the reward type's own config fields, and
+`SampleWeightingConfig`'s fields - so a field lerobot adds is configurable the day
+it lands and the refusal below names the surface as it actually is. Both dicts are
+refused before launch for a field the chosen type has no home for, for a `type`
+lerobot does not ship, and for the pipeline-ordering mistake of weighting a
+reward-model run. A `type` lerobot does not ship is reported on its own: an
+unresolved type has no config class, so nothing is claimed about which fields it
+takes - correct the name and the field check runs against the real one.
 The progress parquet between the two runs is lerobot's to produce:
 
 ```bash
@@ -195,9 +206,17 @@ frames with a trained reward model, load it with lerobot's `make_reward_model`.
 `embodiment` + `tune` + `extra["groot_root"]` drive `launch_finetune.py`; with
 `extra={"policy_type": "groot"}` the same two fields reach lerobot's own
 `GrootConfig(embodiment_tag=..., tune_projector=...)` instead, discovered off the
-config class - see [Isaac-GR00T](../policies/groot.md). `num_gpus` + `extra["cosmos_root"]` +
+config class - see [Isaac-GR00T](../policies/groot.md). GR00T freezes components
+individually rather than by strategy, so `method="expert_only"` is refused for it
+and the set is named directly: `tune={"projector": False}` trains the diffusion
+action head with everything before it frozen. `num_gpus` + `extra["cosmos_root"]` +
 `extra["sft_toml"]` drive `prepare()` (DCP convert), `train()` (`torchrun`) and
 `export()` (DCP -> safetensors) - see [Cosmos3](../policies/cosmos3.md).
+
+Neither backend takes a LoRA request. GR00T has no config field to carry one and
+Cosmos3 writes no adapter override, so `method="lora"` is refused by `validate()`
+instead of being run as the full fine-tune the caller did not ask for; on Cosmos3
+a different tuning strategy belongs in the recipe TOML (`extra["sft_toml"]`).
 
 ## Dependencies & extras (per provider)
 

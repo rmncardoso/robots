@@ -81,14 +81,46 @@ logger = logging.getLogger(__name__)
 # list: the live set is read from lerobot's ``PreTrainedConfig`` draccus
 # ChoiceRegistry (see :func:`_lerobot_policy_types`) - the same zero-maintenance
 # discovery reward models / robots / teleops / cameras already use. Any policy
-# lerobot ships (act, smolvla, the pi0 family, groot, xvla, and newer additions
-# such as eo1, evo1, lingbot_va, molmoact2, wall_x, ...) or a plugin registers is
-# reachable with no change here. The static set below is the FALLBACK used ONLY
-# when lerobot's registry is unavailable (lerobot not importable), where training
-# cannot run anyway but ``validate()`` should still produce a useful offline
-# message.
+# lerobot ships or a plugin registers is reachable with no change here. The
+# static set below is the FALLBACK used ONLY when lerobot's registry is
+# unavailable (lerobot not importable), where training cannot run anyway but
+# ``validate()`` should still produce a useful offline message - which means the
+# snapshot has to name every type the installed lerobot registers, or the
+# offline message says a policy lerobot ships "is not LeRobot-native".
+#
+# Two invariants keep it honest, both pinned by the test suite so a lerobot
+# release that adds or removes a policy type fails there rather than drifting
+# silently (same posture as :data:`_LEROBOT_CODEBASE_VERSION_FALLBACK` and
+# :data:`_SAMPLE_WEIGHTING_KEYS_FALLBACK`):
+#
+#   1. This set EQUALS the live ``PreTrainedConfig`` registry of the installed
+#      lerobot.
+#   2. Every per-capability snapshot below is a SUBSET of this set. A capability
+#      set names lerobot-native types by definition, so a type this set omits
+#      while a capability set names it would make one offline gate contradict
+#      another about the same policy.
 _LEROBOT_POLICY_TYPES_FALLBACK = frozenset(
-    {"act", "diffusion", "vqbet", "tdmpc", "smolvla", "pi0", "pi05", "pi0_fast", "groot", "xvla"}
+    {
+        "act",
+        "diffusion",
+        "eo1",
+        "evo1",
+        "fastwam",
+        "gaussian_actor",
+        "groot",
+        "lingbot_va",
+        "molmoact2",
+        "multi_task_dit",
+        "pi0",
+        "pi05",
+        "pi0_fast",
+        "smolvla",
+        "tdmpc",
+        "vla_jepa",
+        "vqbet",
+        "wall_x",
+        "xvla",
+    }
 )
 
 _SUPPORTED_METHODS = {"full", "lora", "expert_only"}
@@ -140,8 +172,9 @@ def _module_available(name: str) -> bool:
 # side and the matching AbsoluteActionsProcessorStep on the output side, both
 # built from ``config.use_relative_actions`` and saved into the checkpoint's
 # pre/post processors). Discovered live per policy type off the config class
-# (see :func:`_policy_supports_relative_actions`); the static set is the offline
-# FALLBACK. Currently the pi0 family and groot expose the field.
+# (see :func:`_policy_supports_relative_actions`); the static set below is the
+# offline FALLBACK and the only written roster - prose that re-lists it goes
+# stale silently, so the docs roster is graded against this gate instead.
 _RELATIVE_ACTION_POLICY_TYPES_FALLBACK = frozenset({"pi0", "pi05", "pi0_fast", "groot"})
 
 # LeRobot policy types whose config exposes ``train_expert_only`` (freeze the
@@ -227,8 +260,20 @@ _V21_TO_V30_CONVERTER = "lerobot.scripts.convert_dataset_v21_to_v30"
 # (``cfg.sample_weighting``), replacing the flat ``use_rabc`` / ``rabc_*``
 # fields of earlier 0.5.x. The friendly keys map 1:1 onto that config's fields,
 # so the validated dict is forwarded to ``SampleWeightingConfig(**dict)``.
-# ``type`` selects the scheme: lerobot ships ``rabc`` and ``uniform``.
-_SAMPLE_WEIGHTING_KEYS = {"type", "progress_path", "head_mode", "kappa", "epsilon"}
+#
+# Because that is a 1:1 mapping, the accepted keys are read off the installed
+# dataclass by :func:`_sample_weighting_fields` and this set is only the offline
+# fallback - the same live-then-fallback shape ``extra['reward_model']`` uses
+# through :func:`_reward_friendly_fields`. Written down instead, the set had
+# drifted from the dataclass: ``extra_params`` - the field the config's own
+# docstring names as where "additional type-specific parameters" go - was
+# missing, so the one key that carries a scheme's own knobs was refused as
+# unsupported.
+_SAMPLE_WEIGHTING_KEYS_FALLBACK = frozenset({"type", "progress_path", "head_mode", "kappa", "epsilon", "extra_params"})
+
+# ``type`` selects the scheme: lerobot ships ``rabc`` and ``uniform``. Unlike the
+# field set there is no live surface to read this from - ``make_sample_weighter``
+# dispatches on an if-chain rather than a registry - so it stays written down.
 _SAMPLE_WEIGHTING_TYPES = {"rabc", "uniform"}
 
 # LeRobot reward-model types (``--reward_model.type`` / make_reward_model_config
@@ -406,9 +451,9 @@ def _dataset_quantile_stats_present(dataset_root: str) -> bool | None:
     Reads ``meta/stats.json`` (lerobot's ``STATS_PATH``, the aggregate stats
     ``load_stats`` feeds to normalization). Returns ``True`` when quantile keys
     are present, ``False`` when the file exists but lacks them, and ``None`` when
-    the file is absent or unreadable (unknown - e.g. a Hub dataset with no
-    materialized local cache), so a definite miss can be flagged without false
-    positives on the unknown case.
+    the file is absent, unreadable, or holds a document that is not a JSON object
+    (unknown - e.g. a Hub dataset with no materialized local cache), so a
+    definite miss can be flagged without false positives on the unknown case.
 
     Unreadable is ``ValueError`` and not the narrower ``json.JSONDecodeError``:
     a partially-synced file carries bytes the declared encoding does not
@@ -422,6 +467,13 @@ def _dataset_quantile_stats_present(dataset_root: str) -> bool | None:
         with open(stats_path, encoding="utf-8") as fh:
             stats = json.load(fh)
     except (OSError, ValueError):
+        return None
+    if not isinstance(stats, dict):
+        # A document that parses but is not a JSON object carries no per-feature
+        # stats to look in, so it is the same UNKNOWN as an unreadable file.
+        # ``_stats_have_quantiles`` answers ``False`` for it - correct for a
+        # predicate over a mapping, and the DEFINITE miss here, which refuses a
+        # QUANTILES-normalizing run on evidence that was never gathered.
         return None
     return _stats_have_quantiles(stats)
 
@@ -459,8 +511,9 @@ def _dataset_codebase_version(dataset_root: str) -> str | None:
 
     Reads ``meta/info.json`` (the file lerobot's ``load_info`` reads, and the one
     :meth:`LerobotTrainer._dataset_total_episodes` already reads for the episode
-    count). Returns ``None`` when the file is absent, unreadable, or carries no
-    string ``codebase_version`` - the unknown case, e.g. a Hub dataset with no
+    count). Returns ``None`` when the file is absent, unreadable, holds a
+    document that is not a JSON object, or carries no string
+    ``codebase_version`` - the unknown case, e.g. a Hub dataset with no
     materialized local cache - so a DEFINITE mismatch can be reported without
     false positives on the unknown one. Unreadable is graded by ``ValueError``
     for the reason :func:`_dataset_quantile_stats_present` carries.
@@ -468,9 +521,15 @@ def _dataset_codebase_version(dataset_root: str) -> str | None:
     info_path = os.path.join(dataset_root, "meta", "info.json")
     try:
         with open(info_path, encoding="utf-8") as fh:
-            declared = json.load(fh).get("codebase_version")
+            document = json.load(fh)
     except (OSError, ValueError):
         return None
+    # A document that parses but is not a JSON object declares no version, the
+    # same unknown as an unreadable file; reading it as a mapping raised
+    # ``AttributeError`` out of this documented ``None`` and aborted the whole
+    # ``validate()`` preflight. The sibling episode-count readers in this module
+    # already name that failure in their own handlers.
+    declared = document.get("codebase_version") if isinstance(document, dict) else None
     return declared if isinstance(declared, str) else None
 
 
@@ -552,6 +611,35 @@ def _reward_friendly_fields(rtype: str) -> set[str]:
     base = {f.name for f in dataclasses.fields(RewardModelConfig)}
     own = {f.name for f in dataclasses.fields(reg[rtype]) if f.init}
     return own - base
+
+
+def _sample_weighting_fields() -> set[str]:
+    """Accepted ``extra['sample_weighting']`` keys (live dataclass, else fallback).
+
+    The friendly keys map 1:1 onto ``SampleWeightingConfig``'s fields - the
+    validated dict is forwarded as ``SampleWeightingConfig(**dict)`` - so the
+    accepted set IS that dataclass's constructor fields, read off the installed
+    lerobot rather than written down beside it. This is the shape
+    :func:`_reward_friendly_fields` already uses for the module's other
+    ``extra`` dict, and it costs the same zero maintenance: a field lerobot adds
+    is configurable the day it lands, and one it removes is refused by name
+    instead of being forwarded into a ``TypeError``.
+
+    Falls back to :data:`_SAMPLE_WEIGHTING_KEYS_FALLBACK` when the installed
+    lerobot has no ``lerobot.utils.sample_weighting`` (lerobot < 0.6.0), where
+    sample weighting cannot run anyway - the fallback exists so ``validate()``
+    still names the surface offline rather than accepting anything.
+
+    Returns:
+        The constructor (``init=True``) field names, ``type`` included: it is a
+        real field of this config, not a registry selector as it is for a reward
+        model, so the caller does not have to add it back.
+    """
+    try:
+        from lerobot.utils.sample_weighting import SampleWeightingConfig
+    except ImportError:
+        return set(_SAMPLE_WEIGHTING_KEYS_FALLBACK)
+    return {f.name for f in dataclasses.fields(SampleWeightingConfig) if f.init}
 
 
 # Hugging Face Hub dataset id: ``org/name`` (each segment alnum plus ._-). Used
@@ -890,11 +978,12 @@ class LerobotTrainer(Trainer):
         pipeline) restores the inverse decode automatically - no separate
         inference-side wiring is needed.
 
-        Only some policy configs expose ``use_relative_actions`` (currently the
-        ``pi0`` family and ``groot``); the supported set is discovered live from
-        lerobot's registry (:func:`_policy_supports_relative_actions`), and
-        :meth:`validate` rejects the flag for any policy type whose config lacks
-        the field rather than letting it become a silent no-op.
+        Only some policy configs expose ``use_relative_actions``; the supported
+        set is discovered live from lerobot's registry
+        (:func:`_policy_supports_relative_actions`) and named by the refusal, so
+        it is not re-listed here. :meth:`validate` rejects the flag for any
+        policy type whose config lacks the field rather than letting it become a
+        silent no-op.
         """
         return bool(spec.extra.get("relative_actions", False))
 
@@ -903,9 +992,11 @@ class LerobotTrainer(Trainer):
 
         RA-BC (Reward-Aligned Behavior Cloning) per-sample loss weighting is
         surfaced through the ``extra`` escape hatch as a single
-        ``sample_weighting`` dict with friendly keys (``type``,
-        ``progress_path``, ``head_mode``, ``kappa``, ``epsilon``). lerobot
-        >= 0.6.0 configures it via a nested ``SampleWeightingConfig`` on
+        ``sample_weighting`` dict whose keys are the fields of lerobot's
+        ``SampleWeightingConfig`` (``type``, ``progress_path``, ``head_mode``,
+        ``kappa``, ``epsilon``, ``extra_params``), read off the installed
+        dataclass by :func:`_sample_weighting_fields` rather than listed here.
+        lerobot >= 0.6.0 configures it via a nested ``SampleWeightingConfig`` on
         ``TrainPipelineConfig`` (``cfg.sample_weighting``); the friendly keys map
         1:1 onto that config's fields. Example::
 
@@ -1157,7 +1248,8 @@ class LerobotTrainer(Trainer):
         """Policy-training preflight (the default, ``cfg.policy`` path)."""
         problems: list[str] = []
         ptype = self._resolve_policy_type(spec)
-        if ptype not in _lerobot_policy_types():
+        ptype_is_native = ptype in _lerobot_policy_types()
+        if not ptype_is_native:
             problems.append(
                 f"policy_type '{ptype}' is not LeRobot-native (expected one of {sorted(_lerobot_policy_types())})"
             )
@@ -1167,7 +1259,22 @@ class LerobotTrainer(Trainer):
         if spec.method == "lora" and spec.tune.get("expert_only"):
             problems.append("lora and expert_only are mutually exclusive (both freeze the VLM)")
 
-        if self._relative_actions(spec) and not _policy_supports_relative_actions(ptype):
+        # Only a type that RESOLVED has a config class whose fields can be
+        # described. For one that did not, every capability probe below falls
+        # through to its offline fallback set, which a name lerobot does not
+        # register is never in - so each answers "not supported" and the gate
+        # describes the config of a policy this very response says does not
+        # exist, naming the types that DO expose the field (a list that contains
+        # the corrected spelling). Worse, each such problem prescribes dropping
+        # the knob, and for a typo of a policy that supports it - 'pi5' for
+        # 'pi05', 'grot' for 'groot' - a caller who acts on that advice deletes a
+        # legitimate setting while fixing the name. The type problem above
+        # already names the only fault, so the capability checks are scoped to a
+        # resolved type, the way :meth:`_validate_reward_model` scopes its field
+        # check. Checks that do not depend on the type - the method spelling
+        # above, the tune key spelling and value domains, sample_weighting - stay
+        # unconditional: they are just as true for a misspelled policy.
+        if ptype_is_native and self._relative_actions(spec) and not _policy_supports_relative_actions(ptype):
             supported = sorted(t for t in _lerobot_policy_types() if _policy_supports_relative_actions(t))
             problems.append(
                 f"relative_actions is not supported by policy_type '{ptype}' "
@@ -1175,7 +1282,7 @@ class LerobotTrainer(Trainer):
                 "drop extra['relative_actions'] or pick a supporting policy"
             )
 
-        if spec.method == "expert_only" and not _policy_supports_expert_only(ptype):
+        if ptype_is_native and spec.method == "expert_only" and not _policy_supports_expert_only(ptype):
             supported = sorted(t for t in _lerobot_policy_types() if _policy_supports_expert_only(t))
             problems.append(
                 f"method 'expert_only' is not supported by policy_type '{ptype}' "
@@ -1192,10 +1299,25 @@ class LerobotTrainer(Trainer):
             for k, v in sw.items():
                 if isinstance(v, str) and v.startswith("-"):
                     problems.append(f"sample_weighting['{k}'] must not start with '-' (would parse as a stray flag)")
+            # Grade the keys HERE, the way the reward-model dict above is graded.
+            # Both consumers filter on this same set, so a key it does not name
+            # is not forwarded by either: unnamed, ``build_command`` left it out
+            # of the argv and the run trained with the field's default while
+            # reporting success, and ``build_config`` raised from a method the
+            # preflight is supposed to have cleared. One gate, both paths.
+            accepted = _sample_weighting_fields()
+            unknown = sorted(k for k in sw if k not in accepted)
+            if unknown:
+                problems.append(
+                    f"extra['sample_weighting'] does not support field(s) {unknown}; "
+                    f"accepted keys are {sorted(accepted)} (the fields of lerobot's "
+                    "SampleWeightingConfig)."
+                )
 
-        problems.extend(self._embodiment_problems(spec, ptype))
-        problems.extend(self._tune_component_problems(spec, ptype))
-        problems.extend(self._quantile_stats_problems(spec, ptype))
+        problems.extend(self._tune_component_problems(spec, ptype, ptype_is_native))
+        if ptype_is_native:
+            problems.extend(self._embodiment_problems(spec, ptype))
+            problems.extend(self._quantile_stats_problems(spec, ptype))
         return problems
 
     def _embodiment_problems(self, spec: TrainSpec, ptype: str) -> list[str]:
@@ -1217,7 +1339,7 @@ class LerobotTrainer(Trainer):
             "supporting policy"
         ]
 
-    def _tune_component_problems(self, spec: TrainSpec, ptype: str) -> list[str]:
+    def _tune_component_problems(self, spec: TrainSpec, ptype: str, ptype_is_native: bool) -> list[str]:
         """Preflight ``tune``: the spelling, the policy's own toggles, the values.
 
         Two ways a component toggle goes quiet, and both end the same way - the
@@ -1234,6 +1356,18 @@ class LerobotTrainer(Trainer):
         freeze would train. Graded here by the flag's own name, the way
         ``resume`` and ``streaming`` are graded through
         :meth:`_resume_problems` / :meth:`_streaming_problems`.
+
+        The spelling and the value are properties of the request, so they are
+        graded whatever the policy type is. Only the middle check - which
+        components THIS policy exposes - describes a config class, so it is
+        scoped to a policy type that resolved, as :meth:`_validate_policy`
+        explains.
+
+        Args:
+            spec: The spec whose ``tune`` mapping is graded.
+            ptype: The resolved lerobot ``policy.type`` name.
+            ptype_is_native: Whether ``ptype`` is a type lerobot registers.
+                False suppresses the per-policy support check only.
         """
         requested = {k for k in spec.tune if k != "expert_only"}
         if not requested:
@@ -1247,7 +1381,7 @@ class LerobotTrainer(Trainer):
                 "mutual-exclusion check)"
             )
         unsupported = sorted((requested & set(_TUNE_COMPONENT_FIELDS)) - _policy_tune_components(ptype))
-        if unsupported:
+        if unsupported and ptype_is_native:
             supported = sorted(t for t in _lerobot_policy_types() if _policy_tune_components(t))
             problems.append(
                 f"tune component(s) {unsupported} are not supported by policy_type '{ptype}' "
@@ -1394,7 +1528,8 @@ class LerobotTrainer(Trainer):
         problems: list[str] = []
         rtype = self._reward_model_type(rm)
         valid_types = _reward_model_types()
-        if rtype not in valid_types:
+        type_is_native = rtype in valid_types
+        if not type_is_native:
             problems.append(
                 f"reward_model type '{rtype}' is not LeRobot-native (expected one of {sorted(valid_types)})"
             )
@@ -1402,13 +1537,24 @@ class LerobotTrainer(Trainer):
         # registry), so each reward type is configurable with its own knobs and
         # cross-type fields (e.g. SARM's annotation_mode on robometer) are
         # rejected with a clear message. Falls back to SARM's keys offline.
-        friendly = _reward_friendly_fields(rtype)
-        unknown = sorted(k for k in rm if k != "type" and k not in friendly)
-        if unknown:
-            problems.append(
-                f"reward_model type '{rtype}' does not support field(s) {unknown}; "
-                f"its configurable fields are {sorted(friendly)}."
-            )
+        #
+        # Only a type that RESOLVED has fields to grade a key against. For one
+        # that did not there is no config class, so _reward_friendly_fields
+        # answers with the offline fallback - SARM's keys - and grading against
+        # those states the "configurable fields" of a type this very gate just
+        # said does not exist, while refusing knobs that become valid the moment
+        # the type name is corrected (num_layers is a real SARM field). The type
+        # problem above already names the only fault there, so this check is
+        # scoped to a resolved type, the same way the annotation_mode check
+        # below is scoped to the type that declares that field.
+        if type_is_native:
+            friendly = _reward_friendly_fields(rtype)
+            unknown = sorted(k for k in rm if k != "type" and k not in friendly)
+            if unknown:
+                problems.append(
+                    f"reward_model type '{rtype}' does not support field(s) {unknown}; "
+                    f"its configurable fields are {sorted(friendly)}."
+                )
         if rtype == "sarm":
             am = rm.get("annotation_mode")
             if am is not None and am not in _SARM_ANNOTATION_MODES:
@@ -1431,8 +1577,6 @@ class LerobotTrainer(Trainer):
             problems.append(
                 f"method '{spec.method}' applies to policy training; reward-model training uses method='full'"
             )
-
-        import importlib.util
 
         if importlib.util.find_spec("lerobot.rewards") is None:
             problems.append(
@@ -1502,9 +1646,15 @@ class LerobotTrainer(Trainer):
                 cmd.append(f"--policy.{field_name}={'true' if enabled else 'false'}")
             sw = self._sample_weighting_dict(spec)
             if sw is not None:
-                for key in ("type", "progress_path", "head_mode", "kappa", "epsilon"):
-                    if key in sw:
-                        cmd.append(f"--sample_weighting.{key}={sw[key]}")
+                # Same live field set validate() graded, and the same
+                # ``_render_extra_value`` every other extra flag goes through, so
+                # a dict-valued field (``extra_params``) renders as the token
+                # draccus decodes back to it. A hand-written tuple here listed
+                # five of the six fields and dropped anything else in silence.
+                accepted = _sample_weighting_fields()
+                for key, value in sorted(sw.items()):
+                    if key in accepted:
+                        cmd.append(f"--sample_weighting.{key}={_render_extra_value(value)}")
         if spec.resume:
             ckpt_cfg = self._resume_config_path(spec.output_dir)
             if ckpt_cfg:
@@ -1783,7 +1933,6 @@ class LerobotTrainer(Trainer):
 
     def _build_policy_config(self, spec: TrainSpec) -> TrainPipelineConfig:
         """Build a policy ``TrainPipelineConfig`` (``cfg.policy`` set)."""
-        import dataclasses
         from pathlib import Path
 
         from lerobot.configs.default import PeftConfig
@@ -1920,11 +2069,13 @@ class LerobotTrainer(Trainer):
                     "or drop extra['sample_weighting']."
                 ) from exc
 
-            unsupported = sorted(k for k in sw if k not in _SAMPLE_WEIGHTING_KEYS)
+            accepted = _sample_weighting_fields()
+            unsupported = sorted(k for k in sw if k not in accepted)
             if unsupported:
                 raise ValueError(
                     f"extra['sample_weighting'] does not support field(s) "
-                    f"{unsupported}; accepted keys are {sorted(_SAMPLE_WEIGHTING_KEYS)}."
+                    f"{unsupported}; accepted keys are {sorted(accepted)} (the fields of "
+                    "lerobot's SampleWeightingConfig)."
                 )
             sw_type = sw.get("type", "rabc")
             if sw_type not in _SAMPLE_WEIGHTING_TYPES:

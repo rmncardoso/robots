@@ -179,6 +179,13 @@ class PpoTrainer(BaseRLAlgo):
             problems.append("output_dir is required")
         # gamma discounts the return this backend optimizes; the arithmetic that
         # consumes it never judges it, so the shared interval domain does.
+        # normalize_obs and normalize_advantage each select a posture - wrap the
+        # observation streams or feed them raw; standardize advantages per batch
+        # or use them as computed - and setup() and update() read both by
+        # truthiness, so the spellings a caller reaches for to opt out select the
+        # affirmative branch. The shared boolean domain refuses them by name.
+        problems.extend(self._observation_normalization_problems(spec))
+        problems.extend(self._advantage_normalization_problems(spec))
         problems.extend(self._discount_factor_problems(spec))
         # lam is the other factor of the same trace decay: the recursion decays by
         # gamma * lam, so the gate above cannot bound the trace on its own.
@@ -268,7 +275,7 @@ class PpoTrainer(BaseRLAlgo):
 
     def setup(self, spec: RLTrainSpec) -> None:
         """Build env, actor-critic, optimizer, normalizers, and rollout storage."""
-        require_optional("torch", purpose="PPO RL training (strands_robots.training.rl.ppo)")
+        require_optional("torch", extra="rl", purpose="PPO RL training (strands_robots.training.rl.ppo)")
         import torch
 
         from strands_robots.training.rl.normalization import EmpiricalNormalization

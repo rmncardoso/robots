@@ -5,6 +5,7 @@ import logging
 import math
 import numbers
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
@@ -182,8 +183,8 @@ def lerobot_version() -> str:
 DEFAULT_BASE_DIR = Path.home() / ".strands_robots"
 
 
-def get_base_dir() -> Path:
-    """Get the base directory for strands-robots user data.
+def base_dir_path() -> Path:
+    """Where the base directory for strands-robots user data resolves to.
 
     Resolution (in priority order):
 
@@ -191,6 +192,12 @@ def get_base_dir() -> Path:
        you want to relocate *all* strands-robots user data (assets,
        user registry, caches) to a non-default location.
     2. ``~/.strands_robots/`` - default.
+
+    This answers where the directory *is* without creating it, which is what
+    a caller that only compares paths needs: a validator asking whether a
+    host path lies under the base dir must not write to the filesystem to
+    answer, and must not fail when the home directory is unwritable.
+    :func:`get_base_dir` is the same resolution plus creation.
 
     Note:
         ``STRANDS_ASSETS_DIR`` **only** controls the assets subdirectory
@@ -200,10 +207,23 @@ def get_base_dir() -> Path:
         to be pointed.
 
     Returns:
-        Path to the base directory (created if needed).
+        Path to the base directory, whether or not it exists.
     """
     custom = os.getenv("STRANDS_BASE_DIR")
-    d = Path(custom) if custom else DEFAULT_BASE_DIR
+    return Path(custom) if custom else DEFAULT_BASE_DIR
+
+
+def get_base_dir() -> Path:
+    """Get the base directory for strands-robots user data, creating it if needed.
+
+    Resolves through :func:`base_dir_path` - see it for the resolution order
+    and for the read-only spelling to use when the directory only has to be
+    compared against, not written to.
+
+    Returns:
+        Path to the base directory (created if needed).
+    """
+    d = base_dir_path()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -2684,8 +2704,9 @@ def coerce_size_vector(method: str, param_name: str, size: Any) -> tuple[list[fl
 #: because it is read from two sides that must agree: the render entry points
 #: that route it, and the ``add_camera`` guard that refuses it as a *name*. Those
 #: two lived as eleven separate copies of the same tuple literal across
-#: ``mujoco/rendering.py``, ``mujoco/simulation.py``, ``newton/simulation.py`` and
-#: ``base.py`` - one of them written in a different order - and the MuJoCo
+#: ``simulation.mujoco.rendering``, ``simulation.mujoco.simulation``,
+#: ``simulation.newton.simulation`` and ``simulation.base`` - one of them
+#: written in a different order - and the MuJoCo
 #: ``add_camera`` had the set in a comment but not in code, which is exactly the
 #: drift that made a reserved name accepted there while Newton refused it.
 FREE_CAMERA_TOKENS: Final[tuple[str | None, ...]] = (None, "", "default", "free")
@@ -2748,6 +2769,101 @@ def reserved_camera_name_error(method: str, param_name: str, name: Any) -> str |
         f"{method}: {rendered} is reserved; pick a distinct camera name. "
         f"render/get_frame resolve {param_name}={rendered} to the free camera by an "
         f"explicit token check, so a camera created under it could never be rendered from."
+    )
+
+
+def free_camera_routing_rank(name: Any) -> int:
+    """Sort rank that orders the free view behind every real camera.
+
+    The routing-site counterpart to :func:`reserved_camera_name_error`. That
+    guard keeps a caller from *creating* a camera under a
+    :data:`FREE_CAMERA_TOKENS` name; this one keeps the free view a backend
+    creates for itself from outranking a camera the caller did create, wherever
+    cameras compete for a fixed number of slots.
+
+    ``create_world`` registers the built-in free view under ``"default"`` before
+    any ``add_camera`` call, so it is FIRST in ``list_cameras()`` and first among
+    the image entries of ``get_observation()``. Any consumer that fills N slots
+    from that sequence therefore hands slot 0 to a fixed three-quarter debug
+    view of the whole scene - a view no checkpoint was trained on and no caller
+    asked to be an input - and, when the slots run out, drops one of the
+    caller's real cameras to make room for it.
+
+    Used as a ``list.sort`` / ``sorted`` key, this sinks the token names to the
+    end while leaving the real cameras in their existing relative order (both
+    are stable), so it changes which camera a *guess* picks and nothing else. It
+    does not remove the free view from the candidates: a scene whose only camera
+    is the free view still fills the slot it would have filled.
+
+    Args:
+        name: An observation camera key. Membership is the whole rule, so the
+            answer agrees with :data:`FREE_CAMERA_TOKENS` for every member
+            (including the ``None`` / ``""`` spellings a render call site uses,
+            which no observation key can carry). A name that is not a token at
+            all is ranked with the real cameras; judging whether it is a usable
+            name belongs to the caller's own guard, not to an ordering.
+
+    Returns:
+        ``1`` for a free-camera routing token, ``0`` for every other name.
+    """
+    return 1 if name in FREE_CAMERA_TOKENS else 0
+
+
+def mounted_camera_pose_error(
+    method: str,
+    name: str,
+    parent_body: str | None,
+    position: Any,
+    target: Any,
+    *,
+    start: str | None = None,
+) -> str | None:
+    """Return an error message when a camera is mounted on a body with no pose of its own.
+
+    ``add_camera(parent_body=...)`` reads ``position`` and ``target`` in the
+    parent body's LOCAL frame. The free-camera defaults - ``[1, 1, 1]`` looking
+    at ``[0, 0, 0]`` - are a sensible world-frame overview, and a mistake in a
+    body frame: they place the camera 1.73 m from the body looking back at it,
+    a third-person view that rides along with the arm and shows the arm, which
+    is not the wrist view the mount exists for. Measured on
+    ``add_camera(name="wrist", parent_body="so101/gripper")`` (the exact
+    call ``list_bodies`` and the camera-naming guide suggested): a 320x240
+    render of the whole arm from above, the gripper a few pixels wide. Under
+    ``status="success"`` an agent has no reason to look twice, so a "wrist"
+    stream recorded into a dataset carried the wrong view end to end.
+
+    Both backends mount cameras (MuJoCo and Newton), so the rule lives here
+    beside :func:`camera_fov_error` for the same reason that one does: a call
+    one backend refuses must be refused by the other.
+
+    Args:
+        method: The calling method, opening the message (``"add_camera"``).
+        name: The camera's name, so the caller running several knows which.
+        parent_body: The mount, or ``None``/``""`` for a free camera - a free
+            camera never trips this rule.
+        position: The ``position`` argument as passed (``None`` = omitted).
+        target: The ``target`` argument as passed (``None`` = omitted).
+        start: Optional backend-computed starting pose for THIS body, appended
+            verbatim; when absent a generic hint closes the message.
+
+    Returns:
+        ``None`` when the camera is free or carries a pose of its own (either
+        of ``position`` / ``target`` supplied), else the refusal.
+    """
+    if not parent_body:
+        return None
+    if position is not None or target is not None:
+        return None
+    tail = start or (
+        "A few centimetres off the body's origin, looking along its approach axis, is the "
+        "usual start; render the camera and adjust."
+    )
+    return (
+        f"{method}: camera {name!r} is mounted on {parent_body!r}, so position and target are "
+        f"read in that body's LOCAL frame - and both were omitted. The free-camera defaults "
+        f"(position [1, 1, 1] looking at [0, 0, 0]) would place it 1.73 m from the body looking "
+        f"back at it: a third-person view that rides along with the arm, not a wrist view. Pass "
+        f"both in the body frame. {tail}"
     )
 
 
@@ -2905,9 +3021,11 @@ def camera_name_error(method: str, param_name: str, name: Any, *, routes_free_ca
     The whole name rule for a camera creation site, in one place and in one
     order: :func:`entity_name_error` first (a value that cannot be a registry
     key at all), then :func:`reserved_camera_name_error` (a ``str`` this
-    backend's own render entry points resolve past). Every ``add_camera``
-    reads it, so the order is a property of the rule rather than of whichever
-    body a caller reached.
+    backend's own render entry points resolve past), then
+    :func:`scoped_camera_name_error` (a ``str`` this backend registers happily
+    and the consumers that key frames by it read as structure). Every
+    ``add_camera`` reads it, so the order is a property of the rule rather than
+    of whichever body a caller reached.
 
     That order was the defect this composition removes. The two guards had been
     applied separately at each site, and the sites disagreed about where the
@@ -2947,13 +3065,168 @@ def camera_name_error(method: str, param_name: str, name: Any, *, routes_free_ca
 
     Returns:
         The first refusal in the documented order, or ``None`` when *name* can
-        address a camera on this backend.
+        address a camera on this backend *and* key that camera's frames at the
+        consumers which read the name as structure.
     """
     if (err := entity_name_error(method, param_name, name)) is not None:
         return err
-    if routes_free_camera_tokens:
-        return reserved_camera_name_error(method, param_name, name)
-    return None
+    if routes_free_camera_tokens and (err := reserved_camera_name_error(method, param_name, name)) is not None:
+        return err
+    return scoped_camera_name_error(method, param_name, name)
+
+
+#: The alphabet a camera token is written in: letters, digits, ``_`` and ``-``,
+#: opening on a letter or a digit. Both camera-name shapes below are built from
+#: this one string, so the door that takes a bare token and the door that takes a
+#: scoped one cannot come to accept different alphabets.
+_CAMERA_TOKEN_ALPHABET: Final = r"[A-Za-z0-9][A-Za-z0-9_-]*"
+
+#: What a camera's name in a ``cameras`` mapping may be: one bare token. Every
+#: consumer keys the camera's frames by this name, and each of them reserves
+#: punctuation of its own - see :func:`camera_token_error`.
+_CAMERA_TOKEN: Final = re.compile(rf"\A{_CAMERA_TOKEN_ALPHABET}\Z")
+
+#: What a camera's name in a sim scene may be: a bare token, optionally scoped to
+#: one robot as ``<robot>/<camera>``. One optional level, because that is the one
+#: namespace ``add_robot`` gives what it spawns and the only one the mesh strips -
+#: see :func:`scoped_camera_name_error`.
+_SCOPED_CAMERA_NAME: Final = re.compile(rf"\A{_CAMERA_TOKEN_ALPHABET}(?:/{_CAMERA_TOKEN_ALPHABET})?\Z")
+
+
+def camera_token_error(method: str, param_name: str, name: Any) -> str | None:
+    """Return an error message if ``name`` cannot key the camera it names.
+
+    A camera's name in a ``cameras`` mapping is not just a label: it is the
+    identity every downstream consumer keys that camera's frames by, and each of
+    them reserves punctuation of its own. So the name has to be a bare token
+    (:data:`_CAMERA_TOKEN`) at every door that accepts one - the
+    :class:`~strands_robots.hardware_robot.Robot` factory's ``cameras`` mapping
+    and the ``robot_cameras`` of
+    :func:`~strands_robots.tools.lerobot_teleoperate.lerobot_teleoperate` - and
+    the rule lives here, beside :func:`entity_name_error`, for the same reason
+    that one does: two doors onto one name must not accept different alphabets.
+
+    Three consumers, each of which reads a character it reserves as structure
+    rather than as part of the name:
+
+    * **The mesh topic.**
+      :meth:`~strands_robots.mesh.core.Mesh._encode_and_publish_frames`
+      publishes each frame on ``strands/<peer_id>/camera/<name>``. A ``/`` in
+      the name adds a topic level, so the frame lands under a key no
+      ``strands/*/camera/*`` subscription matches, and ``*`` / ``**`` are Zenoh
+      wildcards, which a ``put`` is routed by intersection - the frame is
+      delivered to every peer that subscribes to any camera rather than to the
+      one asking for this camera. Measured on this tree, a camera named
+      ``'wrist/ref'`` published its 274054-byte inline frame on
+      ``strands/rover-01/camera/wrist/ref``, which is the shape of the small S3
+      *pointer* the IoT transport exempts from its camera-frame drop
+      (:func:`~strands_robots.mesh.transport.iot_transport._is_camera_ref`), so
+      the whole frame was forwarded to the broker the drop exists to spare.
+    * **The S3 key.**
+      :meth:`~strands_robots.mesh.iot.camera_offload.CameraOffloader.s3_key_for`
+      joins the name into ``<prefix>/<peer_id>/<name>/<ts>.jpg``, so ``..``
+      walks out of the peer's own prefix.
+    * **The argv.** ``lerobot_teleoperate`` renders the entry into the nested
+      ``--robot.cameras`` dict lerobot's draccus CLI parses, where ``,``, ``:``,
+      ``{``, ``}``, ``=`` and whitespace are structure - a name carrying one
+      changes the shape of that dict rather than the value in it, and is
+      reported minutes later in a detached subprocess's log.
+
+    The name is additionally the dataset feature key a recording writes it under
+    (``observation.images.<name>``, see
+    :meth:`~strands_robots.dataset_recorder.DatasetRecorder.add_frame`), whose
+    ``.`` separator is the same kind of structure.
+
+    Args:
+        method: The surface being called, for the message prefix (e.g.
+            ``"Robot(cameras=...)"``).
+        param_name: What is being named, for the message (e.g.
+            ``"camera name"``).
+        name: The claimed camera name. Anything at all; a value that cannot be a
+            key of any kind is refused first by :func:`entity_name_error`.
+
+    Returns:
+        An error message naming the value and the alphabet, or ``None`` when
+        *name* is a bare token.
+    """
+    if (err := entity_name_error(method, param_name, name)) is not None:
+        return err
+    if _CAMERA_TOKEN.match(name) is not None:
+        return None
+    rendered = refusal_repr(name)
+    return (
+        f"{method}: {param_name}={rendered} is not a bare token. A camera's name is the "
+        "identity every consumer keys its frames by, and each reserves punctuation of its "
+        "own: the mesh publishes them on 'strands/<peer_id>/camera/<name>', where '/' adds a "
+        "topic level and '*' is a wildcard a put is routed by; the S3 offload joins it into "
+        "the object key, where '..' walks out of the peer's prefix; a recording writes it as "
+        "the 'observation.images.<name>' dataset feature key; and lerobot parses "
+        "--robot.cameras as a nested dict, where ',', ':', '{', '}', '=' and whitespace are "
+        "structure. Use letters, digits, '_' or '-'."
+    )
+
+
+def scoped_camera_name_error(method: str, param_name: str, name: Any) -> str | None:
+    """Return an error message if a sim camera's *name* cannot key its own frames.
+
+    The sim-scene counterpart to :func:`camera_token_error`. That rule holds a
+    camera's name to one bare token, because the name is the identity every
+    downstream consumer keys the camera's frames by and each of them reserves
+    punctuation of its own; this one applies the same alphabet to a sim scene,
+    where a name may additionally carry one namespace level.
+
+    One level, and not a free path, because a robot's namespace is one level:
+    ``add_robot`` registers every robot it spawns with
+    ``SimRobot.namespace = "<robot>/"`` and namespaces its bodies, joints and
+    actuators under it, so ``add_camera("alice/wrist_cam", ...)`` is how a wrist
+    camera is scoped to the robot ``alice``. That prefix is also the only one the
+    mesh removes: :meth:`~strands_robots.mesh.core.Mesh._publish_sim_cameras`
+    strips exactly ``r.namespace`` from each MuJoCo camera name before handing
+    the short name to
+    :meth:`~strands_robots.mesh.core.Mesh._encode_and_publish_frames`, so a
+    one-level scoped name reaches the topic as the bare token that function's
+    consumers require. A second level survives the strip, and is structure again.
+
+    Everything else is refused for the reasons :func:`camera_token_error`
+    documents: the mesh topic (a ``/`` adds a level no ``strands/*/camera/*``
+    subscription matches, and ``*`` / ``**`` are Zenoh wildcards a ``put`` is
+    routed by intersection), the S3 object key (``..`` walks out of the peer's
+    own prefix), the ``observation.images.<name>`` dataset feature key, and the
+    nested ``--robot.cameras`` dict lerobot's CLI parses. Measured on one
+    ``create_world`` before this guard, ``add_camera`` returned
+    ``status="success"`` for ``'..'``, ``'sub/../etc'``, ``'a b'``, ``'cam#1'``,
+    ``'*'``, ``'**'``, ``'a//b'``, ``'/lead'`` and ``'trail/'``, and
+    ``list_cameras`` reported every one of them.
+
+    Args:
+        method: The surface being called, for the message prefix (e.g.
+            ``"add_camera"``).
+        param_name: The parameter being validated, for the message.
+        name: The claimed camera name. Anything at all; a value that cannot be a
+            registry key of any kind is refused first by
+            :func:`entity_name_error`.
+
+    Returns:
+        An error message naming the value and the alphabet, or ``None`` when
+        *name* is a camera token optionally scoped to one robot.
+    """
+    if (err := entity_name_error(method, param_name, name)) is not None:
+        return err
+    if _SCOPED_CAMERA_NAME.match(name) is not None:
+        return None
+    rendered = refusal_repr(name)
+    return (
+        f"{method}: {param_name}={rendered} cannot key a camera's frames. A sim camera's name "
+        "is a bare token of letters, digits, '_' or '-', opening on a letter or a digit, "
+        "optionally scoped to one robot as '<robot>/<camera>' (the namespace add_robot gives "
+        "what it spawns, and the one the mesh strips). Every other character is structure to "
+        "a consumer that keys frames by this name: the mesh publishes them on "
+        "'strands/<peer_id>/camera/<name>', where a further '/' adds a topic level no "
+        "'strands/*/camera/*' subscription matches and '*' / '**' are wildcards a put is "
+        "routed by intersection; the S3 offload joins it into the object key, where '..' "
+        "walks out of the peer's prefix; and a recording writes it as the "
+        "'observation.images.<name>' dataset feature key."
+    )
 
 
 def published_string_error(value: Any, param: str, context: str) -> str | None:
@@ -3293,6 +3566,53 @@ def optional_callable_error(value: Any, param: str, context: str) -> str | None:
     if value is None or callable(value):
         return None
     return f"{context}: {param} must be callable or None, got {refusal_repr(value)}."
+
+
+def teleoperator_contract_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` cannot serve as a teleoperator.
+
+    The domain for the one collaborator every teleop surface consumes the same
+    way: a device polled for a joint command once per tick. A callable
+    ``get_action`` is the whole contract checked here - what it returns is
+    normalised by the loop that reads it (a dict, an array or a bare scalar all
+    resolve to a flat action), and no signature is inspected, for the reason
+    :func:`optional_callable_error` gives.
+
+    It lives here rather than beside one of its callers because those callers sit
+    in different layers - :mod:`strands_robots.teleop_mixin` holds the local
+    attach door, :class:`strands_robots.hardware_robot.Robot` the mesh publish
+    entry point, and :class:`strands_robots.mesh.input.InputPublisher` the
+    directly-drivable loop underneath it - and the accepted domain must not
+    diverge between them: a device one door turns away cannot be started by the
+    next.
+
+    Every one of those loops polls on a BACKGROUND thread, which is what makes
+    this worth refusing at the door rather than on first poll. A device with no
+    ``get_action`` raises inside the loop body, where the handler counts an error
+    and moves on to the next tick: the session reports ``running``, publishes
+    nothing at all, and falls silent once its logging budget is spent. On the
+    publish entry point the refusal also has to precede the teardown of a
+    publisher already registered under the same device name, or a device that can
+    never be polled costs the caller the working stream it was replacing.
+
+    Args:
+        value: The caller-supplied teleoperator.
+        param: The parameter it came from, used in the message.
+        context: Message prefix identifying the surface that received it -
+            normally the public method name.
+
+    Returns:
+        An error message, or ``None`` when the device can be polled.
+    """
+    if callable(getattr(value, "get_action", None)):
+        return None
+    return (
+        f"{context}: {param} must expose a callable get_action(), got "
+        f"{refusal_repr(value)} - it does not satisfy the teleoperator contract. "
+        "The loop that drives it polls get_action() once per tick on a background "
+        "thread, so a device without one yields a stream that reports running "
+        "while putting no frame on the wire."
+    )
 
 
 def boolean_flag_error(value: Any, param: str, context: str) -> str | None:

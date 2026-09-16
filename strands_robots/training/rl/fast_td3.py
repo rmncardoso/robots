@@ -163,6 +163,10 @@ class FastTd3Trainer(BaseRLAlgo):
             problems.append("output_dir is required")
         # gamma discounts the return this backend optimizes; the arithmetic that
         # consumes it never judges it, so the shared interval domain does.
+        # normalize_obs selects whether setup() wraps both observation streams in
+        # EmpiricalNormalization, and reads the flag by truthiness - so it takes
+        # the shared boolean domain ahead of the numeric knobs below.
+        problems.extend(self._observation_normalization_problems(spec))
         problems.extend(self._discount_factor_problems(spec))
         # policy_delay is the modulus that decides whether the actor and the
         # target networks move at all; a modulus the test never satisfies trains
@@ -228,30 +232,27 @@ class FastTd3Trainer(BaseRLAlgo):
         # gates cite as the precedent they generalize; it is now shared with them
         # rather than duplicated between this backend and its sibling.
         problems.extend(self._polyak_coefficient_problems(spec))
-        # learning_starts >= batch_size is a relation between two counts, so BOTH
-        # operands are asked of the shared count domain and the relation only of
-        # two values that are counts - a non-finite learning_starts makes ``<``
-        # answer False (every comparison against nan is False, and inf is below
-        # no int), so without the domain the relation passes and both consumers
-        # then read a value that is not a count: ``collect_rollout`` tests
-        # ``buffer.size < learning_starts`` to decide the random warmup and
-        # ``train`` tests ``buffer.size >= learning_starts`` to decide whether
-        # ``update()`` runs at all, so nan skips the warmup and takes zero
-        # gradient steps while inf warms up forever and takes zero gradient
-        # steps - a run that reports success having learned nothing. See
-        # FastSAC's identical guard for the full measured reasoning; the two
-        # off-policy backends share the warmup contract verbatim.
-        learning_starts_error = positive_count_error(spec.learning_starts, "learning_starts", self.provider_name)
-        if learning_starts_error is not None:
-            problems.append(learning_starts_error)
-        elif (
-            positive_count_error(spec.batch_size, "batch_size", self.provider_name) is None
-            and spec.learning_starts < spec.batch_size
-        ):
-            problems.append(
-                f"learning_starts ({spec.learning_starts}) must be >= batch_size ({spec.batch_size}) "
-                "so the first gradient step can sample a full batch"
-            )
+        # learning_starts is this backend's warmup threshold, and it must be at
+        # least batch_size or the first gradient step cannot sample a full batch.
+        # Both operands are counts, so the relation and each operand's domain are
+        # one rule - shared with the sibling off-policy backend that states it
+        # identically rather than inlined in both. The reasoning the relation
+        # rests on lives with it, in warmup_batch_relation_problems.
+        problems.extend(self._rl_warmup_batch_problems(spec))
+        # That relation sizes the FIRST batch; it does not make the threshold
+        # reachable. Two more caller-supplied counts bound the fill a run ever
+        # reaches - the step budget it collects, max(1, total_timesteps // steps)
+        # * steps, and buffer_size, the ring buffer's capacity - and either one
+        # below learning_starts takes zero gradient steps for the whole run while
+        # still reporting success with a checkpoint and an exported policy, the
+        # outcome the relation above and _rl_replay_problems each cite as the one
+        # they exist to refuse. Both were reachable with plain positive counts
+        # that pass every per-field domain: buffer_size=1 builds the same one-slot
+        # buffer as buffer_size=True, which the count rule refuses for exactly
+        # this outcome, and a total_timesteps below learning_starts warms up for
+        # the whole budget. Graded as a relation between counts, so a non-count is
+        # left to the domain gate that names it.
+        problems.extend(self._rl_warmup_reachability_problems(spec))
         # log_interval is this loop's checkpoint cadence - the modulus of the one
         # test that decides whether an intermediate checkpoint is written - so it
         # answers the same question save_freq does for a supervised run and takes
@@ -265,7 +266,7 @@ class FastTd3Trainer(BaseRLAlgo):
 
     def setup(self, spec: RLTrainSpec) -> None:
         """Build env(s), actor + twin critics (with targets), optimizers, and replay buffer."""
-        require_optional("torch", purpose="FastTD3 RL training (strands_robots.training.rl.fast_td3)")
+        require_optional("torch", extra="rl", purpose="FastTD3 RL training (strands_robots.training.rl.fast_td3)")
         import torch
 
         from strands_robots.training.rl.normalization import EmpiricalNormalization
@@ -319,7 +320,6 @@ class FastTd3Trainer(BaseRLAlgo):
         self._update_count = 0
         self._ep_return = 0.0
         self._ep_returns_vec = torch.zeros(spec.num_envs, device=self.device)
-        self._recent_returns: list[float] = []
 
     def _norm_actor(self, x: torch.Tensor, update: bool = True) -> torch.Tensor:
         return self.actor_norm(x, update=update) if self.actor_norm is not None else x
@@ -403,8 +403,6 @@ class FastTd3Trainer(BaseRLAlgo):
             else:
                 self._obs = next_obs
 
-        if ep_returns:
-            self._recent_returns = ep_returns
         mean_return = float(sum(ep_returns) / len(ep_returns)) if ep_returns else float(sum(step_rewards))
         return {
             "mean_reward": float(sum(step_rewards) / max(1, len(step_rewards))),
@@ -470,8 +468,6 @@ class FastTd3Trainer(BaseRLAlgo):
                         self._ep_returns_vec[i] = 0.0
             self._obs = next_obs
 
-        if ep_returns:
-            self._recent_returns = ep_returns
         mean_return = float(sum(ep_returns) / len(ep_returns)) if ep_returns else reward_sum / max(1, N)
         return {
             "mean_reward": reward_sum / max(1, reward_count),

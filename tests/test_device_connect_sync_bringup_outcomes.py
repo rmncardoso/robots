@@ -10,7 +10,17 @@ printing an "is online" line for a runtime that never came up.
 
 The two failure outcomes cross a thread boundary, which is why they are pinned
 here: the recorded exception is re-raised on the caller's thread, and an expired
-budget raises rather than handing back the ``None`` the holder still contains.
+budget raises rather than handing back the ``None`` the holder still contains. A
+bring-up that finishes without returning a runtime leaves that same empty holder,
+so it is reported the same way -- an empty holder is a failed bring-up however it
+came to be empty, and returning it would be the one outcome a caller cannot act
+on, indistinguishable from a runtime that came up.
+
+A bring-up that produced no runtime also has machinery to give back. The loop and
+the thread are handed to the caller by being adopted onto the returned runtime, so
+with no runtime there is nothing to adopt them and nothing to serve on them either
+-- which is why the release is graded here alongside the exception, rather than
+left to a caller that has no handle to release.
 
 Nothing here needs a broker, a Docker stack or the Kit runtime: the awaited half
 is substituted, and the wrapper's budget is a module attribute so the expiry
@@ -24,6 +34,7 @@ import asyncio
 import importlib
 import logging
 import pathlib
+import threading
 import types
 from typing import Any
 
@@ -55,6 +66,39 @@ async def _completes(*_a: Any, **_k: Any) -> Any:
 async def _fails(*_a: Any, **_k: Any) -> Any:
     """A bring-up that fails the way an unreachable broker does."""
     raise RuntimeError("no broker at tcp://127.0.0.1:7447")
+
+
+#: The two ways a bring-up produces no runtime. Both leave the wrapper's holder
+#: empty, so both owe the caller a raise and owe the loop a release.
+_NO_RUNTIME = ["raises", "returns nothing"]
+
+
+def _without_a_runtime_on(kind: str, loop_holder: list[Any]) -> Any:
+    """A bring-up producing no runtime, recording the loop it is running on.
+
+    The wrapper creates that loop itself and only hands it to the caller by
+    adopting it onto the returned runtime, so with no runtime the coroutine is
+    the one place the loop is observable at all.
+
+    Args:
+        kind: ``"raises"`` for the way an unreachable broker fails,
+            ``"returns nothing"`` for a bring-up that finishes and hands back
+            no runtime.
+        loop_holder: Receives the loop the bring-up ran on.
+    """
+
+    async def _bring_up(*_a: Any, **_k: Any) -> Any:
+        loop_holder.append(asyncio.get_running_loop())
+        if kind == "raises":
+            raise RuntimeError("no broker at tcp://127.0.0.1:7447")
+        return None
+
+    return _bring_up
+
+
+def _runtime_threads() -> list[Any]:
+    """The wrapper's bring-up threads that are still alive."""
+    return [t for t in threading.enumerate() if t.name == "device-connect-runtime"]
 
 
 async def _never_finishes(*_a: Any, **_k: Any) -> Any:
@@ -124,6 +168,28 @@ class TestEveryBringUpOutcomeReachesTheCaller:
         assert "still running" in message
         assert "broker" in message
 
+    def test_a_bring_up_that_returns_no_runtime_is_reported_as_a_failure(self, monkeypatch):
+        """Nothing came up, so this is a failed bring-up like any other. Handing
+        back the empty holder instead would return ``None`` where the annotation
+        promises a runtime, and read to every caller as a bring-up that worked.
+
+        The refusal names the empty holder and the contract it broke, because
+        this outcome logs nothing else: the foreground runner's status line sends
+        the operator to "the warning above", and on this route the raise is what
+        puts one there.
+        """
+
+        async def _no_runtime(*_a: Any, **_k: Any) -> Any:
+            return None
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _sync(monkeypatch, _no_runtime, budget=30.0)
+
+        message = str(excinfo.value)
+        assert "init_device_connect_sync" in message
+        assert "without returning a runtime" in message
+        assert "nothing to serve" in message
+
     def test_a_failure_inside_the_budget_reports_its_cause_not_the_budget(self, monkeypatch):
         """Guard order: the recorded exception is checked first, so a bring-up
         that failed quickly is never reported as a slow one."""
@@ -175,6 +241,21 @@ class TestTheForegroundRunnerReportsAFailedBringUp:
         failures = [r for r in records if "Device Connect init failed" in r]
         assert failures, records
         assert "did not come up" in failures[0]
+
+    def test_a_bring_up_that_returned_no_runtime_is_reported_to_the_operator(self, monkeypatch):
+        """The status line for a missing runtime sends the operator to "the
+        warning above". Returning the empty holder logged nothing at all, so the
+        line pointed at a warning that was never written; the raise is what puts
+        one there."""
+
+        async def _no_runtime(*_a: Any, **_k: Any) -> Any:
+            return None
+
+        records = self._foreground(monkeypatch, _no_runtime, budget=30.0)
+
+        failures = [r for r in records if "Device Connect init failed" in r]
+        assert failures, records
+        assert "without returning a runtime" in failures[0]
 
     def test_a_failed_bring_up_is_still_reported_to_the_operator(self, monkeypatch):
         """The unchanged half: an exception already reached this warning."""
@@ -266,3 +347,99 @@ class TestTheBudgetIsReadFromTheModuleRatherThanAnInlineLiteral:
         module = _dc()
 
         assert module.init_device_connect_sync.__annotations__["return"] == "DeviceRuntime"
+
+
+class TestABringUpWithNoRuntimeReleasesTheLoopItRanOn:
+    """The machinery a bring-up with nothing to serve leaves behind.
+
+    The loop and the thread reach the caller one way only: they are adopted onto
+    the runtime the wrapper returns. A bring-up that produced no runtime -- by
+    raising, or by finishing and returning none -- leaves the pair unreachable,
+    and parking the thread in ``run_forever`` anyway kept an idle loop, with the
+    epoll and self-pipe descriptors it holds, alive for the life of the process.
+    Once per attempt: a caller retrying an unreachable broker accumulated a
+    parked thread and three descriptors per try with no way to reach any of them.
+
+    The thread that owns the loop closes it and returns instead, gated on the
+    empty holder rather than on the recorded exception, so neither route can be
+    released while the other is not. The wrapper waits for that before raising,
+    so the failure the caller is handed also means the machinery is gone.
+    """
+
+    @pytest.mark.parametrize("kind", _NO_RUNTIME)
+    def test_a_bring_up_with_no_runtime_closes_the_loop_it_ran_on(self, monkeypatch, kind):
+        """No runtime adopted the loop, so nothing else can ever close it."""
+        loops: list[Any] = []
+
+        with pytest.raises(RuntimeError):
+            _sync(monkeypatch, _without_a_runtime_on(kind, loops), budget=30.0)
+
+        assert len(loops) == 1, loops
+        assert loops[0].is_closed()
+
+    @pytest.mark.parametrize("kind", _NO_RUNTIME)
+    def test_a_bring_up_with_no_runtime_leaves_no_thread_parked_on_that_loop(self, monkeypatch, kind):
+        """The thread is retired with the loop: it was started to serve a
+        runtime that does not exist, and the caller has no handle to stop it."""
+        loops: list[Any] = []
+        before = _runtime_threads()
+
+        with pytest.raises(RuntimeError):
+            _sync(monkeypatch, _without_a_runtime_on(kind, loops), budget=30.0)
+
+        assert _runtime_threads() == before
+
+    @pytest.mark.parametrize("kind", _NO_RUNTIME)
+    def test_a_retried_bring_up_does_not_accumulate_loops(self, monkeypatch, kind):
+        """The shape a caller actually hits: a bring-up that cannot come up is
+        retried, and each attempt has to release its own loop rather than add
+        one."""
+        loops: list[Any] = []
+        before = _runtime_threads()
+
+        for _ in range(3):
+            with pytest.raises(RuntimeError):
+                _sync(monkeypatch, _without_a_runtime_on(kind, loops), budget=30.0)
+
+        assert len(loops) == 3, loops
+        assert [loop.is_closed() for loop in loops] == [True, True, True]
+        assert _runtime_threads() == before
+
+    def test_a_release_that_outlasts_its_budget_is_reported(self, monkeypatch, caplog):
+        """A thread still running the loop cannot have it closed under it, so
+        that outcome is logged rather than silently taken for a release.
+
+        The double is a thread that has not returned: it ignores the join budget
+        and reports itself alive, which is what a bring-up whose partial teardown
+        is still on the loop looks like to this code.
+        """
+
+        class _NeverReturns(threading.Thread):
+            def join(self, timeout: float | None = None) -> None:
+                del timeout  # a thread that never returns outlasts any budget
+                self.was_joined = True
+
+            def is_alive(self) -> bool:
+                return True
+
+        monkeypatch.setattr(threading, "Thread", _NeverReturns)
+        monkeypatch.setattr(_dc(), "_LOOP_JOIN_TIMEOUT_S", 0.05)
+
+        with caplog.at_level(logging.WARNING, logger="strands_robots.device_connect._impl"):
+            with pytest.raises(RuntimeError) as excinfo:
+                _sync(monkeypatch, _fails, budget=30.0)
+
+        assert "no broker" in str(excinfo.value)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings, caplog.records
+        assert "did not return within 0.1s" in warnings[0]
+        assert "still open" in warnings[0]
+
+    def test_the_release_budget_reads_without_the_device_connect_extra(self):
+        """It is a float on the package, next to the bring-up budget, so a
+        caller (or this file) can read and substitute it without the extra."""
+        module = _dc()
+
+        budget = module._LOOP_JOIN_TIMEOUT_S
+        assert isinstance(budget, float)
+        assert 0.0 < budget < float("inf")

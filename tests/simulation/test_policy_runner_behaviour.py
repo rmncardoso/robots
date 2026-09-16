@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -207,7 +208,12 @@ class TestPolicyRunnerEvaluate:
     def test_evaluate_degenerate_policy_advances_and_terminates(self, sim_with_robot):
         """An empty-chunk policy must not hang: each query advances exactly one
         physics step, the episode ends at max_steps, and with no success
-        predicate the run reports zero successes instead of spinning forever."""
+        predicate the run reports zero successes instead of spinning forever.
+
+        The per-step tolerance is what keeps the loop moving; the AGGREGATE is
+        refused, because an evaluation whose every call came back empty never
+        reached ``send_action`` and its outcome figures describe the scene
+        rather than the policy."""
         policy = _EmptyActionPolicy()
         policy.set_robot_state_keys(sim_with_robot.robot_joint_names("alice"))
         runner = PolicyRunner(sim_with_robot)
@@ -219,16 +225,24 @@ class TestPolicyRunnerEvaluate:
             max_steps=4,
             success_fn=None,
         )
-        assert result["status"] == "success"
+        assert result["status"] == "error"
         payload = result["content"][-1]["json"]
         assert payload["success_rate"] == 0.0
         assert payload["episodes"][0]["steps"] == 4
         assert payload["episodes"][0]["success"] is False
+        # The loop advanced its whole budget and commanded nothing.
+        assert payload["actions_applied"] == 0
+        assert payload["steps_advanced"] == 4
+        assert payload["uncommanded_error"] is not None
 
-    def test_evaluate_degenerate_policy_succeeds_on_post_step_obs(self, sim_with_robot):
+    def test_evaluate_degenerate_policy_marks_success_from_the_post_step_obs(self, sim_with_robot):
         """Even with an empty action chunk, a success predicate that holds on
         the post-step observation marks the episode solved on the first query
-        and stops early (steps == 1)."""
+        and stops early (steps == 1).
+
+        The episode record is unchanged, and the evaluation is still refused:
+        this is the sharpest form of the harm, a published ``success_rate`` of
+        ``1.0`` for a policy that never commanded the robot once."""
         policy = _EmptyActionPolicy()
         policy.set_robot_state_keys(sim_with_robot.robot_joint_names("alice"))
         runner = PolicyRunner(sim_with_robot)
@@ -246,12 +260,15 @@ class TestPolicyRunnerEvaluate:
             max_steps=5,
             success_fn=always_success,
         )
-        assert result["status"] == "success"
         payload = result["content"][-1]["json"]
         assert payload["success_rate"] == 1.0
         assert payload["episodes"][0]["steps"] == 1
         assert payload["episodes"][0]["success"] is True
         assert seen, "success_fn must be evaluated on the post-step observation"
+        # A 100% success rate over a rollout that commanded nothing is refused.
+        assert result["status"] == "error"
+        assert payload["actions_applied"] == 0
+        assert payload["uncommanded_error"] is not None
 
 
 # require_default_robot / _maybe_sim_time
@@ -304,19 +321,6 @@ class TestHelpers:
         fake.get_state.side_effect = RuntimeError("boom")
 
         assert PolicyRunner(fake)._maybe_sim_time() is None
-
-    def test_require_default_robot_empty_raises(self):
-        fake = MagicMock()
-        fake.list_robots.return_value = []
-        runner = PolicyRunner(fake)
-        with pytest.raises(ValueError, match="No robots"):
-            runner._require_default_robot()
-
-    def test_require_default_robot_returns_first(self):
-        fake = MagicMock()
-        fake.list_robots.return_value = ["alpha", "beta"]
-        runner = PolicyRunner(fake)
-        assert runner._require_default_robot() == "alpha"
 
 
 # replay() error paths (no lerobot -> clean error)
@@ -466,6 +470,197 @@ class _EmptyActionPolicy(MockPolicy):
 
     async def get_actions(self, observation_dict, instruction, **kwargs):
         return []
+
+
+class _UncommandingActionPolicy(MockPolicy):
+    """Returns a NON-empty chunk whose every action commands nothing.
+
+    The sibling of :class:`_EmptyActionPolicy`: there the chunk is empty, here
+    the chunk is full of actions that name no key. Both reach ``send_action``
+    without commanding the robot, which is the condition
+    ``uncommanded_eval_error`` refuses - but only this one gets past a counter
+    that counts calls instead of commands. A real policy reaches it whenever a
+    decode yields a row with no joint values (see
+    :meth:`CuroboPolicy._next_chunk`, whose key list is empty for a trajectory
+    row carrying no joint position).
+    """
+
+    @property
+    def provider_name(self) -> str:
+        return "uncommanding"
+
+    async def get_actions(self, observation_dict, instruction, **kwargs):
+        return [{}, {}]
+
+
+class _PartlyCommandingPolicy(MockPolicy):
+    """Commands the robot on some actions of the chunk and not others.
+
+    The control for the refusal above: a PARTIAL shortfall is real policy
+    behaviour and is reported as a count rather than refused, so this policy
+    must still evaluate as a success.
+    """
+
+    def __init__(self, keys: list[str]) -> None:
+        super().__init__()
+        self._keys = keys
+
+    @property
+    def provider_name(self) -> str:
+        return "partly-commanding"
+
+    async def get_actions(self, observation_dict, instruction, **kwargs):
+        return [{}, dict.fromkeys(self._keys, 0.0)]
+
+
+class TestEvaluateCountsCommandedActions:
+    """``actions_applied`` counts actions that commanded the robot, not calls.
+
+    An action dict with no keys is handed to ``send_action`` like any other and
+    accepted, so counting the call makes an evaluation of nothing but those
+    actions indistinguishable in every published field from one that commanded
+    every joint. The sibling ``run`` surface separates the two through its
+    per-actuator ``action_resolution_rate``; these pin the rule the evaluation
+    routes read instead.
+    """
+
+    def test_a_chunk_that_commands_nothing_is_refused(self, sim_with_robot):
+        """A full chunk of actions naming no key is the empty chunk's harm."""
+        policy = _UncommandingActionPolicy()
+        policy.set_robot_state_keys(sim_with_robot.robot_joint_names("alice"))
+        runner = PolicyRunner(sim_with_robot)
+
+        result = runner.evaluate("alice", policy, n_episodes=1, max_steps=4, success_fn=None)
+
+        payload = result["content"][-1]["json"]
+        # Physics advanced the whole budget; not one action commanded the robot.
+        assert payload["steps_advanced"] == 4
+        assert payload["actions_applied"] == 0
+        assert payload["uncommanded_error"] is not None
+        assert result["status"] == "error"
+
+    def test_a_success_rate_earned_without_commanding_is_refused(self, sim_with_robot):
+        """The sharpest form: a published 1.0 for a policy that commanded nothing."""
+        policy = _UncommandingActionPolicy()
+        policy.set_robot_state_keys(sim_with_robot.robot_joint_names("alice"))
+        runner = PolicyRunner(sim_with_robot)
+
+        result = runner.evaluate("alice", policy, n_episodes=1, max_steps=5, success_fn=lambda obs: True)
+
+        payload = result["content"][-1]["json"]
+        assert payload["success_rate"] == 1.0
+        assert payload["actions_applied"] == 0
+        assert payload["uncommanded_error"] is not None
+        assert result["status"] == "error"
+
+    def test_a_partly_commanding_policy_is_reported_not_refused(self, sim_with_robot):
+        """A partial shortfall stays a count: refusing it would contradict the
+        per-step tolerance the empty chunk is granted."""
+        keys = sim_with_robot.robot_joint_names("alice")
+        policy = _PartlyCommandingPolicy(keys)
+        policy.set_robot_state_keys(keys)
+        runner = PolicyRunner(sim_with_robot)
+
+        result = runner.evaluate("alice", policy, n_episodes=1, max_steps=4, success_fn=None)
+
+        payload = result["content"][-1]["json"]
+        assert payload["actions_applied"] > 0
+        # Fewer commands than advanced steps: the shortfall is visible, not fatal.
+        assert payload["actions_applied"] < payload["steps_advanced"]
+        assert payload["uncommanded_error"] is None
+        assert result["status"] == "success"
+
+    def test_the_async_rtc_loop_counts_commands_too(self, sim_with_robot):
+        """The overlapped loop applies the same actions through the same
+        ``send_action``, so it reads the same rule as the synchronous one."""
+        policy = _UncommandingActionPolicy()
+        policy.set_robot_state_keys(sim_with_robot.robot_joint_names("alice"))
+        runner = PolicyRunner(sim_with_robot)
+
+        result = runner.evaluate("alice", policy, n_episodes=1, max_steps=4, success_fn=None, async_rtc=True)
+
+        payload = result["content"][-1]["json"]
+        assert payload["rtc_async_enabled"] is True, "this cell must exercise the overlapped loop"
+        assert payload["steps_advanced"] == 4
+        assert payload["actions_applied"] == 0
+        assert payload["uncommanded_error"] is not None
+        assert result["status"] == "error"
+
+    def test_a_commanding_policy_counts_every_step(self, sim_with_robot):
+        """Control: a policy that commands the robot is unaffected."""
+        policy = MockPolicy()
+        policy.set_robot_state_keys(sim_with_robot.robot_joint_names("alice"))
+        runner = PolicyRunner(sim_with_robot)
+
+        result = runner.evaluate("alice", policy, n_episodes=1, max_steps=4, success_fn=None)
+
+        payload = result["content"][-1]["json"]
+        assert payload["actions_applied"] == payload["steps_advanced"] == 4
+        assert payload["uncommanded_error"] is None
+        assert result["status"] == "success"
+
+
+class TestUncommandingActionIsReachable:
+    """The in-tree producer of an action that commands nothing.
+
+    Both motion-planner policies decode a trajectory row into an action by
+    zipping a key list against the row. :class:`CuroboPolicy` derives that key
+    list from the width of the first row, so a trajectory whose rows carry no
+    joint position zips an empty key list and every waypoint decodes to an
+    action naming no key - while the chunk itself stays non-empty, which is why
+    the empty-chunk tolerance cannot describe it and the runner has to count
+    commands rather than calls.
+    """
+
+    @staticmethod
+    def _stub_chunk(trajectory: list[list[float]], horizon: int = 4) -> list[dict[str, Any]]:
+        """Decode ``trajectory`` through the real ``_next_chunk``.
+
+        Built with ``__new__`` so the decode runs on a genuine
+        :class:`CuroboPolicy` without a cuRobo install or a planner: the method
+        reads only the trajectory cache and the key resolver set here.
+        """
+        from strands_robots.policies.curobo.policy import CuroboPolicy
+
+        policy = CuroboPolicy.__new__(CuroboPolicy)
+        policy.action_horizon = horizon
+        # Empty, so the decode takes its positional ``joint_<i>`` fallback -
+        # the same path a planner whose robot keys were never set would take.
+        policy._robot_state_keys = []
+        policy._cached_trajectory = trajectory
+        policy._cached_cursor = 0
+        return policy._next_chunk()
+
+    def test_curobo_positionless_trajectory_row_commands_nothing(self):
+        """A trajectory row carrying no joint position decodes to an action
+        naming no key, so the runner must not count applying it as a command."""
+        from strands_robots.simulation.policy_runner import action_commands_robot
+
+        chunk = self._stub_chunk([[], []])
+
+        assert chunk == [{}, {}], "a positionless row decodes to an action with no keys"
+        assert chunk, "the chunk itself is NOT empty, so the empty-chunk guard cannot see it"
+        assert not any(action_commands_robot(a) for a in chunk)
+        # Control: a row carrying joint values does command the robot.
+        assert self._stub_chunk([[0.1, 0.2]]) == [{"joint_0": 0.1, "joint_1": 0.2}]
+        assert all(action_commands_robot(a) for a in self._stub_chunk([[0.1, 0.2]]))
+
+    def test_moveit2_refuses_the_row_rather_than_emitting_such_an_action(self):
+        """The sibling planner closes the same decode at the producer.
+
+        Kept beside the cuRobo pin so the two planners' answers to one input
+        cannot drift apart unnoticed: a waypoint without a position is not
+        executable, and refusing it is the stronger answer than emitting an
+        action the runner then has to discount.
+        """
+        from strands_robots.policies.moveit2.policy import MoveIt2Policy
+
+        class _Keys:
+            def _resolve_joint_keys(self, n: int) -> list[str]:
+                return [f"joint_{i}" for i in range(n)]
+
+        with pytest.raises(RuntimeError, match="carries no joint position"):
+            MoveIt2Policy._unpack_trajectory(_Keys(), [[0.0], [0.1]])
 
 
 class TestControlSubsteps:

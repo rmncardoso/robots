@@ -39,6 +39,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import pkgutil
 import shutil
 import threading
@@ -57,17 +58,22 @@ from strands.types.tools import ToolContext, ToolResult, ToolSpec, ToolUse
 
 from strands_robots._serial_discovery import describe_serial_candidates, scan_serial_devices
 from strands_robots.bus_access import read_observation, write_action
+from strands_robots.policies.base import instruction_not_read_notice, provider_policy_class
+from strands_robots.registry.policies import policy_requires_error
 from strands_robots.ros_telemetry import ROS2_SYSTEM_INSTALL_HINT
 from strands_robots.teleop_mixin import TeleopMixin, _stop_reported_stopped
 from strands_robots.tools._command_gate import gate_motion
 from strands_robots.utils import (
     boolean_flag_error,
+    camera_token_error,
     dds_domain_id_error,
     positive_count_error,
     positive_finite_number_error,
     refusal_repr,
+    refusal_str,
     require_optional,
     tcp_port_error,
+    teleoperator_contract_error,
 )
 
 if TYPE_CHECKING:
@@ -91,14 +97,20 @@ COMMAND_ALLOW_ENV = "STRANDS_ROBOT_COMMAND_ALLOW"
 # The shared hint names the step that supplies rclpy; this adds the alternative
 # only a Robot can take, because ``ros2_transport`` is the caller's choice: the
 # pure-RTPS bridge publishes the same topics (both transports share the wire
-# contract in ``RosTelemetryBase``) over cyclonedds, which is a pip wheel, so it
-# is the one route here the ``[ros2]`` extra really does complete.
+# contract in ``RosTelemetryBase``) over cyclonedds, a pip wheel on macOS,
+# Windows and Linux x86_64.  No cyclonedds release publishes a Linux aarch64
+# wheel, so there the extra builds the sdist against a Cyclone DDS C install and
+# this alternative carries a condition: a caller already blocked on rclpy must be
+# told that, not sent into a second failing install.
 _RCLPY_TRANSPORT_INSTALL_HINT = (
     f"{ROS2_SYSTEM_INSTALL_HINT}\n"
     "Or select the pure-RTPS transport, which publishes the same topics and "
     "needs no sourced distro:\n"
     "  pip install 'strands-robots[ros2]'\n"
-    "  Robot(..., ros2_bridge=True, ros2_transport='rtps')"
+    "  Robot(..., ros2_bridge=True, ros2_transport='rtps')\n"
+    "On Linux aarch64 (Jetson) that extra has no wheel: install Cyclone DDS C "
+    "first and set CYCLONEDDS_HOME, see "
+    "docs/rtps-integration.md#linux-aarch64-jetson."
 )
 
 
@@ -192,6 +204,13 @@ _CAMERA_STREAM_DEFAULTS: dict[str, Any] = {"fps": 30, "width": 640, "height": 48
 # ``type`` selects which camera backend to build. It is consumed by the
 # registry lookup below, not forwarded to the config dataclass.
 _CAMERA_TYPE_KEY = "type"
+
+# Where a network driver's port is reached. A lerobot driver config spells the
+# host it talks to differently per family - ``ip_address`` (Reachy 2),
+# ``remote_ip`` (LeKiwi client), ``robot_ip`` (Unitree G1), ``host`` - and
+# ``Robot._device_facts`` names it beside a port that is not a device path, so
+# a bare TCP port number is not the whole answer an agent gets.
+_ADDRESS_FIELDS = ("ip_address", "remote_ip", "robot_ip", "host")
 
 
 @functools.cache
@@ -289,6 +308,58 @@ def _resolve_camera_config_class(camera_name: str, cam_type: Any) -> type:
         ) from None
 
 
+def _camera_option_vocabulary(camera_name: str, config: Mapping[str, Any]) -> tuple[type, dict[str, Any]]:
+    """Resolve the config class one camera entry names and the options it may state.
+
+    The one owner of the camera option vocabulary. ``type`` selects the class
+    through lerobot's ``CameraConfig`` choice registry, and the options an entry
+    may then name are that class's declared dataclass fields - so a backend
+    lerobot adds, or a field it renames, is admitted here by construction rather
+    than by a list kept in step by hand. Every surface that accepts the
+    serialized ``cameras`` shape reads it from here: the ``Robot`` factory
+    constructs the config, and ``lerobot_teleoperate`` renders the same entry
+    into the ``--robot.cameras`` argv of a detached subprocess, where an option
+    the class does not declare would be refused minutes later in that process's
+    log rather than here.
+
+    Args:
+        camera_name: The key this camera was registered under, named in every
+            refusal so a multi-camera rig reports which entry is at fault.
+        config: The per-camera options, already known to be a mapping.
+
+    Returns:
+        The resolved ``CameraConfig`` subclass and its declared fields by name.
+
+    Raises:
+        ValueError: If ``type`` is not a registered camera backend, or the entry
+            names an option the resolved class does not declare. An unknown
+            option is refused rather than dropped per AGENTS.md > Review
+            Learnings (#86): a silently discarded option reports success while
+            the camera streams at the default. The suggestion is drawn from the
+            resolved class's own fields: an ``index_or_path`` sent to a
+            RealSense is a real mistake, and pointing at
+            ``serial_number_or_name`` is what makes it fixable.
+    """
+    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
+    accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
+
+    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
+    if unknown:
+        hints = []
+        for key in unknown:
+            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
+            if close:
+                hints.append(f"{key!r} -> {close[0]!r}")
+        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
+        raise ValueError(
+            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
+            f"{ConfigClass.__name__} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
+            f"the camera backend). (If this is a typo, fix it.)"
+        )
+    return ConfigClass, fields
+
+
 def _build_camera_config(camera_name: str, config: Any) -> Any:
     """Build the lerobot camera config for one entry of a ``cameras`` dict.
 
@@ -305,42 +376,31 @@ def _build_camera_config(camera_name: str, config: Any) -> Any:
         names, ready for ``lerobot.cameras.make_cameras_from_configs``.
 
     Raises:
-        ValueError: If ``config`` is not a mapping, names a camera ``type``
-            lerobot does not register, carries a key that is not a declared
-            field of the resolved class, omits a field that has no default, or
-            holds a value lerobot's own config validation refuses. An unknown
-            key is refused rather than dropped per AGENTS.md > Review Learnings
-            (#86): a silently discarded option reports success while the camera
-            streams at the default.
+        ValueError: If ``camera_name`` is not a bare token
+            (:func:`~strands_robots.utils.camera_token_error`), or if ``config``
+            is not a mapping, names a camera ``type`` lerobot does not register,
+            carries a key that is not a declared field of the resolved class,
+            omits a field that has no default, or holds a value lerobot's own
+            config validation refuses. An unknown key is refused rather than
+            dropped per AGENTS.md > Review Learnings (#86): a silently discarded
+            option reports success while the camera streams at the default.
     """
+    # The name is graded before the options because it is what every consumer
+    # keys this camera's frames by -- a mesh topic level, an S3 object key, a
+    # dataset feature key -- so no option is worth checking under a name none of
+    # them can carry. ``lerobot_teleoperate`` holds its ``robot_cameras`` to the
+    # same rule at the same point, through the same owner.
+    if (name_err := camera_token_error("Robot(cameras=...)", "camera name", camera_name)) is not None:
+        raise ValueError(name_err)
     if not isinstance(config, Mapping):
         raise ValueError(
             f"Camera {camera_name!r} config must be a mapping of option name to value, "
             f"got {type(config).__name__}: {config!r}."
         )
 
-    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    ConfigClass, fields = _camera_option_vocabulary(camera_name, config)
     class_name = ConfigClass.__name__
-
-    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
     accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
-
-    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
-    if unknown:
-        hints = []
-        for key in unknown:
-            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
-            if close:
-                hints.append(f"{key!r} -> {close[0]!r}")
-        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
-        # The suggestion is drawn from the resolved class's own fields: an
-        # ``index_or_path`` sent to a RealSense is a real mistake, and pointing
-        # at ``serial_number_or_name`` is what makes it fixable.
-        raise ValueError(
-            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
-            f"{class_name} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
-            f"the camera backend). (If this is a typo, fix it.)"
-        )
 
     missing = sorted(
         name
@@ -581,6 +641,10 @@ class RobotTaskState:
     step_count: int = 0
     error_message: str = ""
     task_future: Future | None = None
+    #: The policy object the loop drove, set once it is built or handed in, so
+    #: the task envelope can describe it (see ``Policy.reads_instruction``).
+    #: Cleared with the rest of the state when a new task is claimed.
+    policy: Any = None
 
 
 class Robot(TeleopMixin, AgentTool):
@@ -609,6 +673,14 @@ class Robot(TeleopMixin, AgentTool):
             robot: LeRobot Robot instance, RobotConfig, or robot type string
             cameras: Camera configuration dict:
                 {"wrist": {"type": "opencv", "index_or_path": "/dev/video0", "fps": 30}}
+                Each key names one camera and must be a bare token of letters,
+                digits, ``_`` or ``-``: it is the identity every consumer keys
+                that camera's frames by - a level of the mesh topic they are
+                published on, a segment of the S3 key they are offloaded to, and
+                the ``observation.images.<name>`` feature key a recording writes
+                them under - so a name carrying punctuation any of those reserves
+                is refused here
+                (:func:`~strands_robots.utils.camera_token_error`).
             action_horizon: Actions consumed from each inferred policy chunk
                 before re-querying. Must be a positive integer - it is a lower
                 bound on the chunk slice the task loop applies
@@ -659,8 +731,8 @@ class Robot(TeleopMixin, AgentTool):
                 (no partial application). Requires ``ros2_bridge=True``.
             dds_security_config: Optional DDS Security credentials
                 (``identity_ca``, ``certificate``, ``private_key``,
-                ``governance``, ``permissions``; ``permissions_ca`` optional)
-                for the pure-RTPS bridge. When ``ros2_commands=True`` on the
+                ``governance``, ``permissions``; ``permissions_ca`` optional,
+                each a non-empty string) for the pure-RTPS bridge. When ``ros2_commands=True`` on the
                 ``"rtps"`` transport this (or the
                 ``STRANDS_ROS2_BRIDGE_I_KNOW_THIS_IS_INSECURE=1`` opt-out) is
                 REQUIRED - the bridge refuses to drive the arm over an unsecured
@@ -775,6 +847,13 @@ class Robot(TeleopMixin, AgentTool):
         # hint that the operator who set ros2_bridge=True actually needs to see.
         # require_optional caches the
         # module, so the real bridge construction in _init_ros_bridge pays nothing.
+        # The two posture flags are graded first: ``"false"`` is truthy, so read
+        # here by truthiness it would run the rclpy probe and, on a box without a
+        # sourced distro, tell a caller who asked for no bridge to install ROS 2.
+        # _init_ros_bridge grades them again for callers that enter there.
+        for flag_name, flag_value in (("ros2_bridge", ros2_bridge), ("ros2_commands", ros2_commands)):
+            if error := boolean_flag_error(flag_value, flag_name, type(self).__name__):
+                raise ValueError(error)
         if ros2_bridge:
             self._check_ros2_bridge_deps(ros2_transport=ros2_transport)
 
@@ -1069,7 +1148,25 @@ class Robot(TeleopMixin, AgentTool):
     def _initialize_robot(
         self, robot: LeRobotRobot | RobotConfig | str, cameras: dict[str, dict[str, Any]] | None, **kwargs: Any
     ) -> LeRobotRobot:
-        """Initialize LeRobot robot instance using native lerobot patterns."""
+        """Initialize LeRobot robot instance using native lerobot patterns.
+
+        Raises:
+            ImportError: When lerobot is not installed. Named with the extra
+                that supplies it: this is the first lerobot import a
+                ``Robot(..., mode="real")`` reaches, and on a core-only install
+                a bare ``ModuleNotFoundError: No module named 'lerobot'`` from
+                the line below was the whole answer the README's real-arm
+                quickstart got. The purpose names the lerobot DRIVER rather
+                than real mode at large, because ``driver="strands"`` builds a
+                real robot through a native driver and needs no lerobot at all.
+            ValueError: When *robot* is neither a lerobot ``Robot`` instance,
+                a ``RobotConfig`` nor a robot type string.
+        """
+        require_optional(
+            "lerobot",
+            extra="lerobot",
+            purpose='real-mode robots built through the lerobot driver (the default for Robot(..., mode="real"))',
+        )
         from lerobot.robots.config import RobotConfig
         from lerobot.robots.robot import Robot as LeRobotRobot
         from lerobot.robots.utils import make_robot_from_config
@@ -1671,13 +1768,60 @@ class Robot(TeleopMixin, AgentTool):
             return True, ""
 
         except Exception as e:
-            error_msg = f"Robot connection failed: {e}. Ensure robot is calibrated and accessible on the specified port"
+            error_msg = self._connect_failure_message(e)
             logger.error(f"{error_msg}")
             # Same rollback as the lazy teleop connect: without it a half-open
             # port makes the NEXT _connect_robot short-circuit on
             # "already connected" and report success against a dead bus.
             self._close_open_devices()
             return False, error_msg
+
+    def _connect_failure_message(self, exc: BaseException) -> str:
+        """Name the device that failed to open and the remedy for that device.
+
+        lerobot's ``connect()`` opens the motors bus, then each camera; either
+        raises its own message. The wrapper used to append one fixed remedy -
+        "Ensure robot is calibrated and accessible on the specified port" - to
+        whichever came up, so a camera that did not exist was answered with a
+        calibration hint (and an agent relayed "recalibrate if needed" for an
+        unplugged arm). A camera message names lerobot's object,
+        ``OpenCVCamera(99)``, not the key the operator wrote in ``cameras=``;
+        that key is looked up here so the reply says which camera.
+
+        The lookup matches the camera *objects* lerobot built, the way
+        :meth:`_close_open_devices` reads them, because every backend writes
+        every one of its messages with ``f"{self}"`` -- the object's ``str`` is
+        the one identity the text is sure to carry, whatever the backend and
+        whatever failed (opening, warmup, a read). No config field can serve as
+        that identity: only ``OpenCVCameraConfig`` declares ``index_or_path``,
+        so matching a config named a webcam and left every other registered
+        backend -- RealSense (``serial_number``), ZMQ
+        (``camera_name@address:port``), Reachy 2 (``name, image_type``) -- with
+        the general remedy, which is the calibration hint for a camera fault
+        this method exists to remove.
+
+        Args:
+            exc: What ``connect()`` raised.
+
+        Returns:
+            One message naming the device and the remedy for that device.
+        """
+        text = " ".join(str(exc).split()).rstrip(".")
+        cameras = getattr(self.robot, "cameras", None)
+        for key, camera in cameras.items() if isinstance(cameras, Mapping) else ():
+            if str(camera) in text:
+                return (
+                    f"Robot connection failed: camera {key!r} did not open - {text}. "
+                    "Fix or remove that entry in cameras=; the motors bus is closed again."
+                )
+        port = getattr(getattr(self.robot, "config", None), "port", None)
+        if "port" in text.lower():
+            where = f" on port {port!r}" if port else ""
+            return (
+                f"Robot connection failed: {text}. The motors bus did not open{where}: check the USB "
+                "cable and power, then find the port (lerobot-find-port or scan_serial_devices)."
+            )
+        return f"Robot connection failed: {text}. Ensure the robot is powered, on the right port and calibrated."
 
     async def _initialize_policy(self, policy: Policy) -> bool:
         """Initialize policy with robot state keys."""
@@ -1724,6 +1868,31 @@ class Robot(TeleopMixin, AgentTool):
         """
         return self._stop_requested.is_set() or self._shutdown_event.is_set()
 
+    def _settle_task_duration(self) -> None:
+        """Write how long the task that is ending here actually ran.
+
+        ``duration`` is the figure every reply and every later ``status`` call
+        reports for a finished task, and it is reset to ``0.0`` when a task
+        starts. Only two writers ever settled it: the rollout's own loop when
+        it ran to its budget, and :meth:`get_task_status` while the task is
+        RUNNING. Every OTHER way a task can end - stopped from outside,
+        stopped during bring-up, a connect that failed, a policy that would
+        not initialize, a rollout that raised - left the reset value in place,
+        so the task reported ``0.0s`` beside a non-zero step count and kept
+        reporting it for good. Measured on a rollout that had applied 39
+        commands to the servo bus: ``error: 39 steps in 0.0s``.
+
+        So this is called wherever a terminal state is recorded, and it owns
+        the arithmetic that :meth:`get_task_status` also needs - one formula,
+        so a stop and the status call after it cannot disagree.
+
+        A ``start_mono`` of ``0.0`` means no task has begun (it is the
+        dataclass default), and is left alone: subtracting it would report the
+        seconds since boot as the duration of a task that never ran.
+        """
+        if self._task_state.start_mono:
+            self._task_state.duration = time.monotonic() - self._task_state.start_mono
+
     def _honor_stop_request(self) -> bool:
         """Record a latched stop or shutdown as the task's terminal state.
 
@@ -1754,6 +1923,7 @@ class Robot(TeleopMixin, AgentTool):
         if not self._rollout_stop_latched:
             return False
         self._task_state.status = TaskStatus.STOPPED
+        self._settle_task_duration()
         logger.info(
             "%s: task stopped during bring-up: '%s'",
             self.tool_name_str,
@@ -1804,19 +1974,36 @@ class Robot(TeleopMixin, AgentTool):
             self._task_state.duration = 0.0
             self._task_state.step_count = 0
             self._task_state.error_message = ""
+            self._task_state.policy = None
 
-            # Connect to robot
+            # Connect to robot. Remember whether THIS call did the connecting:
+            # lerobot's ``connect()`` ends in ``configure()``, whose
+            # ``torque_disabled()`` block re-enables torque on exit, so the arm
+            # goes stiff where it stands the moment it connects - before any
+            # policy exists. A bring-up that then fails (checkpoint missing,
+            # server down, trust gate) would leave the caller's arm locked for
+            # the rest of the session with nothing to drive it. Measured on the
+            # SO-101 tool: policy refused, task ERROR, ``robot.is_connected``
+            # True, torque on until process exit. A connection the caller made
+            # BEFORE this task is theirs and is left alone.
+            connected_here = not self._robot_is_connected()
             connected, connect_error = await self._connect_robot()
             if not connected:
                 self._task_state.status = TaskStatus.ERROR
                 self._task_state.error_message = connect_error or f"Failed to connect to {self.tool_name_str}"
+                self._settle_task_duration()
                 return
 
             # A stop pressed during the bring-up window above (a motors-bus
             # handshake plus per-camera warmup - seconds on a real arm) is
             # honored here, before the policy is even built, so the rollout is
-            # abandoned without commanding the arm.
+            # abandoned without commanding the arm. The arm this task just
+            # energized is released with it: an abandoned bring-up leaves
+            # nothing to drive it, exactly as a policy that cannot be built
+            # does, and the operator who pressed stop is told so rather than
+            # left holding a stiff arm.
             if self._honor_stop_request():
+                self._task_state.error_message = await self._release_uncommanded_arm(connected_here)
                 return
 
             # Get policy instance: a caller-supplied pre-built object wins;
@@ -1824,12 +2011,23 @@ class Robot(TeleopMixin, AgentTool):
             if policy_object is not None:
                 policy_instance = policy_object
             else:
-                policy_instance = await self._get_policy(policy_port, policy_host, policy_provider, **policy_kwargs)
+                try:
+                    policy_instance = await self._get_policy(policy_port, policy_host, policy_provider, **policy_kwargs)
+                except Exception as e:
+                    self._task_state.status = TaskStatus.ERROR
+                    self._settle_task_duration()
+                    released = await self._release_uncommanded_arm(connected_here)
+                    self._task_state.error_message = " ".join(p for p in (str(e), released) if p)
+                    logger.error(f"Task execution failed: {e}")
+                    return
+            self._task_state.policy = policy_instance
 
             # Initialize policy with robot state keys
             if not await self._initialize_policy(policy_instance):
                 self._task_state.status = TaskStatus.ERROR
-                self._task_state.error_message = "Failed to initialize policy"
+                self._settle_task_duration()
+                released = await self._release_uncommanded_arm(connected_here)
+                self._task_state.error_message = " ".join(p for p in ("Failed to initialize policy", released) if p)
                 return
 
             logger.info(f"Starting task: '{instruction}' on {self.tool_name_str}")
@@ -1839,7 +2037,7 @@ class Robot(TeleopMixin, AgentTool):
                 logger.info(f"Using policy: {policy_provider} on {policy_host}:{policy_port}")
 
             # Real-Time Chunking contract (mirror PolicyRunner._run_policy_rollout
-            # in strands_robots/simulation/policy_runner.py): tell the policy the
+            # in ``strands_robots.simulation.policy_runner``): tell the policy the
             # control rate ONCE before the rollout so RTC-capable providers
             # (pi0/pi0.5/SmolVLA/MolmoAct2) convert their inference latency into a
             # correct count of action steps and blend chunk seams identically to
@@ -1849,7 +2047,7 @@ class Robot(TeleopMixin, AgentTool):
 
             # Clear per-episode policy state before the rollout, mirroring the
             # per-episode reset PolicyRunner performs in
-            # strands_robots/simulation/policy_runner.py. A caller may drive one
+            # ``strands_robots.simulation.policy_runner``. A caller may drive one
             # policy object through several tasks (that is the documented
             # ``run_policy(policy_object=...)`` usage), and Policy.reset exists
             # to clear exactly the state that must not cross that boundary -
@@ -1871,8 +2069,11 @@ class Robot(TeleopMixin, AgentTool):
 
             # Building a server-backed policy is a second multi-second window
             # (a network connect plus a handshake), so the latch is re-checked
-            # before the arm is commanded for the first time.
+            # before the arm is commanded for the first time - and the arm is
+            # released here too, for the same reason as at the first gate: it
+            # has still never been commanded.
             if self._honor_stop_request():
+                self._task_state.error_message = await self._release_uncommanded_arm(connected_here)
                 return
 
             self._task_state.status = TaskStatus.RUNNING
@@ -1984,6 +2185,63 @@ class Robot(TeleopMixin, AgentTool):
             logger.error(f"Task execution failed: {e}")
             self._task_state.status = TaskStatus.ERROR
             self._task_state.error_message = str(e)
+            self._settle_task_duration()
+
+    @property
+    def _task_message_label(self) -> str:
+        """``"Error"`` or ``"Note"`` for the message the task left behind.
+
+        ``error_message`` is also where an abandoned bring-up records that the
+        arm was released - true of a task an operator STOPPED, which is not an
+        error. Labelling that "Error" would report a handled interrupt as a
+        failure, so the label follows the terminal status.
+        """
+        return "Error" if self._task_state.status == TaskStatus.ERROR else "Note"
+
+    def _robot_is_connected(self) -> bool:
+        """``robot.is_connected`` as a plain bool, False when the driver cannot say."""
+        try:
+            return bool(getattr(self.robot, "is_connected", False))
+        except Exception:  # noqa: BLE001 - a bus that cannot answer is not connected
+            return False
+
+    async def _release_uncommanded_arm(self, connected_here: bool) -> str:
+        """Disconnect a robot THIS task connected and never commanded.
+
+        Called from every bring-up exit that ends the task after
+        :meth:`_connect_robot` and before the loop commands the arm: the policy
+        could not be built, it could not be initialized, or a stop/shutdown was
+        latched at one of the two stage gates. In all of them the arm has not
+        moved - it stands where the caller left it, now with torque on, because
+        lerobot's ``connect()`` ends in ``configure()``, whose
+        ``torque_disabled()`` block re-enables torque on exit. Disconnecting
+        (``disable_torque_on_disconnect`` defaults to True) returns it to
+        exactly the state the caller had before the call, and leaves nothing
+        energized that nothing is driving.
+
+        That the arm has not moved is also why a rollout which fails while
+        RUNNING is NOT released here: an arm mid-motion dropping under gravity
+        is the hazard, holding its pose is not.
+
+        Args:
+            connected_here: Whether this task opened the connection. One the
+                caller made before the task is theirs and is left alone.
+
+        Returns:
+            A sentence for the reply saying what was done, or ``""`` when there
+            was nothing to release. A disconnect that fails yields a sentence
+            saying the arm is still energized; the failure is logged and, on an
+            error path, the original cause stays the headline.
+        """
+        if not connected_here or not self._robot_is_connected():
+            return ""
+        try:
+            await asyncio.to_thread(self.robot.disconnect)
+        except Exception as exc:  # noqa: BLE001 - reported, must not mask the cause
+            logger.warning("Could not disconnect %s after the abandoned bring-up: %s", self.tool_name_str, exc)
+            return f"The robot is still connected (torque on); disconnecting it failed: {exc}"
+        logger.info("%s disconnected again: no policy to drive it", self.tool_name_str)
+        return "The robot was disconnected again (torque released) since nothing will drive it."
 
     @staticmethod
     def _duration_error(duration: Any, method: str) -> dict[str, Any] | None:
@@ -2079,6 +2337,46 @@ class Robot(TeleopMixin, AgentTool):
         return None
 
     @staticmethod
+    def _policy_requires_error(
+        policy_provider: str | None, policy_kwargs: dict[str, Any], method: str
+    ) -> dict[str, Any] | None:
+        """Reject a provider build that is missing a keyword it cannot act without.
+
+        This surface's envelope around
+        :func:`~strands_robots.registry.policies.policy_requires_error`, which owns the
+        domain and states why. :meth:`_policy_port_error` judges the ``port``
+        entry; this judges the rest - the checkpoint a ``lerobot_local`` /
+        ``lerobot_async`` policy is built from. Here the harm is that
+        :meth:`_connect_robot` energizes the arm before the first
+        ``get_actions`` fails on the executor thread with nobody left to tell;
+        the quickstart's real-arm step did exactly this.
+
+        Args:
+            policy_provider: Provider name; unknown or unregistered providers
+                are left to ``create_policy`` to refuse.
+            policy_kwargs: Checkpoint/provider keywords the caller supplied.
+            method: Public entry point name, used to prefix the message.
+
+        Returns:
+            A tool-shaped error dict naming the missing keyword(s) and the
+            provider, or ``None`` when every required keyword is present.
+        """
+        # ``port``/``host`` are ignored because they never travel in
+        # ``**policy_kwargs``: they arrive as the named ``policy_port`` /
+        # ``policy_host`` parameters, so reading them here would find every
+        # caller's absent and refuse a port that WAS supplied. The port is
+        # judged by :meth:`_policy_port_error`, which runs first, and the host
+        # has a default.
+        reason = policy_requires_error(
+            policy_provider,
+            policy_kwargs,
+            method,
+            "the task would start, energize the arm and fail at its first action",
+            ignore=("port", "host"),
+        )
+        return None if reason is None else {"status": "error", "content": [{"text": reason}]}
+
+    @staticmethod
     def _policy_port_error(policy_port: Any, method: str, policy_provider: str | None = None) -> dict[str, Any] | None:
         """Reject a ``policy_port`` no policy can be built from.
 
@@ -2126,6 +2424,9 @@ class Robot(TeleopMixin, AgentTool):
             policy_port: The caller-supplied port to validate, or ``None`` when
                 none was supplied.
             method: Public entry point name, used to prefix the message.
+            policy_provider: The provider the port would be handed to, named in
+                the refusal - a missing port is only that provider's problem,
+                and which one asked for it decides the caller's next step.
 
         Returns:
             A tool-shaped error dict naming ``policy_port``, or ``None`` when a
@@ -2146,14 +2447,24 @@ class Robot(TeleopMixin, AgentTool):
                         return None
                 except Exception:  # noqa: BLE001 - registry read is best-effort
                     pass
+            # Name the provider that needs the port - the DEFAULT (groot) is
+            # one the caller never chose, so "policy_port is required" read as
+            # a fact about the arm - and the way to run with no server at all.
+            # The old remedy ("use run_policy with a pre-built policy_object")
+            # named a verb this tool does not have; an agent reading it asked
+            # the operator for a port instead of picking mock.
+            provider_clause = f"policy_provider '{policy_provider}'" if policy_provider else "the policy provider"
+            if policy_provider == "groot":
+                provider_clause += " (the default)"
             return {
                 "status": "error",
                 "content": [
                     {
                         "text": (
-                            f"{method}: policy_port is required to build a policy "
-                            "(pass the port of the policy server, or use run_policy "
-                            "with a pre-built policy_object)."
+                            f"{method}: policy_port is required - {provider_clause} dials a policy "
+                            "server; pass the port it listens on. With no server running, choose a "
+                            "provider that builds in process: policy_provider='mock' (sinusoidal test "
+                            "motion, no model) or 'lerobot_local' (a local HuggingFace checkpoint)."
                         )
                     }
                 ],
@@ -2340,6 +2651,10 @@ class Robot(TeleopMixin, AgentTool):
         # value the call ignores would be a false rejection.
         if policy_object is None and (err := self._policy_port_error(policy_port, "execute_task", policy_provider)):
             return err
+        if policy_object is None and (
+            err := self._policy_requires_error(policy_provider, policy_kwargs, "execute_task")
+        ):
+            return err
         if err := self._claim_task(instruction):
             return err
 
@@ -2401,8 +2716,6 @@ class Robot(TeleopMixin, AgentTool):
         **policy_kwargs: Any,
     ) -> dict[str, Any]:
         """Drive the rollout on its own event loop and report the outcome."""
-        # Import here to avoid conflicts
-        import asyncio
 
         # Run task without creating new event loop - let it run in thread
         async def task_runner() -> None:
@@ -2447,12 +2760,18 @@ class Robot(TeleopMixin, AgentTool):
             # No event loop running - safe to create one.
             asyncio.run(task_runner())
 
-        # Return final status
-        policy_desc = (
-            f"{type(policy_object).__name__} (pre-built object)"
-            if policy_object is not None
-            else f"{policy_provider} on {policy_host}:{policy_port}"
-        )
+        # Return final status. A provider that built in process has no
+        # server; "on localhost:None" described one anyway.
+        if policy_object is not None:
+            policy_desc = f"{type(policy_object).__name__} (pre-built object)"
+        elif policy_port is None:
+            policy_desc = f"{policy_provider} (built in process, no server)"
+        else:
+            policy_desc = f"{policy_provider} on {policy_host}:{policy_port}"
+        # The policy the loop drove, for the instruction notice: the pre-built
+        # object when given, else the one ``_get_policy`` built for the task.
+        driven = policy_object if policy_object is not None else self._task_state.policy
+        instruction_notice = instruction_not_read_notice(driven)
         return {
             "status": "success" if self._task_state.status == TaskStatus.COMPLETED else "error",
             "content": [
@@ -2462,7 +2781,12 @@ class Robot(TeleopMixin, AgentTool):
                     f"Policy: {policy_desc}\n"
                     f"Duration: {self._task_state.duration:.1f}s\n"
                     f"Steps: {self._task_state.step_count}"
-                    + (f"\nError: {self._task_state.error_message}" if self._task_state.error_message else "")
+                    + (
+                        f"\n{self._task_message_label}: {self._task_state.error_message}"
+                        if self._task_state.error_message
+                        else ""
+                    )
+                    + (f"\n{instruction_notice}" if instruction_notice else "")
                 }
             ],
         }
@@ -2532,6 +2856,8 @@ class Robot(TeleopMixin, AgentTool):
         # already connected.
         if err := self._policy_port_error(policy_port, "start_task", policy_provider):
             return err
+        if err := self._policy_requires_error(policy_provider, policy_kwargs, "start_task"):
+            return err
 
         # Claim the bus here, not on the executor thread: this method returns
         # before its job begins, so a claim taken inside the job would report
@@ -2556,17 +2882,27 @@ class Robot(TeleopMixin, AgentTool):
             self._release_task()
             raise
 
+        # The policy is built on the executor thread after this returns, so
+        # the class the registry maps the provider to is what can be asked
+        # whether the instruction just echoed will be read at all.
+        start_notice = self._pending_instruction_notice(policy_provider)
         return {
             "status": "success",
             "content": [
                 {
                     "text": f"Task started: '{instruction}'\n"
                     f"Robot: {self.tool_name_str}\n"
-                    f"Use action='status' to check progress\n"
-                    f"Use action='stop' to interrupt"
+                    + (f"{start_notice}\n" if start_notice else "")
+                    + "Use action='status' to check progress\n"
+                    "Use action='stop' to interrupt"
                 }
             ],
         }
+
+    @staticmethod
+    def _pending_instruction_notice(policy_provider: str | None) -> str | None:
+        """The instruction-not-read notice for a provider that has not been built yet."""
+        return instruction_not_read_notice(provider_policy_class(policy_provider), pending=True)
 
     def run_policy(
         self,
@@ -2672,12 +3008,245 @@ class Robot(TeleopMixin, AgentTool):
             "content": [{"text": summary}, {"json": payload}],
         }
 
-    def get_task_status(self) -> dict[str, Any]:
-        """Get current task execution status."""
+    # Verbs an agent reaches for on a real arm that this tool's enum does not
+    # publish, mapped to where each one lives. The quickstart once asked this
+    # tool for three of them; the generic "Unknown action" left the agent to
+    # guess whether the verb was gone, renamed, or in another tool.
+    #
+    # Two of the three destinations are elsewhere - the recording pair are the
+    # simulation tool's actions, teleoperation is the lerobot_teleoperate tool -
+    # and the third is this tool itself: run_policy/start_policy/stop_policy are
+    # the simulation tool's spellings for execute/start/stop, so those refusals
+    # send the caller back here rather than away.
+    _ELSEWHERE_ACTIONS: dict[str, str] = {
+        "teleoperate": "teleoperation",
+        "start_teleop": "teleoperation",
+        "stop_teleoperate": "teleoperation",
+        "record": "recording",
+        "start_recording": "recording",
+        "stop_recording": "recording",
+        "record_episode": "recording",
+        "run_policy": "policy",
+        "start_policy": "policy",
+        "stop_policy": "policy",
+    }
 
+    def _unknown_action_text(self, action: Any) -> str:
+        """The refusal for an action this tool does not have.
+
+        Names the four verbs the real robot tool does have, and for the
+        spellings an agent is known to reach for it also names where that verb
+        lives: the ``lerobot_teleoperate`` tool for teleoperation, the
+        simulation tool for dataset recording, and this tool's own
+        ``execute``/``start``/``stop`` for the simulation tool's policy verbs.
+        So an agent's next call is the right verb rather than another spelling
+        of the wrong one.
+
+        ``action`` is rendered through :func:`~strands_robots.utils.refusal_str`
+        rather than interpolated: a Python caller of :meth:`stream` supplies it,
+        and a value whose ``__str__`` raises would make building this refusal
+        raise instead of answering. ``str`` rather than ``repr`` keeps the text
+        an agent reads unquoted, as it has always been.
+
+        Args:
+            action: The action the caller sent.
+
+        Returns:
+            One paragraph: the refusal, the valid actions, and the remedy when
+            the verb is a known one that lives elsewhere - or here under
+            another name.
+        """
+        text = f"Unknown action: {refusal_str(action)}. Valid actions: execute, start, status, stop"
+        kind = self._ELSEWHERE_ACTIONS.get(action) if isinstance(action, str) else None
+        if kind == "teleoperation":
+            text += (
+                f". {self.tool_name_str} drives policies; it does not teleoperate from an agent. "
+                "Leader-arm teleoperation of a real arm is the lerobot_teleoperate tool "
+                "(action='start', robot_port=..., teleop_port=...), or from Python "
+                "robot.attach_teleop('so101_leader', port=...).teleoperate(duration=...)"
+            )
+        elif kind == "recording":
+            text += (
+                f". {self.tool_name_str} drives policies; it does not record datasets. "
+                "Recording a real arm under teleoperation is the lerobot_teleoperate tool "
+                "(action='start' with dataset_repo_id=..., dataset_root=..., dataset_single_task=...); "
+                "start_recording/stop_recording are the simulation tool's actions"
+            )
+        elif kind == "policy":
+            text += (
+                f". {self.tool_name_str} does drive policies, under its own verbs: action='execute' "
+                "runs one to completion, action='start' runs one in the background and action='stop' "
+                "halts it (instruction=..., policy_provider=..., duration=... carry the rollout). "
+                "run_policy/start_policy/stop_policy are the simulation tool's spellings; from Python, "
+                "robot.run_policy(policy_object=...) drives a policy already built in-process"
+            )
+        return text
+
+    def _device_facts(self) -> dict[str, Any]:
+        """Measured facts about the device, readable before it is connected.
+
+        The device is connected lazily, on the first task, so for most of a
+        robot's life an agent asks about it while nothing is open. What can be
+        read then: the port it was built for and whether that path exists on
+        this host, the cameras it was configured with, and the ``is_connected``
+        flag. What cannot: ``is_calibrated`` - lerobot reads it through the
+        bus and raises ``DeviceNotConnectedError`` before ``connect()`` - so
+        it is ``None`` until the device is connected, rather than a raise that
+        turned the whole :meth:`get_status` probe into its error shape for
+        every idle arm.
+
+        Every fact here is three-state for the same reason: ``True``/``False``
+        is a reading, ``None`` is "this was not readable" - including
+        ``is_connected``, which is a probe and not a stored flag. Every shipped
+        lerobot arm folds its cameras into it (``self.bus.is_connected and
+        all(cam.is_connected for cam in self.cameras.values())``, 8 drivers in
+        lerobot 0.6.2), so the camera whose probe raises - the one this method
+        already tolerates per-camera below - arrives through that aggregate
+        first. Read unguarded it took the whole probe down with it: the port, a
+        filesystem read that cannot raise, was discarded too, and
+        :meth:`get_status` answered ``is_connected: False`` for an arm that was
+        connected and driving.
+
+        A port is not always a device path - lerobot's network drivers carry a
+        TCP port (``Reachy2RobotConfig.port`` is ``50065``, reached at its
+        ``ip_address``), and there is nothing on this host to stat for one, so
+        ``port_present`` stays ``None`` and must not be reported as either
+        answer.
+
+        Returns:
+            ``port`` (``None`` when the driver has no port), ``port_present``
+            (``True``/``False`` from the filesystem for a path port; ``None``
+            when the port is not a path, so presence was never read),
+            ``address`` (the host a network port is reached at, ``None`` when
+            the config names none), ``is_connected`` (``None`` when the
+            driver's probe raised, so it was not read), ``is_calibrated``
+            (``None`` until connected), ``cameras`` (the configured names) and
+            ``cameras_connected`` (per live camera, best-effort - a camera
+            whose probe raises is omitted).
+        """
+        robot = self.robot
+        try:
+            is_connected: bool | None = bool(getattr(robot, "is_connected", False))
+        except Exception as e:  # noqa: BLE001 - an unreadable flag is None, not a probe that fails
+            logger.debug("%s could not read is_connected: %s", self.tool_name_str, e)
+            is_connected = None
+        config = getattr(robot, "config", None)
+        port = getattr(config, "port", None)
+        port_present: bool | None = None
+        if isinstance(port, str) and port.startswith("/"):
+            port_present = os.path.exists(port)
+        # A port that is not a device path is a network port, and the number
+        # alone does not say where. lerobot spells the host differently per
+        # driver family, so the first one the config carries wins.
+        address: str | None = None
+        for field in _ADDRESS_FIELDS:
+            value = getattr(config, field, None)
+            if isinstance(value, str) and value:
+                address = value
+                break
+        is_calibrated: bool | None = None
+        if is_connected:
+            is_calibrated = bool(getattr(robot, "is_calibrated", True))
+        cameras: list[str] = []
+        configured = getattr(config, "cameras", None)
+        if isinstance(configured, dict):
+            cameras = list(configured.keys())
+        cameras_connected: dict[str, bool] = {}
+        live_cameras = getattr(robot, "cameras", None)
+        if isinstance(live_cameras, dict):
+            for name, camera in live_cameras.items():
+                try:
+                    cameras_connected[name] = bool(camera.is_connected)
+                except Exception as e:  # noqa: BLE001 - a camera that cannot answer is omitted, not fatal
+                    logger.debug("camera %r on %s could not report is_connected: %s", name, self.tool_name_str, e)
+        return {
+            "port": port,
+            "port_present": port_present,
+            "address": address,
+            "is_connected": is_connected,
+            "is_calibrated": is_calibrated,
+            "cameras": cameras,
+            "cameras_connected": cameras_connected,
+        }
+
+    @staticmethod
+    def _device_lines(facts: dict[str, Any]) -> str:
+        """The device facts as the lines ``status`` prints under the task state.
+
+        Args:
+            facts: The mapping :meth:`_device_facts` returns.
+
+        Returns:
+            Newline-terminated lines: the connection, the port and the
+            cameras. Each reports what was read - and an unreadable fact says
+            so rather than borrowing the negative answer: a connection that
+            could not be probed is not "not connected", and a camera missing
+            from ``cameras_connected`` is not "not connected" either. The port
+            line reports present, absent (with the remedy), or, for a network
+            port, that presence on this host was never a fact to read.
+        """
+        if facts["is_connected"]:
+            calibrated = "calibrated" if facts["is_calibrated"] else "NOT calibrated"
+            device = f"Device: connected on {facts['port']} ({calibrated})"
+        elif facts["is_connected"] is None:
+            device = (
+                "Device: whether the bus is open could not be read - the driver's is_connected "
+                "probe raised, so neither answer would be a reading. A lerobot arm reads it as the "
+                "bus AND every camera, so one camera that cannot answer lands here; the cameras "
+                "line names which one."
+            )
+        else:
+            device = "Device: not connected (the bus is opened by the first task)"
+        lines = [device]
+        if facts["port_present"] is False:
+            lines.append(
+                f"Port: {facts['port']} is not present on this host - no serial device answers to that path, "
+                "so the first task will fail to connect. Check the cable and power; scan_serial_devices() "
+                "lists what this host does see."
+            )
+        elif facts["port"] is not None and not facts["is_connected"]:
+            if facts["port_present"]:
+                lines.append(f"Port: {facts['port']} is present on this host")
+            else:
+                # port_present is None: the port is not a device path, so
+                # nothing on this host was stat-ed. Reporting it as present
+                # would be the defect this method exists to fix - a sentence
+                # an agent cannot tell from a reading.
+                where = f", reached at {facts['address']}" if facts["address"] else ""
+                lines.append(
+                    f"Port: {facts['port']} is a network port{where}, not a device path - this host has no "
+                    "such path to check, so neither answer about it would be a reading."
+                )
+        if facts["cameras"]:
+            states = facts["cameras_connected"]
+            named = ", ".join(
+                f"{n} ({'connected' if states[n] else 'not connected'})" if n in states else f"{n} (could not be read)"
+                for n in facts["cameras"]
+            )
+            lines.append(f"Cameras: {named}")
+        else:
+            lines.append("Cameras: none configured")
+        return "\n".join(lines) + "\n"
+
+    def get_task_status(self) -> dict[str, Any]:
+        """Report the task state, then the device it would drive.
+
+        The task machine used to be the whole answer: an arm whose port does
+        not exist on this host read ``Robot Status: IDLE``, byte-identical to
+        a connected, healthy arm at rest, and the difference only surfaced as
+        a connect failure inside the first task. The measured facts were
+        already gathered by :meth:`get_status` for Python callers; the tool
+        action now prints the same facts under the task state and carries
+        them as a ``json`` block.
+
+        Returns:
+            ``status=success`` with the task state on the first line (as
+            before), the device lines from :meth:`_device_facts` after it,
+            and a second content block holding those facts as JSON.
+        """
         # Update duration for running tasks
         if self._task_state.status == TaskStatus.RUNNING:
-            self._task_state.duration = time.monotonic() - self._task_state.start_mono
+            self._settle_task_duration()
 
         status_text = f"Robot Status: {self._task_state.status.value.upper()}\n"
 
@@ -2692,18 +3261,37 @@ class Robot(TeleopMixin, AgentTool):
             status_text += f"Total Steps: {self._task_state.step_count}\n"
 
         if self._task_state.error_message:
-            status_text += f"Error: {self._task_state.error_message}\n"
+            status_text += f"{self._task_message_label}: {self._task_state.error_message}\n"
 
+        # Same sentence the ``execute`` envelope carries, in the present tense
+        # while the task runs: a RUNNING / 18 steps report on a policy that
+        # never reads the instruction it is filed under otherwise says the task
+        # is being performed. Above the device lines, with the task state it
+        # qualifies - and so on the path that cannot read the device too.
+        if self._task_state.status not in (TaskStatus.IDLE, TaskStatus.CONNECTING):
+            notice = instruction_not_read_notice(
+                self._task_state.policy, pending=self._task_state.status == TaskStatus.RUNNING
+            )
+            if notice:
+                status_text += f"{notice}\n"
+
+        try:
+            facts = self._device_facts()
+        except Exception as e:  # noqa: BLE001 - the task state must still be reported
+            logger.debug("%s device facts unavailable: %s", self.tool_name_str, e)
+            return {"status": "success", "content": [{"text": status_text}]}
+        status_text += self._device_lines(facts)
         return {
             "status": "success",
-            "content": [{"text": status_text}],
+            "content": [{"text": status_text}, {"json": facts}],
         }
 
     def stop_task(self) -> dict[str, Any]:
         """Stop the current task, including one that is still connecting.
 
         This is the interrupt an operator (or the fleet ``{"action": "stop"}``
-        dispatch, via ``mesh/core.py``) reaches for, so it has to hold for a
+        dispatch, via :class:`~strands_robots.mesh.core.Mesh`) reaches for, so
+        it has to hold for a
         task in ANY stage that can still command the arm - not only the one
         stage whose status happens to be ``RUNNING``.
 
@@ -2745,6 +3333,7 @@ class Robot(TeleopMixin, AgentTool):
 
         # Signal task to stop
         self._task_state.status = TaskStatus.STOPPED
+        self._settle_task_duration()
 
         # Cancel future if it exists
         if self._task_state.task_future:
@@ -2760,6 +3349,11 @@ class Robot(TeleopMixin, AgentTool):
                     "text": f"Task stopped{stage}: '{self._task_state.instruction}'\n"
                     f"Duration: {self._task_state.duration:.1f}s\n"
                     f"Steps completed: {self._task_state.step_count}"
+                    + (
+                        f"\n{stop_notice}"
+                        if (stop_notice := instruction_not_read_notice(self._task_state.policy))
+                        else ""
+                    )
                 }
             ],
         }
@@ -2779,10 +3373,16 @@ class Robot(TeleopMixin, AgentTool):
         """Get tool specification with async actions."""
         return {
             "name": self.tool_name_str,
-            "description": f"Universal robot control with async task execution ({self.robot}). "
+            "description": f"Drive the real robot {self.robot} with a policy. "
             f"Actions: execute (blocking), start (async), status, stop. "
-            f"For execute/start actions: instruction and policy_port are required. "
-            f"For status/stop actions: no additional parameters needed.",
+            f"execute/start pause for operator approval before the arm moves - the call returns only "
+            f"after the operator answers (a headless script pre-approves with "
+            f"{COMMAND_ALLOW_ENV}=execute,start) - and run for at most duration seconds (default 30). "
+            f"They need instruction; the default provider groot also needs policy_port (the server it "
+            f"dials), while mock and lerobot_local build in process with no server - mock ignores the "
+            f"instruction and drives a test motion on every joint, and lerobot_local needs "
+            f"pretrained_name_or_path (the checkpoint it loads). "
+            f"status/stop take no other parameters.",
             "inputSchema": {
                 "json": {
                     "type": "object",
@@ -2799,7 +3399,7 @@ class Robot(TeleopMixin, AgentTool):
                         },
                         "policy_port": {
                             "type": "integer",
-                            "description": "Policy service port (required for execute/start actions)",
+                            "description": "Policy service port. Required by groot and moveit2, read by the other server-dialing providers, refused for providers that build in process (mock, lerobot_local).",
                         },
                         "policy_host": {
                             "type": "string",
@@ -2809,7 +3409,11 @@ class Robot(TeleopMixin, AgentTool):
                         "policy_provider": {
                             "type": "string",
                             "description": (
-                                "Policy provider name (e.g. groot, lerobot_local, mock). See list_providers()."
+                                "Policy provider name (e.g. groot, moveit2, lerobot_local, mock). "
+                                "groot (default, needs policy_port) and moveit2 dial a server; "
+                                "lerobot_local runs a local checkpoint in process and needs "
+                                "pretrained_name_or_path; mock is a test motion on every joint that "
+                                "ignores the instruction. See list_providers()."
                             ),
                             "default": "groot",
                         },
@@ -2854,6 +3458,41 @@ class Robot(TeleopMixin, AgentTool):
         except ImportError:
             return False
         return bool(agent_hitl.consume_grant(self.tool_name_str, tool_input))
+
+    def _pre_gate_error(
+        self, action: str, policy_port: Any, policy_provider: str, duration: Any
+    ) -> dict[str, Any] | None:
+        """The input checks that decide a command's fate with no operator and no hardware.
+
+        ``execute``/``start`` ask the operator before dispatch, and the
+        dispatcher (:meth:`execute_task` / :meth:`start_task`) then checks
+        the inputs. Every check here is a pure function of the call and of
+        this object - a shut-down robot, a duration that is not a positive
+        number, a ``policy_port`` outside 1-65535 or missing for a provider
+        that needs one - so a call that fails one was never going to move
+        the arm. Asking first would spend an approval on nothing and leave
+        the operator reading an error under the "y" they just typed, with
+        the agent's corrected retry costing a second round. Run them before
+        the gate; the dispatcher runs them again, which is defence in depth,
+        not a second answer.
+
+        Args:
+            action: ``"execute"`` or ``"start"``; names the dispatcher the
+                refusal speaks for.
+            policy_port: As supplied by the tool input.
+            policy_provider: As supplied by the tool input.
+            duration: As supplied by the tool input.
+
+        Returns:
+            The dispatcher's error envelope, or None when the call reaches
+            the operator.
+        """
+        method = "execute_task" if action == "execute" else "start_task"
+        if err := self._shutdown_error(method):
+            return err
+        if err := self._duration_error(duration, method):
+            return err
+        return self._policy_port_error(policy_port, method, policy_provider)
 
     def _gate_motion(
         self, action: str, tool_input: Mapping[str, Any], tool_use: ToolUse, invocation_state: Mapping[str, Any]
@@ -2924,16 +3563,26 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for execute action"}],
+                                "content": [{"text": "instruction is required for execute action"}],
                             },
                         )
                     )
+                    return
+
+                # A call the dispatcher would refuse on its inputs alone is
+                # refused here, before the operator is asked to approve it.
+                if err := self._pre_gate_error(action, policy_port, policy_provider, duration):
+                    yield ToolResultEvent(self._make_tool_result(tool_use_id, err))
                     return
 
                 # Ask the operator before anything is dispatched: a refused or
@@ -2964,16 +3613,24 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for start action"}],
+                                "content": [{"text": "instruction is required for start action"}],
                             },
                         )
                     )
+                    return
+
+                if err := self._pre_gate_error(action, policy_port, policy_provider, duration):
+                    yield ToolResultEvent(self._make_tool_result(tool_use_id, err))
                     return
 
                 try:
@@ -3008,12 +3665,7 @@ class Robot(TeleopMixin, AgentTool):
                 yield ToolResultEvent(
                     self._make_tool_result(
                         tool_use_id,
-                        {
-                            "status": "error",
-                            "content": [
-                                {"text": f"Unknown action: {action}. Valid actions: execute, start, status, stop"}
-                            ],
-                        },
+                        {"status": "error", "content": [{"text": self._unknown_action_text(action)}]},
                     )
                 )
 
@@ -3093,7 +3745,23 @@ class Robot(TeleopMixin, AgentTool):
                     )
 
             # Tear down the ROS 2 telemetry bridge if one was created.
-            self._shutdown_ros_bridge()
+            # Guarded like the mesh and teleop steps above, and for a stronger
+            # reason: this is the last step before the devices close, so a
+            # ``destroy_node()`` on a context another component already shut
+            # down would reach the handler at the bottom of this method and
+            # skip the disconnect entirely -- leaving the serial port held and
+            # the arm energised at its last commanded position, with nothing
+            # left that would close either. The sim engine already suppresses
+            # this same call; a software resource that will not release must
+            # not decide whether the physical ones do.
+            try:
+                self._shutdown_ros_bridge()
+            except Exception as ros_exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: ROS 2 bridge shutdown raised during cleanup: %s",
+                    self.tool_name_str,
+                    ros_exc,
+                )
 
             # Close the devices last, once every source of commands is down.
             # ``send_action`` re-opens the robot lazily on a command that finds
@@ -3128,6 +3796,14 @@ class Robot(TeleopMixin, AgentTool):
 
     def __del__(self) -> None:
         """Destructor to ensure cleanup."""
+        if not hasattr(self, "_shutdown_event"):
+            # ``__init__`` refused a kwarg (``action_horizon``,
+            # ``control_frequency``) before the executor and this latch were
+            # created, so the instance holds nothing to release. ``cleanup()``
+            # would raise on the first attribute it never reached and log that
+            # name as a cleanup failure beside the ValueError the caller was
+            # owed. A bring-up that fails after this point still cleans up.
+            return
         try:
             self.cleanup()
         except Exception:
@@ -3155,7 +3831,10 @@ class Robot(TeleopMixin, AgentTool):
         ``is_connected`` probe raises is omitted from ``cameras_connected``
         rather than failing the whole probe, so a name present in ``cameras``
         and absent from ``cameras_connected`` is one whose state could not be
-        read. A device exposing no live camera objects reports an empty map.
+        read. That same raise also reaches the arm's aggregate ``is_connected``,
+        which reports ``None`` for it rather than degrading this probe to its
+        error shape - so the attribution survives the failure it exists to
+        attribute. A device exposing no live camera objects reports an empty map.
 
         Returns:
             Status dict of measured facts. An unexpected failure anywhere in
@@ -3164,45 +3843,12 @@ class Robot(TeleopMixin, AgentTool):
             supervising agent reads a verdict instead of taking an exception.
         """
         try:
-            # Get robot connection status
-            is_connected = self.robot.is_connected if hasattr(self.robot, "is_connected") else False
-            is_calibrated = self.robot.is_calibrated if hasattr(self.robot, "is_calibrated") else True
-
-            # The configured enumeration: which image streams the device was
-            # asked for. Says nothing about whether any of them came up.
-            camera_status = []
-            if hasattr(self.robot, "config") and hasattr(self.robot.config, "cameras"):
-                for name in self.robot.config.cameras.keys():
-                    camera_status.append(name)
-
-            # The measured reading, one entry per live camera. The camera
-            # objects hang off the device beside the config, and each carries
-            # the ``is_connected`` that the device's own aggregate is built
-            # from - so reading them here is what turns an aggregate ``False``
-            # into a named culprit instead of a set to guess from.
-            cameras_connected: dict[str, bool] = {}
-            live_cameras = getattr(self.robot, "cameras", None)
-            if isinstance(live_cameras, dict):
-                for name, camera in live_cameras.items():
-                    try:
-                        cameras_connected[name] = bool(camera.is_connected)
-                    except Exception as e:  # noqa: BLE001 - a camera that cannot answer is omitted, not fatal
-                        # Breadth is the camera backend's, not ours: the default
-                        # OpenCV camera answers through ``cv2.VideoCapture``, and
-                        # ``cv2.error`` subclasses ``Exception`` directly, so any
-                        # narrower tuple would let the shipped camera through.
-                        logger.debug("camera %r on %s could not report is_connected: %s", name, self.tool_name_str, e)
-
-            # Build status dict
             status_data = {
                 "robot_name": self.tool_name_str,
                 "robot_type": getattr(self.robot, "robot_type", self.robot.name),
                 "robot_info": str(self.robot),
                 "data_config": self.data_config,
-                "is_connected": is_connected,
-                "is_calibrated": is_calibrated,
-                "cameras": camera_status,
-                "cameras_connected": cameras_connected,
+                **self._device_facts(),
                 "ros2_bridge": bool(getattr(self, "_ros_bridge", None) is not None),
                 "ros2_transport": getattr(self, "_ros2_transport", "rclpy")
                 if getattr(self, "_ros_bridge", None) is not None
@@ -3322,9 +3968,12 @@ class Robot(TeleopMixin, AgentTool):
         have its hardware follow along.
 
         Args:
-            teleoperator: Any object with a ``get_action() -> dict`` method.
+            teleoperator: Any object with a callable ``get_action() -> dict``.
                 Typically a lerobot Teleoperator (SOLeader, GamepadTeleop,
-                KeyboardTeleop, Phone).
+                KeyboardTeleop, Phone). The publish loop polls it every tick, so
+                a device that does not satisfy that contract is refused here
+                rather than on the loop thread - the same domain
+                :meth:`attach_teleop` grades a locally attached device against.
             device_name: Name for this input stream (e.g. "leader", "gamepad").
             method: Input method label ("arm", "gamepad", "keyboard", "phone").
             hz: Publishing frequency in Hz. Must be a positive finite number;
@@ -3332,27 +3981,34 @@ class Robot(TeleopMixin, AgentTool):
 
         Returns:
             Status dict with topic and peer_id for the receiver to use, or an
-            error dict when the mesh is inactive, ``device_name`` is not a
-            valid mesh identifier, or ``hz`` is not a rate the publish loop
-            can honor.
+            error dict when the mesh is inactive, ``teleoperator`` cannot be
+            polled, ``device_name`` is not a valid mesh identifier, or ``hz`` is
+            not a rate the publish loop can honor.
         """
         if not self.mesh or not self.mesh.alive:
             return {"status": "error", "content": [{"text": "Mesh not active. Cannot publish input."}]}
 
         from strands_robots.mesh.security import ValidationError, validate_mesh_identifier
 
-        # Both arguments are validated up front, before the teardown of any
+        # All three arguments are validated up front, before the teardown of any
         # publisher already registered under this device name: a rejected call
         # must not stop a live stream. ``device_name`` becomes a segment of the
-        # published key expression and a key in ``_input_publishers``, and
-        # ``hz`` sets the publish loop's ``1 / hz`` period. Report through the
-        # tool envelope rather than raising.
+        # published key expression and a key in ``_input_publishers``, ``hz``
+        # sets the publish loop's ``1 / hz`` period, and ``teleoperator`` is what
+        # that loop polls for every frame - a device with no callable
+        # ``get_action`` cannot produce one, so it replaces a working stream with
+        # a session that reports running and publishes nothing. Report through
+        # the tool envelope rather than raising.
         try:
             validate_mesh_identifier(device_name, "start_teleop_publish.device_name")
         except ValidationError as exc:
             return {"status": "error", "content": [{"text": str(exc)}]}
 
         error = positive_finite_number_error(hz, "hz", "start_teleop_publish")
+        if error:
+            return {"status": "error", "content": [{"text": error}]}
+
+        error = teleoperator_contract_error(teleoperator, "teleoperator", "start_teleop_publish")
         if error:
             return {"status": "error", "content": [{"text": error}]}
 

@@ -14,7 +14,7 @@ import strands_robots
 |--------|------|------|
 | `Robot(name, mode='sim', ...)` | Factory → `Simulation` or `HardwareRobot` | [Robot factory](getting-started/robot-factory.md) |
 | `Teleoperator(name, **kwargs)` | Factory → LeRobot teleoperator (leader arm, gamepad, keyboard, …) | [Teleoperation](hardware/teleoperation.md) |
-| `list_robots(category='all')` | Catalog query | [Robot catalog](robots/index.md) |
+| `list_robots(mode='all')` | Catalog query, filtered on backend support | [Robot catalog](robots/index.md) |
 | `Policy` | Policy ABC | [Policies](policies/overview.md) |
 | `MockPolicy` | Sinusoidal mock | [Policies](policies/overview.md) |
 | `create_policy(provider, **kw)` | Policy factory | [Policies](policies/overview.md) |
@@ -38,16 +38,16 @@ from strands_robots.registry import (
 
 | Symbol | What |
 |--------|------|
-| `list_robots(category)` | All robots in a category, or `"all"`. |
+| `list_robots(mode)` | Robots filtered on backend support, not on category: `"all"`, `"sim"` (has a simulation asset), `"real"` (has a hardware backend) or `"both"`. An unrecognized mode raises rather than returning the unfiltered list. To group by category use `list_robots_by_category()`. |
 | `resolve_name(name)` | Alias → canonical name. The query is folded by `normalize_robot_name` first, so any spelling of a name or alias reaches the same robot. |
 | `get_robot(name)` | Full registry entry dict. |
 | `has_sim(name)` / `has_hardware(name)` | Sim / real support flags. |
 | `get_hardware_type(name)` | LeRobot type string for `mode="real"`. |
-| `list_robots_by_category()` | `{category: [names]}`. |
+| `list_robots_by_category()` | Group name to the `list_robots()` records in it. Every robot is in exactly one group, so the group sizes sum to `len(list_robots())`. `category` is optional, so a robot that declares none is grouped under `"other"` rather than under a nameless group, and a declared name is stripped of surrounding whitespace so a padded spelling joins its own group. `list_robots()` still reports each robot's own `category` exactly as its entry declares it. |
 | `list_aliases()` | All 121 aliases, keyed by `normalize_robot_name` (so every key is a spelling a folded query can produce), including every GR00T `data_config` spelling (so `data_config` names resolve as robot names). |
 | `normalize_robot_name(name)` | The fold every registry lookup applies: lowercase, trimmed, dashes as underscores. Canonical names, aliases and the uniqueness constraints over both are all keyed by it, so this is the rule that predicts which robot a name reaches. |
 | `format_robot_table()` | Pretty-printed robot table. |
-| `register_robot(name, entry)` | Add user-defined robot at runtime. `model_xml`/`scene_xml` must name a file inside `asset_dir`. Values must be JSON types (a `Path` or a numpy scalar in `hardware` is refused, naming the offending type). |
+| `register_robot(name, *, model_xml, ...)` | Add user-defined robot at runtime. Every field after `name` is keyword-only. `model_xml`/`scene_xml` must name a file inside `asset_dir`. Values must be JSON types (a `Path` or a numpy scalar in `hardware` is refused, naming the offending type). |
 | `unregister_robot(name)` | Remove a runtime-registered robot. |
 | Both write the whole overlay | `user_robots.json` is read, changed and stored back in one atomic commit, so a refused or failed write leaves every previously registered robot exactly as it was rather than truncating the document they all share. |
 | `list_user_robots()` | Names from `register_robot`. |
@@ -74,7 +74,7 @@ from strands_robots.simulation.base import SimEngine
 | `Simulation` | MuJoCo backend - 60+ agent actions. |
 | `SimWorld`, `SimRobot`, `SimObject`, `SimCamera` | Shared dataclasses. |
 | `create_simulation(backend='mujoco')` | Factory for non-`Robot()` construction. |
-| `list_backends()` / `register_backend(name, cls)` | Backend registry. |
+| `list_backends()` / `register_backend(name, loader)` | Backend registry. `loader` is a zero-arg callable returning the class (`lambda: MyEngine`), so the import stays deferred. |
 | `SimEngine` | ABC custom backends implement. |
 
 Selected actions:
@@ -83,7 +83,7 @@ Selected actions:
 |--------|------|
 | `run_policy(robot_name, ...)` | Blocking policy rollout. |
 | `start_policy(robot_name, ...)` | Rollout in a background thread on MuJoCo; a blocking passthrough to `run_policy` on the other backends. `describe()['methods']['start_policy']` states which one the engine you hold implements. |
-| `stop_policy(robot_name)` | Cooperatively stop a rollout; the `json` block reports `was_running`. Refused (naming the class) by a backend with no durable per-robot claim. |
+| `stop_policy(robot_name)` | Cooperatively stop a rollout, then wait (bounded, 1 s) for its worker to exit, so the caller's next action on that robot is admitted. The `json` block reports `was_running` and `exited`: `true` when the worker was joined and is gone, `false` when it is still live after that budget (the text says so, and names the action that stays refused), `null` when there was nothing to join - no rollout, or a blocking `run_policy` driven on its caller's own thread. An empty `robot_name` means the only rollout in flight, and is otherwise refused naming what is running. Refused (naming the class) by a backend with no durable per-robot claim. |
 | `run_multi_policy(policies, ...)` | Synchronized multi-robot rollout, one merged frame per step. |
 | `eval_policy(robot_name, n_episodes, ...)` | Multi-episode evaluation. |
 | `evaluate_benchmark(benchmark_name, ...)` | Run registered benchmark. |
@@ -137,13 +137,15 @@ from strands_robots.policies.cosmos3 import Cosmos3Policy
 ## `strands_robots.tools`
 
 ```python
-from strands_robots.tools import (
+from strands_robots import (
     download_assets, gr00t_inference, lerobot_camera, lerobot_teleoperate,
     lerobot_train, pose_tool, robot_mesh, run_policy,
     serial_tool, train_policy, use_lerobot, use_ros, use_rtps,
 )
-# Every tool is also re-exported at the package root, e.g.
-#   from strands_robots import use_lerobot, run_policy
+# Each tool lives in a submodule of the same name (strands_robots.tools.use_ros),
+# so read it off the package root as above or off its own submodule
+# (from strands_robots.tools.use_ros import use_ros); never off strands_robots.tools,
+# where the name is the submodule once anything has imported it.
 # All return {"status": "...", "content": [{"text": "..."}]}
 ```
 

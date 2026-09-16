@@ -1492,14 +1492,20 @@ hatch run format            # ruff check --fix, ruff format
    was reporting - both read `mergeStateStatus: CLEAN`.
 
    Three properties of that sweep are worth knowing before leaning on it. A
-   truncated path set is named as unevaluated rather than intersected: a capped
-   list is indistinguishable from a complete one in the payload, and this check's
+   truncated path set is never intersected as if it were complete: a capped list
+   is indistinguishable from a complete one in the payload, and this check's
    failure mode is a *missed* overlap, so quietly intersecting a truncated set is
    how one goes missing. The two sides differ in how far away that is - the head
    side is read from the paginated `pulls/{n}/files` endpoint and stops at 3000
-   entries, while the base side has no paginated equivalent and keeps the compare
+   entries, while the base side has no paginated `files` and keeps the compare
    endpoint's 300 - and the head side is the input to the pairwise mode, so it is
-   the one that must not drop a large diff.
+   the one that must not drop a large diff. The base side reaches its 300 often,
+   because `M..base` grows for as long as a branch sits in review, so a range that
+   reaches it is read as its halves instead: the same payload carries the range's
+   `commits`, and one of them splits the compare into two narrower ones whose
+   union is the set the capped list was hiding. Only a range with no boundary
+   inside it - a single commit whose own diff reaches the cap - is still named as
+   unevaluated.
    And the two path sets skip apart: the base-side set is the one that grows
    without bound, so it is the one that hits its cap - #1035 was 265 commits
    behind - and dropping the whole pull request for it would discard the pairwise
@@ -1651,8 +1657,17 @@ hatch run format            # ruff check --fix, ruff format
    place it is legible:
 
    ```
-   GET /repos/{owner}/{repo}/actions/runs?head_sha=<head>  ->  triggering_actor
+   GET /repos/{owner}/{repo}/actions/runs?head_sha=<head>  ->  actor
    ```
+
+   Read `actor`, not `triggering_actor`. A run carries both; `triggering_actor`
+   names the account behind its *latest attempt*, so approving a held run or
+   re-running one rewrites it. On #3448 -- a first-time contributor's fork, every
+   run held at `action_required` -- releasing the CI moved `triggering_actor` to
+   the maintainer on all nine `pull_request` runs while `actor` stayed
+   `shipitfast`, so the check named its approver as the pusher. The two agree
+   wherever no run had a second attempt (measured on #1894, #1920, #1722, #1035
+   and #2907).
 
    #1035 is the control - same author, same fork, same `strands_robots/mesh/`
    files, one approval from the same account post-dating its head commit,
@@ -1661,7 +1676,7 @@ hatch run format            # ruff check --fix, ruff format
    `APPROVED` - until a later push moved that one input and took it into the
    blocked row as well:
 
-   | PR | commit author | `triggering_actor` | approver | `reviewDecision` |
+   | PR | commit author | `actor` | approver | `reviewDecision` |
    |---|---|---|---|---|
    | #1035 at `2be59dad` | the contributor | the contributor | the maintainer | `APPROVED` |
    | #1035 at `8d6a4c42` | the maintainer | the maintainer | the maintainer | `REVIEW_REQUIRED` |
@@ -1718,8 +1733,8 @@ hatch run format            # ruff check --fix, ruff format
    `8d6a4c42`.
 
    Do not try to settle this from the commit metadata, which misleads in three
-   different directions. All three heads below read `REVIEW_REQUIRED`; only
-   `triggering_actor` is load-bearing.
+   different directions. All three heads below read `REVIEW_REQUIRED`; only the
+   workflow run's `actor` is load-bearing.
 
    | head | git author / committer | metadata reads as |
    |---|---|---|
@@ -1731,8 +1746,9 @@ hatch run format            # ruff check --fix, ruff format
    prompt a check: a commit whose committer is a GitHub service account reads as
    GitHub having performed the merge rather than a person. It is what the
    **"Update branch" button** leaves behind, and the clicker survives only in the
-   git *author* field and in `triggering_actor` -- both `cagataycali` on that
-   head, across all 12 of its workflow runs, on a branch authored by `logesh4v`.
+   git *author* field and in the run attribution -- `cagataycali` in `actor` and
+   in `triggering_actor` alike, across all 12 of that head's workflow runs, on a
+   branch authored by `logesh4v`.
    A table that stopped two of the three shapes is why this one was read twice as
    harmless.
 
@@ -2275,8 +2291,9 @@ which side the enum is on.
 ### Module-Level Side Effects
 - **If you must run code at import time, comment WHY it can't be lazy.** `MUJOCO_GL` is the canonical example: MuJoCo locks the GL backend at first `import mujoco`, so the env var must be set before any downstream import chain triggers it.
 - **An import-time env default must name a value that works where the code runs.** The same `MUJOCO_GL` example has a second half: because the backend is locked at first `import mujoco`, a *module-scope* default is what a headless host is left with when the operator exported nothing, while one inside a test function runs too late to select anything. MuJoCo's windowed backends (`cgl`, `glfw`) cannot render without a window server, and `glfw` fails worse than `cgl`: `cgl` is refused at import with a message naming the variable; `glfw` is accepted, and the render probe then warns that rendering is unavailable and names the missing `DISPLAY` but not the `MUJOCO_GL` value that asked for a window, after which camera observations are skipped and the caller's *failure* is whatever it was doing with those frames - a camera recording reports it as a dataset feature mismatch several frames away. Write `os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")` - a bare `"egl"` is not in MuJoCo's valid set on Darwin, so it trades one platform for the other.
-- Pinned by `tests/test_examples_mujoco_gl.py::test_no_module_scope_windowed_gl_default`, which is AST-scoped to module level so a backend name that is the value *under test* (a `monkeypatch.setenv`, or an assertion about what the resolver did) is out of scope by construction rather than by exemption.
-- **Cheap-guard optional imports** - `if importlib.util.find_spec("mujoco") is not None:` before doing `from strands_robots.simulation.mujoco.backend import _configure_gl_backend`. Users without the `[sim-mujoco]` extra shouldn't pay an import-attempt cost on every `import strands_robots`.
+- Pinned by `tests/test_examples_mujoco_gl.py::test_no_module_scope_platform_bound_gl_default`, which is AST-scoped to module level so a backend name that is the value *under test* (a `monkeypatch.setenv`, or an assertion about what the resolver did) is out of scope by construction rather than by exemption.
+- **Cheap-guard optional imports** - `if importlib.util.find_spec("mujoco") is not None:` before doing `from strands_robots._mujoco_gl import _configure_gl_backend`. Users without the `[sim-mujoco]` extra shouldn't pay an import-attempt cost on every `import strands_robots`.
+- **An import-time shim lives in a stdlib-only leaf, never under a package whose `__init__` is heavy.** `import strands_robots` is documented as leaving numpy, torch and mujoco out of `sys.modules`, and that is load-bearing rather than cosmetic: coverage resolves a dotted `--cov=strands_robots.<sub>` source with `find_spec` inside `sys_modules_saved()`, so any numpy the parent package initialises is dropped from `sys.modules` and the next `import numpy` re-executes its Python layer over an already-initialised C extension - `ndarray.max()` then returns a foreign `_NoValue` and 149 of 2268 Isaac tests failed on `float()` of it (#3587). The GL selector used to live in `simulation.mujoco.backend`, and importing it ran `simulation/__init__` -> `SimEngine` -> the policy runner -> the rendering package, twelve numpy-importing modules for a function that touches `os.environ`. It now lives in `strands_robots._mujoco_gl` beside `_dyld`, the other import-time shim, and a monkeypatch aimed at one of its helpers is set on that module - a patch on the backend's re-imported name is not read by the selector. Pinned by `tests/test_package_lazy_imports.py::TestBareImportLeavesNumpyUnloaded`, which grades the bare import in a subprocess, the coverage probe itself, and that the leaf imports only the stdlib.
 
 ### Public API Hygiene
 - **Never recommend a `_method` in user-facing docstrings or error messages.** If `Robot()`'s docstring says "use `sim._dispatch_action(...)` to add a camera", you've just locked in a private dependency. Promote it (rename `_dispatch_action` → `dispatch_action`) or add public shorthands (`Simulation.add_camera()` / `.create_world()` / `.add_robot()`) before merging.
@@ -2318,7 +2335,7 @@ which side the enum is on.
 
 ### Testing Patterns
 - **Use `monkeypatch.setenv`, never `os.environ[...] = ...`** - direct mutation leaks if the test raises before `finally`, and `del os.environ[...]` can `KeyError` under parallel runs. The pytest fixture handles teardown atomically.
-- **Restore a `sys.modules` entry you remove** - a removal does not undo an import, it *orphans* every reference already bound to that module: the next `import X` re-executes the package and returns a *different* object, so a sibling test module's `monkeypatch.setattr(X, "attr", double)` installs the double where nothing will look and the real package is used instead. `monkeypatch.setitem(sys.modules, name, None)` makes `import name` raise `ImportError` *and* restores. A bare `sys.modules.pop("boto3", None)` in one camera-offload test left the IoT fan-out tests building a real client and attempting signed AWS requests, dormant only because they happened to sort ahead of the pop. Purging a module nothing patches, to force a re-import, stays legal - `tests/test_sys_modules_removal_leaves_no_orphan.py` grades the difference from the tree.
+- **Restore a `sys.modules` entry you remove** - a removal does not undo an import, it *orphans* every reference already bound to that module: the next `import X` re-executes the package and returns a *different* object, so a sibling test module's `monkeypatch.setattr(X, "attr", double)` installs the double where nothing will look and the real package is used instead. `monkeypatch.setitem(sys.modules, name, None)` makes `import name` raise `ImportError` *and* restores. A bare `sys.modules.pop("boto3", None)` in one camera-offload test left the IoT fan-out tests building a real client and attempting signed AWS requests, dormant only because they happened to sort ahead of the pop. Purging a module nothing patches, to force a re-import, stays legal - `tests/test_sys_modules_removal_leaves_no_orphan.py` grades the difference from the tree. **Blocking an optional dependency borrows the entry, so put back what you displaced**: `sys.modules[name] = None` makes the import fail, and the way out is re-assigning the module that was there, never `del sys.modules[name]` - deleting the key is the same orphaning by another spelling, and `require_optional`'s memo is no fallback because it is populated on the first *success*. `tests/_blocked_module.py`'s `blocked(name)` restores both entries and is the one owner of that pair.
 - **Import a tool from its own submodule, never off the tools package** - `strands_robots.tools` maps each tool name to the `@tool` object inside the submodule of the *same* name, so `from strands_robots.tools import pose_tool` resolves to whichever of the two this process bound first: CPython's `_handle_fromlist` imports the submodule only when the attribute is *absent*, and here the lookup triggers the package `__getattr__`, which succeeds, so the name binds to the tool object and the submodule is never imported. A source that binds a name that way and then reads it as a module - `ur.__file__`, `pose_mod.pose_tool`, any of the module's private names - therefore passes or fails on the import order of the whole process rather than on the behaviour it is about, and surfaces as an `AttributeError` naming the read rather than the import that decided it. Write `import strands_robots.tools.pose_tool as pose_mod` or `from strands_robots.tools.pose_tool import pose_tool`, which cannot resolve to anything else. `tests/tools/test_lazy_tool_name_is_not_read_as_a_module.py` derives both halves of the rule - which names are ambiguous, and which attributes only a module can answer - so a tool added to the mapping and a call site added to any scanned tree are graded on arrival.
 - **Happy-path tests, not just error-paths** - if you have `test_factory_raises_on_bad_xml`, you also need `test_factory_returns_working_sim` gated behind `pytest.importorskip("mujoco")`. Steps physics, asserts state, destroys cleanly.
 - **Never read a tool name off `strands_robots.tools`** - the package maps each exported name to the `@tool` object inside the submodule of the *same* name and caches it in the package `__dict__`, so `from strands_robots.tools import pose_tool` binds either the tool or the module depending on what the process imported first: cold it is the tool, and after any import of the submodule it is the module. That read is also the only spelling that writes the *tool* into the slot, which is what makes the module-alias form used widely here as a monkeypatch target (`import strands_robots.tools.use_rosbridge as rb_mod`) resolve to the tool instead - `rb_mod.roslibpy` then raises `AttributeError` naming the tool class rather than an import order. Both directions shipped, each passing in the selection it was written against: two tests read the name and used the result as a module (`'DecoratedFunctionTool' object has no attribute '__file__'`), two examples read it and used the result as a tool (`module ... has no attribute '__wrapped__'`). Write `import strands_robots.tools.<name> as <name>_mod` when the module object is wanted and `from strands_robots.tools.<name> import <name>` when the tool is wanted; both read the submodule, so no import order changes them. Pinned by `tests/tools/test_lazy_tool_name_imports_are_unambiguous.py`.
@@ -2465,6 +2482,7 @@ Corrections from code review that apply to all future contributions:
   | handler | ends in | flagged |
   |---|---|---|
   | `strands_robots/dashboard/auth.py::_save_locked` | `os.unlink(tmp)`, bare `raise` | no |
+  | `strands_robots/dashboard/auth.py::_write_enroll_token` | `os.unlink(tmp)`, bare `raise` | no |
   | `strands_robots/dashboard/settings.py::_write_file` | `os.unlink(tmp)`, bare `raise` | no |
   | `strands_robots/episode_labels.py::_write_document` | `os.unlink(tmp_name)`, bare `raise` | no |
   | `strands_robots/hardware_robot.py::start_task` | `self._release_task()`, bare `raise` | no |
@@ -2596,6 +2614,59 @@ Corrections from code review that apply to all future contributions:
   runtime, the one shape where this exemption would suppress a true finding and
   the one direction `ruff` and `mypy` cannot report, since the cast string
   resolves either way.
+- **`py/mixed-returns` does not read a `NoReturn` it did not model, so a
+  test helper that returns a value on one path and ends in `pytest.fail(...)`
+  on the other is reported as falling through.** `pytest.fail`, `pytest.skip`,
+  `pytest.exit` and `pytest.xfail` are each declared `-> NoReturn` in
+  `_pytest/outcomes.py` - as the `__call__` of an outcome class, which is why
+  the analysis does not follow it - so the only way past that line is an
+  exception and the implicit `None` the alert describes cannot be produced.
+  The shape is the idiomatic one for a helper that searches and refuses:
+
+  ```python
+  def _self_calls(module: str, method: str) -> set[str]:
+      for node in ast.walk(tree):
+          if isinstance(node, ast.FunctionDef) and node.name == method:
+              return {...}
+      pytest.fail(f"{method} not found in {module}")
+  ```
+
+  Do not answer the alert by rewriting the helper. Run the counterfactual,
+  because the two cases need opposite actions and only one of them is a false
+  positive:
+
+  | `mypy` after replacing the outcome with a call that can return | meaning | action |
+  |---|---|---|
+  | `Missing return statement [return]` at the `def` | the fall-through exists only if the terminal call returns, and it cannot | dismiss as `false positive` |
+  | clean | the helper is `-> Any` or unannotated, so `mypy` is not reading its body at all | read the terminal call yourself |
+
+  Measured with the three helpers' own annotations: `-> dict[str, str]` and
+  `-> set[str]` report `[return]` on the counterfactual and are clean as
+  written, and `-> Any` reports nothing either way - `mypy` does not grade a
+  missing return against `Any`, and `[tool.mypy]` relaxes
+  `disallow_untyped_defs` for `tests.*` and `tests_integ.*`, so an unannotated
+  helper's body is not read there. `hatch run lint` runs `mypy` over both test
+  trees, so the first row is already inside `call-test-lint / Test and Lint`;
+  the second row is the hole. Do not reach for the query filter: the rule
+  carries live signal, since a helper ending in `print(...)` or a cleanup
+  call is exactly the defect it names, and `tests/test_codeql_query_filters.py`
+  pins the filter at two ids.
+
+  Three instances, one class, none adjudicated until the third held a merge:
+
+  | alert | site | terminal call | cost before it was adjudicated |
+  |---|---|---|---|
+  | 823 | `tests/simulation/test_recording_rate_matches_control_frequency.py` | `pytest.fail` | open on `main` for 45 days |
+  | 1140 | `tests/drivers/ur/test_ur_sim_joint_order_matches_the_wire.py` | `pytest.skip`, closing a `try` handler | open on `main` for 12 days, and `-> Any`, so in the second row |
+  | 1206 | `tests/mesh/test_mesh_guide_opening_block_starts_the_mesh.py` | `pytest.fail` | a review thread gated #3551 under `required_review_thread_resolution`; merged 8 seconds after the resolve |
+
+  `tests/test_mixed_return_helpers_end_in_a_pytest_outcome.py` grades the
+  boundary at every site whatever the annotation: it derives from the test
+  trees every function that returns a value and can fall off its end through a
+  bare call - the terminal statement, or the last statement of an `if`, `try`
+  or `with` branch it ends in - and refuses one whose call is not a declared
+  `NoReturn`. That is the one shape where this exemption would suppress a true
+  finding and the one `mypy` cannot report in a test.
 - **Dependency Review hard-fails on high/critical CVEs in new deps.** If a PR
   needs a dep with a known critical CVE, the conversation is "do we need this
   dep" not "let's bypass the check."
@@ -2618,7 +2689,7 @@ Corrections from code review that apply to all future contributions:
   command.** A docstring one-liner that recomputes a pin is necessary but not
   sufficient; on-call at 3 AM needs a documented grace-period strategy. For the
   Amazon Root CA1 pin (`provision._AMAZON_ROOT_CA1_PINS`) the runbook lives in
-  README.md > "CA Pin Rotation Runbook": dual-pin tuple during the overlap, ship
+  docs/reference/configuration.md > "CA Pin Rotation Runbook": dual-pin tuple during the overlap, ship
   the new pin first, drop the old pin in a follow-up release after fleet uptake,
   and use `STRANDS_MESH_CA_PINS` only as an emergency out-of-band override.
 - **Make the accepted-pin set a collection, never a scalar.** `_resolve_ca_pins()`

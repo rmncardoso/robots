@@ -122,8 +122,16 @@ works, no cloud dependency required):
   image blocks for a multimodal judge (needs the `lerobot` extra). Every
   recorded camera is included - one block per camera per sampled position,
   position-major, cameras in sorted order, with the count and grouping
-  stated in the leading text block. That is deliberate, not a missing
-  simplification: the same world motion can be well above a judge's
+  stated in the leading text block and every image block immediately
+  preceded by a text block naming its camera and `frame_index`, so a
+  per-view observation can be attributed to a view and joined back onto that
+  frame's state row. The label sits *before* its image because that is what
+  binds it: with the labels moved after their images and nothing else
+  changed - same bytes, same token count - naming the blocked view scored
+  0/40 rather than 40/40, and every wrong answer was the camera named by the
+  label that then preceded the blocked image, so a text block is read as a
+  caption of the image that follows it. The interleave itself is deliberate,
+  not a missing simplification: the same world motion can be well above a judge's
   legibility threshold in one view and below it in another (a 185 mm slide
   measured as 84 px of travel in one camera and 22 px in the other, with
   the verdict lost on the weaker view alone - PR #2486 review), so
@@ -144,15 +152,29 @@ works, no cloud dependency required):
 - `read_predicate_verdict` - the authoritative deterministic verdict.
 - `write_label` - the annotation; structurally unable to touch the verdict.
 
+All four answer with the `{"status", "content"}` envelope even when the
+parquet reader is missing. `pyarrow` ships with the `lerobot` extra, so a judge
+process that only reads datasets recorded elsewhere can be running without it;
+`load_episode` and `sample_frames` then refuse by naming the extra to install,
+and the two sidecar tools (`read_predicate_verdict`, `write_label`) read JSON
+and are unaffected. A judge run over a hundred episodes reports the episode it
+could not read rather than dying on it, so no tool raises past the dispatch.
+
 Two failure modes lean on judge capability rather than on a payload field,
 so calibrate before trusting them: `jerky_motion` is grounded for a
-text-only judge by `rms_state_jerk`, but `camera_occlusion` is inherently a
-claim about *one* view that the payload's unlabelled image blocks cannot
-name, and the open-weights VLM measured on PR #2486 did not tag even a
-total single-camera occlusion (0 visible object pixels in every sampled
-frame of that view) from any presentation. Expect `camera_occlusion` from a
-human or a stronger multimodal judge, and treat any direction phrase in a
-free-text `note` as a statement about a camera frame, not about the world.
+text-only judge by `rms_state_jerk`, and `camera_occlusion` is a claim about
+*one* view, so it needs a payload in which that view can be named. It now
+can be - each image block carries its camera - and that turned out to be
+what the earlier measurement was reporting rather than judge capability: on
+a three-camera recording with one view fully blocked (0 visible object
+pixels in every sampled frame of that view, 1.2-2.1% of frame in the other
+two), naming the blocked camera from this payload scored 15/40 before the
+per-block labels and 40/40 after, with the same open-weights VLM scoring
+30/30 on the identical frames asked one at a time. Naming the view is not
+the same as emitting the tag over a real dataset, so still calibrate
+(`measure_agreement`) before trusting `camera_occlusion`, and treat any
+direction phrase in a free-text `note` as a statement about a camera frame,
+not about the world.
 The `note` is for humans and is never parsed by anything downstream - the
 filterable channels are the closed vocabularies, and that split is measured,
 not stylistic: on a frozen-arm control clip (arm silhouette travelling ~1 px
@@ -182,8 +204,37 @@ report = measure_agreement("/data/pick_place", {
     3: {"quality": "high", "failure_mode": None},
     7: {"quality": "low", "failure_mode": "jerky_motion"},
 })
-print(report["quality_agreement"], report["disagreements"])
+print(report["quality_agreement"], report["quality_baseline"], report["disagreements"])
 ```
+
+Read each agreement fraction against the baseline reported beside it, never on
+its own. Both fractions are accuracies over a column with a class balance, and
+a recorded dataset is mostly clean, so a judge that emitted one label for every
+episode already scores the majority-class frequency having read nothing: on a
+20-episode holdout with a single tagged episode, a judge answering
+`quality="high", failure_mode=None` every time measures
+`quality_agreement 0.95` / `failure_mode_agreement 0.95`, and on a holdout
+where nothing is tagged it measures 1.0. `quality_baseline` and
+`failure_mode_baseline` are what that constant answer earns on the same
+holdout, over exactly the episodes compared, so a fraction at or below its
+baseline says the judge is indistinguishable from one that read nothing -
+however high the fraction reads. A judge is calibrated by the gap, not by the
+fraction. Both baselines are `None` in step with the fraction they accompany.
+
+The gap is also per-tag advice rather than one verdict, because the taxonomy is
+not uniformly legible: measured on a 16-episode two-camera recording with
+disjoint physically-induced ground truth (4 clean, 4 that never reach the
+object, 4 with 30x the commanded jerk, 4 with one camera fully blocked), an
+open-weights VLM asked for the `failure_mode` tag emitted `None` for all 16
+episodes and scored `failure_mode_agreement 0.25` - the exact base rate of the
+4 untagged episodes, and 0.25 was also its baseline. The same model on the same
+payload, asked instead whether a plain-English description of each tag was true
+of the recording, separated the blocked-camera episodes perfectly (0.42-0.67 on
+the four blocked, 0.00 on all twelve others) and the never-reached episodes
+well, and did not separate the jerky ones at all - four evenly spaced stills
+cannot show jitter, and the recorded `rms_state_jerk` moved only 1.8x where the
+commanded jerk moved 30x. So calibrate per tag and filter on the tags whose gap
+is real.
 
 ## Filtering and re-training
 

@@ -8,7 +8,7 @@ description: Compose non-trivial scenes - multiple robots, tables, obstacles, cu
 from strands_robots import Robot
 
 sim = Robot("so100")                              # one arm on flat ground plane
-sim.add_robot(name="so100", position=[0.0, 0.5, 0.0])   # second arm
+sim.add_robot(name="arm2", data_config="so100", position=[0.0, 0.5, 0.0])   # second arm
 
 sim.add_object(name="table", shape="box", size=[0.5, 0.5, 0.02],
                position=[0.0, 0.0, 0.0], color=[0.5, 0.3, 0.1, 1.0], mass=20.0)
@@ -128,8 +128,11 @@ those `position=[0, 0, 0]` spawns the robot standing rather than sunk into the
 floor, which is the reason the compose is the useful default. `add_robot`
 reports the *measured* world position of the robot's root body and names the
 request and the model's offset beside it whenever they differ, so a spawn that
-did not land where it was asked is visible in the result. This differs from
-`add_object`, whose `position` places its body at exactly that world point.
+did not land where it was asked is visible in the result. `list_robots` reports
+the same measured base pose, re-read from the physics on every call, so a robot
+that has since walked, driven or fallen is listed where it now is rather than
+where it spawned. This differs from `add_object`, whose `position` places its
+body at exactly that world point.
 
 ### Adding a robot does not disturb the scene it joins
 
@@ -216,10 +219,24 @@ below the nominal floor), and it is regenerated identically on every
 `reset()` (deterministic given the terrain kind), so a benchmark that
 evaluates a policy on rough ground is reproducible. `terrain` only applies
 when `ground_plane=True` (the default, which is the master floor switch);
-an unknown kind is rejected with an error listing the supported kinds. It
+an unknown kind is rejected with an error listing the supported kinds.
+`ground_plane` itself must be a boolean: it selects a posture (lay a floor or
+leave the world open), so a non-boolean is refused under the shared
+`boolean_flag_error` domain rather than read by truthiness - `"false"` does
+not lay a floor and `0` does not omit one (MuJoCo and Newton backends). It
 is the ground-generation primitive a terrain *curriculum* (progressive
 difficulty across resets) builds on. (MuJoCo backend; the Newton backend
 rejects `terrain=` as not-yet-supported.)
+
+Those guarantees - the field flush with `z=0` at its lowest cell, reaching the
+full elevation at its highest, with the declared plateau count for a stepped
+kind - are properties of the *grid* as much as of the kind, so each kind needs a
+minimum number of cells to draw its shape at all. `create_world()` always uses a
+40-cell grid and is comfortably above every minimum. A caller reaching for the
+generator directly (`generate_heightfield(kind, resolution=...)`) is refused
+below it, naming the kind and the count that works, rather than handed a field
+that is flat or short of its top plateau; the minimums are exported as
+`TERRAIN_MIN_RESOLUTION`.
 
 That curriculum knob is `difficulty`, which scales the terrain's peak
 elevation (the metre height its normalized `[0, 1]` field maps to) without
@@ -405,6 +422,44 @@ Whatever the reason for a rejection - mass, `size`, an unsupported `shape`, an
 unloadable mesh - the scene is rolled back to its previous compilable state and
 the object name stays reusable, so a corrected retry under the same name works
 and one bad add never bricks later scene edits.
+
+## Object names do not collide with robot labels
+
+A robot's label is not one of its body names - those are `<label>/base`,
+`<label>/gripper`, ... - so MuJoCo's repeated-name check never saw an object
+named after a robot in the world, while every by-name reader did: the object
+took over `get_body_state(body_name=...)`, `add_camera(parent_body=...)` and
+`attach_bodies(parent=...)` for the arm the caller meant, reporting success
+each time. Both directions are refused before anything is registered:
+
+```python
+sim.add_robot(name="so101", data_config="so101")
+sim.add_object("so101", shape="box", size=[0.05, 0.05, 0.05])
+# status=error: add_object: 'so101' is the name of a robot in this world, and an
+#               object under that name would answer get_body_state /
+#               attach_bodies / add_camera calls meant for the robot (its bodies
+#               are 'so101/<body>'; see list_bodies). Pick another name.
+
+sim.add_object("cube", shape="box", size=[0.05, 0.05, 0.05])
+sim.add_robot(name="cube", data_config="so101")
+# status=error: Robot name 'cube' is already an object in this world; by-name
+#               reads (get_body_state, attach_bodies, add_camera) would keep
+#               resolving to that object. Pick another name, or omit name= to
+#               auto-number.
+```
+
+That last remedy is one you can take: the label `add_robot` derives when
+`name` is omitted skips names held by objects as well as by robots, so the
+short form stays usable in a world where an object already carries the model's
+name.
+
+```python
+sim.add_object("so101", shape="box", size=[0.05, 0.05, 0.05])
+sim.add_robot(data_config="so101")   # no name= : derives 'so101_2', not a clash
+```
+
+An object named after an existing *body* was already refused by MuJoCo
+("repeated name") and still is.
 
 ## Mesh objects
 
@@ -610,6 +665,25 @@ sim.export_xml(output_path="/tmp/handoff.xml")
 other.load_scene(scene_path="/tmp/handoff.xml")   # same scene, same structure
 ```
 
+An absolute `output_path` is written as given. A relative one - `"scene.xml"`,
+`"handoff/scene.xml"` - lands under `~/.strands_robots/scenes/`
+(`STRANDS_ROBOTS_SCENE_ROOT`), not the process working directory, so an agent
+asked to "save the scene" does not drop files into whatever directory the process
+was started from; the success text names the resolved path either way.
+
+`load_scene` reads that same directory, so the round trip holds under one bare
+name - the spelling an agent actually uses:
+
+```python
+sim.export_xml(output_path="handoff.xml")          # -> ~/.strands_robots/scenes/handoff.xml
+other.load_scene(scene_path="handoff.xml")         # same file, found there
+```
+
+A `scene_path` is read AS GIVEN first, so a relative path that resolves against
+the working directory today keeps resolving there; the scenes directory is
+searched only when nothing is at the path the caller spelled. A file that is in
+neither is refused with both directories named.
+
 Mesh, texture and height-field assets are referenced by ABSOLUTE path. MuJoCo
 resolves a relative `file=` against the model's own directory (plus `meshdir` /
 `texturedir`, or the `assetdir` that sets both), and that directory is not part
@@ -629,8 +703,11 @@ copy the referenced asset trees too, or re-compose the scene there from the same
 Free cameras look from `position` toward `target` (`fov=60.0`, `width=640`, `height=480`). Robot-URDF cameras (wrist, etc.) are auto-discovered on `add_robot` - no `add_camera` needed.
 
 A discovered camera is registered under its short MJCF name (`wrist`), and the
-compiled model also carries it namespaced (`so101/wrist`); `render` takes the
-namespaced form, `get_observation` keys on the short one. The short name is
+compiled model also carries it namespaced (`so101/wrist`). Either spelling
+addresses it on every camera surface - `render`, `render_depth`, `get_frame`,
+`get_camera_params` and the recorders - the same way a body name may be bare or
+namespaced; `get_observation` keys its frame on the short one, and
+`list_cameras` offers both. The short name is
 first-come across robots: when a second robot declares a camera whose short name
 is already taken, that camera is registered under its namespaced name instead
 (logged, naming both), so two arms that both declare `wrist` give you `wrist` and
@@ -656,6 +733,16 @@ re-mounted on its body once every surviving robot is re-attached, keeping its
 local pose and its tracking. Removing the robot the camera is mounted ON leaves
 it with no mount point, so that camera is dropped (with a warning naming it)
 rather than blocking the removal.
+
+That rebuild is faithful to the registry, and only to the registry, which is why
+`remove_robot` is refused on a world built by `load_scene`. A loaded scene's
+bodies, lights, tendons and equality constraints live only in the compiled spec,
+so rebuilding from `robots` / `objects` / `cameras` would drop all of them; the
+refusal comes before anything is touched, so the scene is left exactly as it was.
+To get the same world without one robot, `load_scene` again and `add_robot` only
+the robots you want, or swap the scene wholesale with `replace_scene_mjcf`. The
+additive verbs need no such gate - `add_robot`, `add_object` and `add_camera`
+mutate the loaded spec in place and preserve it.
 
 ## Multi-robot policies
 

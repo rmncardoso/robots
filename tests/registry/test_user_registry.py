@@ -15,8 +15,8 @@ from unittest import mock
 import pytest
 
 from strands_robots.registry import get_robot, list_robots, resolve_name
+from strands_robots.registry._overlay import user_registry_path
 from strands_robots.registry.user_registry import (
-    _get_user_registry_path,
     _load_user_registry,
     get_user_robots,
     list_user_robots,
@@ -106,46 +106,6 @@ class TestRegisterRobot:
         assert entry["hardware"] == hw
 
 
-class TestRegisterRobotAliasCollisionFailSoft:
-    """Alias-collision detection must degrade gracefully, never block a
-    registration.
-
-    ``register_robot(aliases=...)`` enumerates the package registry to warn
-    when a user alias shadows a canonical name or another alias. That
-    enumeration is best-effort diagnostics, not a precondition: if listing
-    the package registry raises (corrupt/partial install, import-time error
-    in a downstream ``robots.py`` consumer), registration must still succeed
-    with the aliases intact rather than propagating the failure to the
-    caller. This pins the ``except Exception`` fallback that resets the
-    package canonical/alias sets to empty.
-    """
-
-    def test_register_with_aliases_survives_package_enumeration_failure(self, tmp_path):
-        """When list_robots() raises during alias-collision detection, the
-        robot is still registered and its aliases resolve."""
-        robot_dir = _make_robot(tmp_path / "assets")
-
-        # The collision-detection block does a function-local
-        # ``from .robots import list_robots`` then calls it; patch the name
-        # on the robots module so the call raises at enumeration time.
-        with mock.patch(
-            "strands_robots.registry.robots.list_robots",
-            side_effect=RuntimeError("package registry enumeration failed"),
-        ):
-            entry = register_robot(
-                name="failsoft_bot",
-                model_xml="bot.xml",
-                asset_dir=str(robot_dir),
-                aliases=["failsoft_alias"],
-            )
-
-        # Registration succeeded despite the enumeration failure ...
-        assert entry["aliases"] == ["failsoft_alias"]
-        # ... and the robot + its alias are actually persisted/resolvable.
-        assert resolve_name("failsoft_alias") == "failsoft_bot"
-        assert get_user_robots().get("failsoft_bot") is not None
-
-
 class TestRegisterRobotNameNormalization:
     """Names are lower-cased, stripped, and hyphens become underscores."""
 
@@ -193,6 +153,56 @@ class TestRegisterRobotValidation:
         empty_dir.mkdir(parents=True)
         with pytest.raises(FileNotFoundError, match="Model XML not found"):
             register_robot(name="empty", model_xml="nope.xml", asset_dir=str(empty_dir))
+
+    def test_missing_asset_dir_raises_file_not_found(self, tmp_path):
+        """A non-existent asset_dir fails closed at registration with an actionable message.
+
+        Registration must not silently accept a dir that does not exist yet and
+        defer the failure to add_robot() time.
+        """
+        ghost_dir = tmp_path / "assets" / "ghost"  # never created
+        with pytest.raises(FileNotFoundError, match="Asset directory does not exist") as exc:
+            register_robot(name="ghost", model_xml="g.xml", asset_dir=str(ghost_dir))
+        # Message names the missing dir and the xml the user should place inside it.
+        assert str(ghost_dir) in str(exc.value)
+        assert "g.xml" in str(exc.value)
+        # Nothing should have been persisted.
+        assert get_user_robots().get("ghost") is None
+
+
+class TestRegisterRobotAliasCollision:
+    """register_robot fails closed when an alias would collide at read time.
+
+    The loader RAISES on an alias that shadows a canonical name or another
+    robot's alias on every subsequent read, so register_robot must reject such
+    an alias at write time rather than persist it. Otherwise a "successful"
+    registration bricks every get_robot/resolve_name call process-wide until
+    user_robots.json is hand-edited.
+    """
+
+    def test_alias_shadowing_package_canonical_name_raises(self, tmp_path):
+        robot_dir = _make_robot(tmp_path / "assets", name="botA", xml_name="a.xml")
+        with pytest.raises(ValueError, match="so100"):
+            register_robot(name="botA", model_xml="a.xml", asset_dir=str(robot_dir), aliases=["so100"])
+        # Nothing persisted, and the registry still loads.
+        assert get_user_robots().get("bota") is None
+        assert get_robot("so100") is not None
+
+    def test_alias_already_used_by_another_user_robot_raises(self, tmp_path):
+        first_dir = _make_robot(tmp_path / "assets", name="botB", xml_name="b.xml")
+        second_dir = _make_robot(tmp_path / "assets", name="botC", xml_name="c.xml")
+        register_robot(name="botB", model_xml="b.xml", asset_dir=str(first_dir), aliases=["grabber"])
+        with pytest.raises(ValueError, match="grabber"):
+            register_robot(name="botC", model_xml="c.xml", asset_dir=str(second_dir), aliases=["grabber"])
+        # The second robot is not persisted; the first is still resolvable.
+        assert get_user_robots().get("botc") is None
+        assert get_robot("grabber") is not None
+
+    def test_unique_alias_registers_successfully(self, tmp_path):
+        robot_dir = _make_robot(tmp_path / "assets", name="botD", xml_name="d.xml")
+        register_robot(name="botD", model_xml="d.xml", asset_dir=str(robot_dir), aliases=["unique_grip_xyz"])
+        assert get_user_robots().get("botd") is not None
+        assert get_robot("unique_grip_xyz") is not None
 
 
 class TestRegisterRobotAssetDirResolution:
@@ -280,13 +290,13 @@ class TestPersistence:
     def test_writes_json_file(self, tmp_path):
         robot_dir = _make_robot(tmp_path / "assets")
         register_robot(name="test_bot", model_xml="bot.xml", asset_dir=str(robot_dir))
-        path = _get_user_registry_path()
+        path = user_registry_path()
         assert path.exists()
         data = json.loads(path.read_text())
         assert "test_bot" in data["robots"]
 
     def test_corrupted_json_returns_empty(self):
-        path = _get_user_registry_path()
+        path = user_registry_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("NOT JSON!!!")
         assert _load_user_registry() == {"robots": {}}
@@ -298,13 +308,13 @@ class TestPersistence:
         the file does not hold robot definitions - so an overlay written by a
         crashed writer must not raise out of ``get_robot()``.
         """
-        path = _get_user_registry_path()
+        path = user_registry_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'{"robots": {"\xff\xfe": {}}}')
         assert _load_user_registry() == {"robots": {}}
 
     def test_valid_json_without_robots_key_returns_empty(self):
-        path = _get_user_registry_path()
+        path = user_registry_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"version": 1}')
         assert _load_user_registry() == {"robots": {}}
@@ -343,7 +353,7 @@ class TestStrandsBaseDirIntegration:
         custom = tmp_path / "custom_base"
         custom.mkdir()
         with mock.patch.dict(os.environ, {"STRANDS_BASE_DIR": str(custom)}, clear=False):
-            assert _get_user_registry_path().parent == custom
+            assert user_registry_path().parent == custom
 
     def test_assets_dir_does_not_move_registry(self, tmp_path, monkeypatch):
         """Setting only STRANDS_ASSETS_DIR must not change the registry location."""
@@ -352,12 +362,12 @@ class TestStrandsBaseDirIntegration:
         custom_assets.mkdir()
         monkeypatch.setenv("STRANDS_ASSETS_DIR", str(custom_assets))
         # Registry should land under the default base, not the assets dir.
-        assert ".strands_robots" in str(_get_user_registry_path())
+        assert ".strands_robots" in str(user_registry_path())
 
     def test_defaults_to_dot_strands_robots(self, monkeypatch):
         monkeypatch.delenv("STRANDS_BASE_DIR", raising=False)
         monkeypatch.delenv("STRANDS_ASSETS_DIR", raising=False)
-        assert ".strands_robots" in str(_get_user_registry_path())
+        assert ".strands_robots" in str(user_registry_path())
 
 
 # ===========================================================================

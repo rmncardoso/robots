@@ -9,10 +9,15 @@ publisher wiring with NO ROS 2 installed. They assert that:
 * :meth:`SimEngine._publish_ros_telemetry` reads joint state from
   ``get_observation`` and forwards it, and is a no-op when the bridge is off.
 * Enabling the bridge with no ``rclpy`` raises a clear :class:`ImportError`.
+* :meth:`SimRosBridge.shutdown` releases the node handle *and* the rclpy context
+  it initialized, so a failure destroying one does not leak the other.
+* A ``MuJoCoSimEngine`` constructor argument that is refused leaves no rclpy
+  node or context behind, whichever argument it is.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 from types import ModuleType
 from typing import Any
@@ -46,6 +51,8 @@ class _FakeNode:
         self.name = name
         self.publishers: list[_FakePublisher] = []
         self.destroyed = False
+        #: Set to model rclpy's ``InvalidHandle`` / ``RCLError`` out of the C layer.
+        self.destroy_error: BaseException | None = None
 
     def get_clock(self) -> _FakeClock:
         return _FakeClock()
@@ -56,6 +63,8 @@ class _FakeNode:
         return pub
 
     def destroy_node(self) -> None:
+        if self.destroy_error is not None:
+            raise self.destroy_error
         self.destroyed = True
 
 
@@ -178,18 +187,78 @@ def test_sim_ros_bridge_shutdown_destroys_node(fake_ros: dict[str, Any]) -> None
     bridge.shutdown()  # idempotent
 
 
+def test_shutdown_releases_the_context_when_the_node_will_not_die(fake_ros: dict[str, Any]) -> None:
+    """A node that cannot be destroyed does not keep the rclpy context alive.
+
+    ``shutdown`` releases two independent resources: this bridge's node handle
+    and - when it was this bridge that called ``rclpy.init()`` - the
+    process-wide context. Letting a ``destroy_node`` failure propagate skipped
+    the second release, and nothing retried it: the bridge keeps claiming
+    ownership while the next bridge in the process sees ``rclpy.ok()`` already
+    true, disclaims ownership, and never shuts it down either. Both call sites
+    (``SimEngine.cleanup`` and ``Robot.cleanup``) tear the bridge down inside a
+    suppressing block, so the leaked participant was reported to no one.
+    """
+    from strands_robots.simulation.ros_bridge import SimRosBridge
+
+    bridge = SimRosBridge(domain_id=7)
+    assert fake_ros["inited"] is True  # this bridge owns the context
+    fake_ros["nodes"][0].destroy_error = RuntimeError("failed to destroy node: handle invalid")
+
+    bridge.shutdown()  # best-effort: the node failure is not the caller's to handle
+
+    assert fake_ros["shutdown"] is True, "the context release was skipped by the node failure"
+    assert fake_ros["inited"] is False, "the rclpy context outlived the bridge that initialized it"
+    # ...so ownership passes cleanly to the next bridge in this process.
+    SimRosBridge(domain_id=7).shutdown()
+    assert fake_ros["inited"] is False
+
+
+def test_shutdown_reports_a_context_it_could_not_release(
+    fake_ros: dict[str, Any], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A context that will not shut down is reported, because nothing retries it.
+
+    Unlike the node handle - which the context shutdown would have taken down
+    anyway - a failed ``rclpy.shutdown`` is the last word on a participant still
+    on the wire, so it is logged at warning rather than swallowed at debug.
+    """
+    from strands_robots.simulation.ros_bridge import SimRosBridge
+
+    bridge = SimRosBridge(domain_id=7)
+
+    def _boom() -> None:
+        raise RuntimeError("rcl_shutdown failed")
+
+    monkeypatch.setattr(sys.modules["rclpy"], "shutdown", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="strands_robots.ros_telemetry"):
+        bridge.shutdown()  # must not raise out of teardown
+
+    assert "could not be shut down" in caplog.text
+    assert "domain 7" in caplog.text
+
+
 class _FakeEngine(SimEngine):
     """Minimal concrete engine exercising the telemetry helper only."""
 
-    def __init__(self, observation: dict[str, Any], *, ros2_bridge: bool = False, ros2_domain: int = 0) -> None:
+    def __init__(
+        self,
+        observation: dict[str, Any],
+        *,
+        ros2_bridge: bool = False,
+        ros2_domain: int = 0,
+        joint_names: list[str] | None = None,
+    ) -> None:
         self._obs = observation
+        self._joint_names = ["shoulder_pan", "elbow"] if joint_names is None else joint_names
         self._init_ros_bridge(ros2_bridge=ros2_bridge, ros2_domain=ros2_domain)
 
     def list_robots(self) -> list[str]:
         return ["so101"]
 
     def robot_joint_names(self, robot_name: str) -> list[str]:
-        return ["shoulder_pan", "elbow"]
+        return list(self._joint_names)
 
     def get_observation(self, robot_name: str | None = None, *, skip_images: bool = False) -> dict[str, Any]:
         return self._obs
@@ -243,6 +312,63 @@ def test_publish_telemetry_forwards_joint_state(fake_ros: dict[str, Any]) -> Non
     js = topics["/so101/joint_states"].messages[0]
     assert js.position == [0.5, -0.25]
     assert "/so101/front/image_raw" in topics
+
+
+class TestJointStateArraysNameTheSameJoints:
+    """A published ``JointState``'s two arrays must describe the same joints.
+
+    ``sensor_msgs/JointState`` pairs ``name`` and ``position`` by index, so the
+    telemetry helper cannot filter one column and not the other. Every
+    floating-base robot in the registry reaches this: the root freejoint is
+    element 0 of ``robot_joint_names()`` and is not an observation key, so a
+    positions-only filter compacted the value column and published every later
+    joint under the name of the one before it.
+    """
+
+    #: A floating-base robot's joint list: the root joint carries no observation.
+    FLOATING_BASE = ["freejoint", "hip", "knee", "ankle"]
+
+    @staticmethod
+    def _published(fake_ros: dict[str, Any]) -> Any:
+        node = fake_ros["nodes"][0]
+        topics = {p.topic: p for p in node.publishers}
+        assert "/so101/joint_states" in topics, sorted(topics)
+        return topics["/so101/joint_states"].messages[0]
+
+    def test_a_joint_absent_from_the_observation_drops_its_name_too(self, fake_ros: dict[str, Any]) -> None:
+        obs = {"hip": 0.1, "knee": 0.2, "ankle": 0.3}
+        engine = _FakeEngine(obs, ros2_bridge=True, joint_names=self.FLOATING_BASE)
+        engine._publish_ros_telemetry()
+
+        js = self._published(fake_ros)
+        # Premise: the fixture really does exercise a gap.
+        assert "freejoint" not in obs
+        assert len(js.name) == len(js.position), (js.name, js.position)
+        # Every reported joint carries ITS OWN value, not its neighbour's.
+        assert dict(zip(js.name, js.position, strict=True)) == obs
+        assert "freejoint" not in js.name
+
+    def test_no_joint_is_reported_under_its_neighbours_name(self, fake_ros: dict[str, Any]) -> None:
+        # Distinct values so a one-place shift cannot pass by coincidence.
+        obs = {"hip": -0.75, "knee": 0.5, "ankle": 1.25}
+        engine = _FakeEngine(obs, ros2_bridge=True, joint_names=self.FLOATING_BASE)
+        engine._publish_ros_telemetry()
+
+        wire = dict(zip(self._published(fake_ros).name, self._published(fake_ros).position, strict=True))
+        for joint, truth in obs.items():
+            assert wire[joint] == truth, f"{joint} published as {wire[joint]}, truth {truth}"
+        # The tail joint is reported at all, rather than falling off the end.
+        assert "ankle" in wire
+
+    def test_a_fully_observed_robot_reports_every_joint(self, fake_ros: dict[str, Any]) -> None:
+        # Control: no gap, so nothing is dropped and the name column is full.
+        obs = {"shoulder_pan": 0.5, "elbow": -0.25}
+        engine = _FakeEngine(obs, ros2_bridge=True)
+        engine._publish_ros_telemetry()
+
+        js = self._published(fake_ros)
+        assert js.name == ["shoulder_pan", "elbow"]
+        assert js.position == [0.5, -0.25]
 
 
 def test_publish_telemetry_is_noop_when_disabled(fake_ros: dict[str, Any]) -> None:
@@ -397,3 +523,87 @@ def test_shutdown_ros_bridge_tears_down_active_bridge_idempotently(fake_ros: dic
 
     engine._shutdown_ros_bridge()  # idempotent: must not raise, handle stays None
     assert engine._ros_bridge is None
+
+
+# -- a refused constructor argument must not leave the bridge behind ---------
+#
+# ``MuJoCoSimEngine.__init__`` builds the optional bridge part-way through, so
+# every argument it can refuse has to be answered above that point. These pin
+# the consequence rather than the ordering: ``__init__`` raising returns no
+# object, so the ``cleanup()`` that would call ``_shutdown_ros_bridge`` is
+# unreachable, and anything the refused call built is leaked for the life of the
+# process.
+
+REFUSED_ARGUMENTS = [
+    ({"default_width": 0}, ValueError, "default_width"),
+    ({"default_height": -1}, ValueError, "default_height"),
+    ({"ros2_domain": 233}, ValueError, "ros2_domain"),
+    ({"mesh": True}, TypeError, "mesh="),
+]
+
+
+@pytest.mark.parametrize(("kwargs", "exc", "match"), REFUSED_ARGUMENTS)
+def test_a_refused_constructor_argument_leaves_no_ros_node_behind(
+    kwargs: dict[str, Any], exc: type[BaseException], match: str, fake_ros: dict[str, Any]
+) -> None:
+    """Every refusable ``MuJoCoSimEngine`` argument is answered before the bridge.
+
+    ``mesh=True`` is the documented "not a mesh client" refusal, and it was
+    raised *after* ``_init_ros_bridge`` had created the ``strands_sim`` node and
+    initialized the rclpy context. The other three rows are the arguments whose
+    guards already precede the bridge, so they hold either way and say that this
+    is one placement rule rather than one special case.
+    """
+    from strands_robots.simulation.mujoco.simulation import MuJoCoSimEngine
+
+    with pytest.raises(exc, match=match):
+        MuJoCoSimEngine(ros2_bridge=True, **kwargs)
+
+    assert fake_ros["nodes"] == []
+    assert fake_ros["inited"] is False
+
+
+def test_a_retry_after_a_refusal_still_releases_the_context_it_initialized(
+    fake_ros: dict[str, Any],
+) -> None:
+    """A corrected second call leaves the process as it found it.
+
+    This is why the guard has to precede the bridge rather than clean up after
+    it. A bridge records ``_owns_context`` only when it is the one that called
+    ``rclpy.init``, so a bridge leaked by a refused construction keeps that
+    ownership: the corrected retry finds the context already up, declines it,
+    and on teardown destroys only its own node - leaving the leaked node alive
+    and the context initialized with nobody left to shut it down.
+    """
+    from strands_robots.simulation.mujoco.simulation import MuJoCoSimEngine
+
+    with pytest.raises(TypeError, match="mesh="):
+        MuJoCoSimEngine(ros2_bridge=True, mesh=True)
+
+    engine = MuJoCoSimEngine(ros2_bridge=True)
+    engine.cleanup()
+
+    assert [node.destroyed for node in fake_ros["nodes"]] == [True]
+    assert fake_ros["shutdown"] is True
+    assert fake_ros["inited"] is False
+
+
+def test_a_mesh_client_the_engine_can_stop_is_still_accepted(fake_ros: dict[str, Any]) -> None:
+    """The guard moved, it did not tighten: a stoppable client is stored and stopped.
+
+    Anti-vacuity companion to the rows above - a guard that refused everything
+    would satisfy them all - and it pins that resolving the handle earlier does
+    not change where it lands or who stops it.
+    """
+    from strands_robots.simulation.mujoco.simulation import MuJoCoSimEngine
+
+    stopped: list[bool] = []
+    client = type("_MeshClient", (), {"stop": lambda _self: stopped.append(True)})()
+
+    engine = MuJoCoSimEngine(ros2_bridge=True, mesh=client)
+    assert engine.mesh is client
+
+    engine.cleanup()
+
+    assert stopped == [True]
+    assert [node.destroyed for node in fake_ros["nodes"]] == [True]

@@ -23,15 +23,17 @@ Usage:
 
 import difflib
 import importlib.util
+import inspect
 import logging
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from strands_robots._dyld import quiet_video_backend
 from strands_robots.utils import (
     boolean_flag_error,
     camera_schema_key,
@@ -45,6 +47,19 @@ from strands_robots.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _quiet_backend_kwargs(dataset_cls: Any) -> dict[str, Any]:
+    """``{"video_backend": "pyav"}`` when torchcodec cannot load, else ``{}``.
+
+    For the read-back constructors, which take no ``video_backend`` from the
+    caller: the same one-line choice :func:`quiet_video_backend` makes for the
+    recorder, guarded on the LeRobot version accepting the parameter.
+    """
+    if "video_backend" not in inspect.signature(dataset_cls).parameters:
+        return {}
+    resolved = quiet_video_backend()
+    return {"video_backend": resolved} if resolved is not None else {}
 
 
 # Every LeRobot codec surface validates the requested codec against the same
@@ -723,23 +738,32 @@ def unrecordable_action_columns_error(
     outside it (in a shared scene, the robots this rollout does not drive) are
     not this frame's to supply and are left alone.
 
+    A required column is unrecordable whether the action dict omits the key or
+    carries it as ``None``: neither is a command that was issued, and the two
+    arrive from the same places - a policy that produced no value for a joint,
+    a wire payload whose reading was ``null``, a dict built by zipping names
+    against a shorter sequence of values. This is the same reading
+    :func:`unrecordable_state_columns_error` applies to a state column.
+
     Args:
         action: The frame's action dict, keyed as the dataset schema spells it.
+            A key mapped to ``None`` counts as absent.
         declared: Action column names declared by the dataset schema.
         required: Column names this frame must supply, or ``None`` to skip the
-            check. :meth:`DatasetRecorder.add_frame` no longer passes ``None``
-            for a frame that carries an action - unscoped, every declared
-            column is required - so ``None`` reaches here only from a caller
-            that deliberately makes no claim about who owes what.
+            check. :meth:`DatasetRecorder.add_frame` never passes ``None`` -
+            unscoped, every declared column is required, whether the frame's
+            action carries some of them or none - so ``None`` reaches here
+            only from a caller that deliberately makes no claim about who owes
+            what.
 
     Returns:
         An actionable message naming the missing columns, or ``None`` when every
-        required column is present.
+        required column carries a value.
     """
     if required is None:
         return None
     declared_set = set(declared)
-    missing = [key for key in required if key in declared_set and key not in action]
+    missing = [key for key in required if key in declared_set and action.get(key) is None]
     if not missing:
         return None
     return (
@@ -784,6 +808,68 @@ def unrecordable_state_columns_error(
         "not 'unknown'). Declare joint_names that match the observation keys - for a sim "
         "Robot that is list(sim.get_observation()[<robot>].keys()) - or record with the "
         "backend's start_recording(), which derives the schema from the robot."
+    )
+
+
+def unrecordable_camera_columns_error(
+    frame_camera_keys: Iterable[str],
+    declared: Iterable[str],
+    stripped: Iterable[str],
+) -> str | None:
+    """Reject a frame that leaves a declared image column with no image.
+
+    The camera sibling of :func:`unrecordable_state_columns_error` and
+    :func:`unrecordable_action_columns_error`, and it exists for the same
+    reason: LeRobot refuses the frame either way, and this is the only place
+    that knows WHY.
+
+    LeRobot's ``validate_frame`` grades a frame's feature set against the
+    schema's in both directions - ``Missing features`` and ``Extra features``
+    are two branches of one check. This recorder already defends the extra
+    half, dropping an observed camera the schema does not declare so an extra
+    debug view cannot fail the write. The missing half is not survivable and
+    was not defended: a declared ``observation.images.<name>`` the frame does
+    not carry fails ``validate_frame``, so the frame is refused, and with it
+    every frame of the episode - the camera names do not change between steps.
+
+    The usual cause is a name that nearly matches: a policy declaring
+    ``wrist_image`` against a scene streaming ``wrist_cam`` records nothing at
+    all, and LeRobot's report names the dataset column rather than the two
+    camera names or the ``camera_key_map`` that reconciles them.
+
+    Args:
+        frame_camera_keys: ``observation.images.*`` keys this frame carries,
+            after remapping and normalization.
+        declared: ``observation.images.*`` keys the schema declares.
+        stripped: ``observation.images.*`` keys dropped from this frame because
+            the schema does not declare them - the observed names a remap would
+            most likely come from.
+
+    Returns:
+        An actionable message naming the unfilled columns, the observed names
+        that were dropped, and the remedy; or ``None`` when every declared
+        image column carries an image.
+    """
+    prefix = "observation.images."
+
+    def bare(keys: Iterable[str]) -> list[str]:
+        return sorted(k.removeprefix(prefix) for k in keys)
+
+    unfilled = bare(set(declared) - set(frame_camera_keys))
+    if not unfilled:
+        return None
+    dropped = bare(stripped)
+    remedy = (
+        f"Pass camera_key_map={{{dropped[0]!r}: {unfilled[0]!r}}} to remap, or declare "
+        "cameras whose names match the streams"
+        if dropped
+        else "Declare only cameras this observation carries, or supply an image for each declared camera"
+    )
+    return (
+        f"Recorded image column(s) {unfilled} carry no image in this frame"
+        + (f", while the observed camera stream(s) {dropped} are not declared" if dropped else "")
+        + ". LeRobot refuses a frame that leaves a declared feature empty, so this frame - and "
+        f"every later one, the camera names do not change - cannot be recorded. {remedy}."
     )
 
 
@@ -925,6 +1011,35 @@ class DatasetRecorder:
         strict: bool = True,
         camera_key_map: dict[str, str] | None = None,
     ):
+        """Wrap an open LeRobotDataset writer.
+
+        Args:
+            dataset: An open ``LeRobotDataset`` accepting ``add_frame``. Built by
+                :meth:`create` or reopened by :meth:`resume`; a plain
+                ``LeRobotDataset(...)`` is read-only and its ``add_frame``
+                raises.
+            task: Default task description for frames that name none of their
+                own. The bottom of the three-level chain :meth:`add_frame`
+                documents.
+            strict: Whether a failed dataset write raises
+                :class:`RecordingFrameError` (the default) or is counted in
+                ``dropped_frame_count`` and logged. A posture rather than a
+                quantity, so it is held to the domain the rest of this module
+                applies to its flags
+                (:func:`~strands_robots.utils.boolean_flag_error`).
+            camera_key_map: Optional remap of observed camera stream names to
+                the declared schema names, in either bare or fully-qualified
+                spelling (see :meth:`create`).
+
+        Raises:
+            ValueError: ``strict`` is not a boolean. Refused rather than read by
+                truthiness: a falsy non-boolean selected best-effort recording,
+                which drops frames and completes, and a truthy one selected
+                fail-fast and then named ``strict=True`` in the refusal text
+                whatever the caller wrote.
+        """
+        if text := boolean_flag_error(strict, "strict", "DatasetRecorder"):
+            raise ValueError(text)
         self.dataset = dataset
         self.default_task = task
         self.frame_count = 0
@@ -949,7 +1064,6 @@ class DatasetRecorder:
         self.camera_key_map = self._normalize_camera_key_map(camera_key_map)
         # One-shot guard so the camera-key-mismatch diagnostic is logged once
         # per recorder instead of every control step (50Hz would flood logs).
-        self._warned_camera_mismatch = False
 
     @staticmethod
     def _normalize_camera_key_map(camera_key_map: dict[str, str] | None) -> dict[str, str]:
@@ -1264,8 +1378,6 @@ class DatasetRecorder:
             use_videos=use_videos,
             image_writer_threads=image_writer_threads,
         )
-        import inspect
-
         create_sig = inspect.signature(LeRobotDatasetCls.create)
         create_params = create_sig.parameters
 
@@ -1279,8 +1391,15 @@ class DatasetRecorder:
         # streaming_encoding / video_backend only in newer LeRobot versions
         if "streaming_encoding" in create_params:
             create_kwargs["streaming_encoding"] = streaming_encoding
-        if "video_backend" in create_params and video_backend is not None:
-            create_kwargs["video_backend"] = video_backend
+        if "video_backend" in create_params:
+            # A caller who named no backend gets LeRobot's default - unless
+            # torchcodec is installed and cannot load, where LeRobot's resolver
+            # logs its ~150-line loader exception before picking pyav anyway.
+            # :func:`strands_robots._dyld.quiet_video_backend` makes that
+            # choice in one line.
+            resolved = video_backend if video_backend is not None else quiet_video_backend()
+            if resolved is not None:
+                create_kwargs["video_backend"] = resolved
 
         # Resolve create-vs-crash for an existing target BEFORE calling
         # LeRobotDataset.create(), which mkdir()s with exist_ok=False and would
@@ -1368,8 +1487,6 @@ class DatasetRecorder:
             RuntimeError: The installed LeRobot has no ``LeRobotDataset.resume``
                 (append needs ``lerobot>=0.5.2``).
         """
-        import inspect
-
         # Same posture flag as :meth:`create` forwards, on the same domain and
         # ahead of the same lerobot probe, so the two creation entry points cannot
         # disagree about which values are usable. Read by truthiness,
@@ -1409,8 +1526,10 @@ class DatasetRecorder:
             resume_kwargs["streaming_encoding"] = streaming_encoding
         if "image_writer_threads" in resume_sig:
             resume_kwargs["image_writer_threads"] = image_writer_threads
-        if "video_backend" in resume_sig and video_backend is not None:
-            resume_kwargs["video_backend"] = video_backend
+        if "video_backend" in resume_sig:
+            resolved = video_backend if video_backend is not None else quiet_video_backend()
+            if resolved is not None:
+                resume_kwargs["video_backend"] = resolved
 
         dataset = LeRobotDatasetCls.resume(**resume_kwargs)
         recorder = cls(dataset=dataset, task=task, camera_key_map=camera_key_map)
@@ -1590,7 +1709,11 @@ class DatasetRecorder:
                 ``observation`` or a declared action column is absent from
                 ``action`` - nothing is written as 0.0 in place of a value
                 the frame did not carry. With an explicit scope, a scoped
-                action column absent from ``action``.
+                action column absent from ``action``. Also when a declared
+                ``observation.images.*`` column carries no image, whatever the
+                scope: LeRobot refuses that frame either way, and this is the
+                only place that can name the camera-name mismatch behind it
+                (see :func:`unrecordable_camera_columns_error`).
             RecordingFrameError: The dataset write failed and this recorder is
                 ``strict`` (the default). With ``strict=False`` the frame is
                 counted in ``dropped_frame_count`` and a warning is logged
@@ -1618,29 +1741,39 @@ class DatasetRecorder:
 
         # State → observation.state (flattened vector)
         # Use feature schema ordering to match the dataset schema declared in _build_features().
+        # The declared columns are resolved from the schema before the
+        # ``if state_keys:`` guard, so a frame carrying NO state at all (a
+        # camera-only observation against a schema that declares joints) is
+        # graded like a frame missing one column rather than walking past the
+        # door. The sorted() fallback still only runs for a non-empty state, so
+        # such a frame cannot cache an empty column list for the episode.
+        if self._cached_state_keys is None:
+            if self._state_source_keys is not None:
+                # Vector-expanded schema: read SOURCE keys (e.g. ``base_quat``);
+                # the list/ndarray branch below flattens each in schema order.
+                self._cached_state_keys = list(self._state_source_keys)
+            else:
+                feat = self.dataset.features.get("observation.state", {})
+                state_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
+                if state_names:
+                    self._cached_state_keys = list(state_names)
+                elif state_keys:
+                    self._cached_state_keys = sorted(state_keys)
+
+        if required_action_keys is None and self._cached_state_keys is not None:
+            # Direct API: no scope was given, so every declared column is
+            # this frame's to supply and a missing one is refused. The
+            # backends' hooks always pass a scope; for them a bystander
+            # robot whose state read failed degrades to the fill below
+            # (see ``strands_robots.simulation.recording.undriven_robot_state``) rather
+            # than ending the driven robot's episode.
+            gap = unrecordable_state_columns_error(observation, self._cached_state_keys)
+            if gap is not None:
+                raise ValueError(gap)
+
         if state_keys:
             state_vals = []
-            if self._cached_state_keys is None:
-                if self._state_source_keys is not None:
-                    # Vector-expanded schema: read SOURCE keys (e.g. ``base_quat``);
-                    # the list/ndarray branch below flattens each in schema order.
-                    self._cached_state_keys = list(self._state_source_keys)
-                else:
-                    feat = self.dataset.features.get("observation.state", {})
-                    state_names = feat.get("names", []) if isinstance(feat, dict) else getattr(feat, "names", [])
-                    self._cached_state_keys = state_names if state_names else sorted(state_keys)
-
-            if required_action_keys is None:
-                # Direct API: no scope was given, so every declared column is
-                # this frame's to supply and a missing one is refused. The
-                # backends' hooks always pass a scope; for them a bystander
-                # robot whose state read failed degrades to the fill below
-                # (see simulation/recording.py::undriven_robot_state) rather
-                # than ending the driven robot's episode.
-                gap = unrecordable_state_columns_error(observation, self._cached_state_keys)
-                if gap is not None:
-                    raise ValueError(gap)
-            for k in self._cached_state_keys:
+            for k in self._cached_state_keys or []:
                 v = observation.get(k)
                 if v is None:
                     state_vals.append(0.0)
@@ -1673,8 +1806,15 @@ class DatasetRecorder:
         # ``None`` (the direct-API default) means every declared column is this
         # frame's to supply: a single recorder fed by hand has no other robot to
         # leave columns for. The backends' recording hooks pass the scoped set.
+        # Not conditioned on ``action`` being non-empty: an action that carries
+        # nothing omits every declared column, which is the same absence as
+        # omitting one. Left unrefused here, the frame reaches the dataset with
+        # no action column at all, and the write's own refusal is what the
+        # caller sees - a RecordingFrameError naming the dataset column, or with
+        # ``strict=False`` a dropped-and-counted frame - instead of the
+        # ValueError this method documents, which names the columns and the fix.
         declared_action_keys = self._cached_action_keys or []
-        if required_action_keys is None and action:
+        if required_action_keys is None:
             required_action_keys = declared_action_keys
         gap = unrecordable_action_columns_error(action, declared_action_keys, required_action_keys)
         if gap is not None:
@@ -1688,7 +1828,9 @@ class DatasetRecorder:
                     # Only reachable for a column OUTSIDE an explicitly scoped
                     # ``required_action_keys`` (a shared scene: the robots this
                     # rollout does not drive). Every column this frame must
-                    # supply was checked above.
+                    # supply was checked above - by value, so a required column
+                    # present as ``None`` was refused there rather than filled
+                    # here.
                     action_vals.append(0.0)
                 elif isinstance(v, (int, float)):
                     action_vals.append(float(v))
@@ -1733,40 +1875,25 @@ class DatasetRecorder:
                 frame[normalized] = frame.pop(cam_key)
 
         # Strip undeclared cameras (keys present in obs but not registered in
-        # _build_features). This avoids LeRobot's "Extra features" error.
-        # Declared-but-missing cameras (e.g. when a render fails) are left alone -
-        # LeRobot tolerates absent columns and the episode simply won't have that
-        # camera's data.
+        # _build_features). This avoids LeRobot's "Extra features" error. The
+        # mirror case is NOT tolerated: "Missing features" is the other branch
+        # of the same LeRobot check, so a declared camera this frame leaves
+        # empty is refused below rather than written.
         frame_cam_keys_final = {k for k in frame if k.startswith("observation.images.")}
         stripped_cam_keys = frame_cam_keys_final - declared_cam_keys
         for extra in stripped_cam_keys:
             del frame[extra]
 
-        # Surface the silent data-loss case: camera frames arrived but NONE of
-        # them matched a declared schema key, so every image is being dropped
-        # and the dataset will record zero image columns. This is the
-        # "image_keys never match the streams" failure mode that otherwise
-        # produces episodes with no video and no error. Warn once per recorder
-        # (50Hz would flood) with the observed-vs-declared keys and the
-        # camera_key_map remedy. A PARTIAL strip (some cameras matched) is left
-        # quiet - that is the normal "ignore an extra debug camera" path.
-        if (
-            not self._warned_camera_mismatch
-            and stripped_cam_keys
-            and declared_cam_keys
-            and not (frame_cam_keys_final & declared_cam_keys)
-        ):
-            self._warned_camera_mismatch = True
-            logger.warning(
-                "DatasetRecorder: none of the observed camera streams %s match the "
-                "declared image features %s - all image frames are being dropped and "
-                "this dataset will have no video. Pass camera_key_map={observed: declared} "
-                "to remap (e.g. {%r: %r}), or declare cameras with names matching the streams.",
-                sorted(k[len("observation.images.") :] for k in stripped_cam_keys),
-                sorted(k[len("observation.images.") :] for k in declared_cam_keys),
-                next(iter(sorted(stripped_cam_keys)))[len("observation.images.") :],
-                next(iter(sorted(declared_cam_keys)))[len("observation.images.") :],
-            )
+        # A declared image column this frame leaves empty is refused, not
+        # warned about: LeRobot's "Missing features" branch rejects the write,
+        # so the choice is between its report - which names the dataset column
+        # only - and one that names the two camera names and the remedy. The
+        # check is on the columns the schema declares, not on how many observed
+        # streams happened to match: an EXTRA debug view alongside a full set of
+        # declared cameras is the normal path and stays silent, while the near
+        # miss that drops one of three names is the case that used to.
+        if gap := unrecordable_camera_columns_error(frame_cam_keys_final, declared_cam_keys, stripped_cam_keys):
+            raise ValueError(gap)
 
         # Add to dataset
         try:
@@ -2094,7 +2221,11 @@ def load_lerobot_episode(repo_id: str, episode: int = 0, root: str | None = None
     # derives. Resolving it here would move Hub downloads out of that cache for
     # no gain.
     read_root = Path(root) if root else local_dataset_dir(repo_id)
-    ds = LeRobotDataset(repo_id=repo_id, root=str(read_root) if read_root is not None else None)
+    ds = LeRobotDataset(
+        repo_id=repo_id,
+        root=str(read_root) if read_root is not None else None,
+        **_quiet_backend_kwargs(LeRobotDataset),
+    )
 
     num_episodes = ds.meta.total_episodes if hasattr(ds.meta, "total_episodes") else len(ds.meta.episodes)
     if episode >= num_episodes:

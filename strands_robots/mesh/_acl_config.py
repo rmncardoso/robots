@@ -41,6 +41,29 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+#: The spellings of ``STRANDS_MESH_ACCEPT_PERMISSIVE_ACL`` that count as the
+#: operator's acknowledgement of a permissive ACL. One tuple, one reader
+#: (:func:`permissive_acl_acknowledged`): ``Mesh.start`` decides on it,
+#: ``session`` warns on it, the ACL loader gates on it and ``strands-robots
+#: doctor`` prints on it, so no row can PASS a spelling the gate refuses.
+#: ``on`` is deliberately absent - ``_zenoh_config._bool_env`` reads it, and a
+#: doctor row that borrowed that parser printed PASS for a value the runtime
+#: refused. Any other spelling is not an acknowledgement; nothing raises.
+PERMISSIVE_ACL_ACK_SPELLINGS: tuple[str, ...] = ("1", "true", "yes")
+
+
+def permissive_acl_acknowledged() -> bool:
+    """Whether the operator has acknowledged a permissive ACL posture.
+
+    Reads ``STRANDS_MESH_ACCEPT_PERMISSIVE_ACL`` against
+    :data:`PERMISSIVE_ACL_ACK_SPELLINGS` (case-insensitive, whitespace
+    stripped). This is the only place in the package that reads the variable:
+    every gate and every report on this posture calls it, so they cannot
+    disagree about which values acknowledge.
+    """
+    return os.getenv("STRANDS_MESH_ACCEPT_PERMISSIVE_ACL", "").strip().lower() in PERMISSIVE_ACL_ACK_SPELLINGS
+
+
 class PermissiveACLError(RuntimeError):
     """Raised when an operator-supplied ACL uses the blacklist footgun
     (``default_permission='allow'`` with explicit rules) without opting
@@ -298,12 +321,7 @@ def _parse_acl_bytes(raw_bytes: bytes, path: Path) -> dict[str, Any]:
             # via STRANDS_MESH_ACCEPT_PERMISSIVE_ACL. The built-in default
             # (allow + EMPTY rules) does not reach this branch and stays
             # gated by Mesh.start's refuse-to-start path.
-            accept = os.getenv("STRANDS_MESH_ACCEPT_PERMISSIVE_ACL", "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-            )
-            if not accept:
+            if not permissive_acl_acknowledged():
                 raise PermissiveACLError(
                     f"ACL file {path} uses default_permission='allow' with "
                     f"{len(data['rules'])} rule(s) -- a blacklist policy where any "
@@ -357,7 +375,10 @@ def _validate_acl_shape(data: dict[str, Any], path: Path) -> None:
        ``SubjectProperty::Wildcard`` (matches every link); when present,
        it must be a non-empty list of non-empty strings (Zenoh rejects
        ``[]`` with ``Found empty interface value``). ``cert_common_names``
-       is OPTIONAL -- when present must be a list. Subjects with
+       is OPTIONAL -- when present must be a list of non-empty strings, since
+       Zenoh refuses a non-string entry at ``Mesh.start`` naming a column of
+       the wire JSON rather than this file, and accepts an empty one that no
+       certificate can match. Subjects with
        neither ``interfaces`` nor ``cert_common_names`` match every
        peer (effectively wildcard) and operators should use them only
        when a permissive ``default_permission: "allow"`` is desired.
@@ -424,6 +445,24 @@ def _validate_acl_shape(data: dict[str, Any], path: Path) -> None:
                 f"ACL file {path}: subjects[{i}={sid!r}].cert_common_names must be a list "
                 f"(or omitted), got {type(cns).__name__}. Common typo: cert_common_name (singular)."
             )
+        # The entries are graded here for the same reason ``interfaces`` grades
+        # its own above: this validator promises a path-prefixed refusal, and the
+        # Zenoh parser is the only other reader. A non-string entry (``null``,
+        # a number, a nested list) is refused there at ``Mesh.start`` as
+        # ``invalid type: ..., expected a string`` at a line and column of the
+        # wire JSON the operator never sees, naming neither this file nor the
+        # subject. An empty string is worse: Zenoh accepts it, a CN is matched
+        # literally, and no certificate carries an empty one, so the subject
+        # matches no peer - the silent "match nothing" outage this function
+        # exists to refuse - while ``[""]`` is truthy enough to pass the
+        # wildcard guard below as a constraint.
+        if isinstance(cns, list):
+            for k, cn in enumerate(cns):
+                if not isinstance(cn, str) or not cn:
+                    raise ValueError(
+                        f"ACL file {path}: subjects[{i}={sid!r}].cert_common_names must contain only "
+                        f"non-empty strings; entry [{k}] is {type(cn).__name__} {cn!r}."
+                    )
         # HARD-REJECT subjects
         # that constrain neither ``interfaces`` nor
         # ``cert_common_names``. A subject with only an ``id`` (or

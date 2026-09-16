@@ -14,7 +14,7 @@ calls.
 
 ```python
 from strands import Agent
-from strands_robots.tools import use_ros
+from strands_robots import use_ros
 
 agent = Agent(tools=[use_ros])
 agent("list the ROS 2 topics, then drive /turtle1 forward and confirm its pose changed")
@@ -35,7 +35,7 @@ have and what you want to do:
 | Surface | Role | Backend | Needs sourced ROS 2 | Use it to |
 |---------|------|---------|---------------------|-----------|
 | **`use_ros`** tool | client / observer + commander | in-process `rclpy` | yes | List/echo/publish topics, call services on any ROS 2 graph - full type coverage |
-| **`use_rtps`** tool | participant / **act as a robot** | pure `cyclonedds` (pip) | **no** | Join a graph as a DDS peer and publish topics a real stack consumes; works on macOS/CI/Jetson, all distros |
+| **`use_rtps`** tool | participant / **act as a robot** | pure `cyclonedds` (pip) | **no** | Join a graph as a DDS peer and publish topics a real stack consumes; works on macOS/CI/Linux x86_64 from the wheel, all distros; Linux aarch64 (Jetson) builds from source - see [rtps integration](rtps-integration.md#linux-aarch64-jetson) |
 | **`use_rosbridge`** tool + **`RosbridgeRobot`** | ROS1 / remote robots over a rosbridge WebSocket | pure-pip `roslibpy` | **no** | Drive ROS1 robots (e.g. the NASA Curiosity Gazebo sim) or any remote rosbridge robot from a machine with no ROS install - see [rosbridge integration](rosbridge-integration.md) |
 | **`RosBridgedRobot`** | a ROS 2 robot as a strands `Robot` | `use_ros` | yes | `drive()`/`get_pose()` a `cmd_vel`/odom base with the same `Agent(tools=[robot])` UX as sim/hardware |
 | **`AckermannRosRobot`** | an Ackermann ROS 2 car as a strands `Robot` | `use_ros` | yes | `drive()`/`get_scan()` a steering-geometry car (AWS DeepRacer servo stack) with bicycle-model conversion and an automatic enable handshake |
@@ -68,6 +68,12 @@ still need a real sourced distro.
 ```bash
 pip install 'strands-robots[ros2]'   # optional cyclonedds RMW binding only
 ```
+
+The binding is a pre-built wheel on macOS, Windows and Linux x86_64. No
+cyclonedds release publishes a Linux **aarch64** wheel, so on a Jetson or a
+robot's onboard computer the extra resolves to the sdist, which builds against
+an existing Cyclone DDS C install (`CYCLONEDDS_HOME`) - the recipe is in
+[rtps integration](rtps-integration.md#linux-aarch64-jetson).
 
 ## Actions
 
@@ -272,7 +278,13 @@ are clamped to `max_speed`; holds longer
 than `max_duration` are rejected loudly rather than silently truncated. The
 `linear`/`angular`/`duration`/`count` values themselves are checked against the
 same shared domains the differential-drive bridges use, so an unusable value is
-refused with identical text on every transport. The
+refused with identical text on every transport. A pair the steering geometry
+cannot execute is refused for the same reason: below the rest threshold
+(1e-3 m/s) the bicycle model maps any command to the zero servo pair, so
+`drive(linear=0.0, angular=1.0)` - a rotate in place, which this platform cannot
+do - would otherwise leave as byte-identical to `stop()` and report success for a
+heading change that never happened. Give a turn a linear speed to travel at, or
+call `stop()`; `drive(0, 0)` still means rest, because that is what it asked for. The
 stock platform publishes no odometry, so there is deliberately no
 `get_pose`.
 
@@ -311,6 +323,15 @@ internal `rclpy` node that publishes, per robot, after every `step()`:
 |-------|------|---------|
 | `/<robot>/joint_states` | `sensor_msgs/msg/JointState` | joint names + positions |
 | `/<robot>/<camera>/image_raw` | `sensor_msgs/msg/Image` (`rgb8`) | one frame per attached camera. `<robot>`/`<camera>` are sanitised into ROS 2 name tokens, so a camera named `0` publishes on `/<robot>/camera_0/image_raw` - ROS 2 forbids a token starting with a digit |
+
+`name` and `position` are one table read by index. A robot whose observation
+does not carry every joint of `robot_joint_names()` - every floating-base
+humanoid, quadruped and mobile base, whose root freejoint is joint 0 and is not
+an observation key - publishes only the joints it observed, so the two arrays
+stay the same joints. A caller that hands `publish_joint_states` a differing
+number of names and positions has no pose to publish: the message is dropped
+whole with a warning naming both counts, rather than published with every joint
+after the gap under its neighbour's name.
 
 ```python
 from strands_robots.simulation import Simulation
@@ -357,6 +378,15 @@ the ROS 2 graph:
 | `/<robot>/<camera>/image_raw` | published | `sensor_msgs/msg/Image` (`rgb8`) | one frame per camera |
 | `/<robot>/joint_command` | **subscribed** | `sensor_msgs/msg/JointState` | inbound `name`/`position` -> `send_action`, drives the real arm |
 
+`name` and `position` are one table read by index. A robot whose observation
+does not carry every joint of `robot_joint_names()` - every floating-base
+humanoid, quadruped and mobile base, whose root freejoint is joint 0 and is not
+an observation key - publishes only the joints it observed, so the two arrays
+stay the same joints. A caller that hands `publish_joint_states` a differing
+number of names and positions has no pose to publish: the message is dropped
+whole with a warning naming both counts, rather than published with every joint
+after the gap under its neighbour's name.
+
 The first two are **outbound telemetry** (shared, byte-identical, with the sim
 bridge). The third is the **inbound command** surface that makes the hardware
 bridge *full duplex*: an external ROS 2 node (a teleop joystick node, MoveIt, a
@@ -392,7 +422,9 @@ arm_ro = Robot("so101", mode="real", ros2_bridge=True, ros2_commands=False)
 
 # rclpy-free: run the SAME bridge over pure cyclonedds (no sourced ROS 2
 # distro). Byte-identical topics; type coverage bounded by the IDL bundle.
-arm_rtps = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps")
+# Telemetry-only: on this transport the inbound command surface refuses to
+# start without a dds_security_config or the explicit opt-out (see below).
+arm_rtps = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps", ros2_commands=False)
 ```
 
 External ROS 2 nodes - rviz, nav2, or the agent's own `use_ros` calls - then see
@@ -417,6 +449,16 @@ be driven. Only a boolean names either posture - `ros2_bridge` and
 `"false"` is refused rather than reading as the truthy value it is and opening
 the surface it asks to close. A daemon thread spins the node so inbound commands are serviced
 concurrently with publishing, and it is torn down cleanly on `cleanup()`/`stop()`.
+That teardown is best-effort: a node destroyed on a context another
+component already shut down is reported at WARNING and `cleanup()` carries
+on to disconnect the motors bus and the cameras, because a bridge that will
+not release must not leave the serial port held or the arm energised. The same
+rule holds one level in, where the bridge releases two things - its node handle
+and, when it was this bridge that called `rclpy.init()`, the process-wide
+context: a failure releasing one no longer skips the other, so a node that
+refuses to be destroyed does not leave the participant on the domain for the
+life of the process. A context that itself refuses to shut down is logged at
+warning, because nothing after it retries.
 
 Because the inbound `joint_command` topic drives the physical arm, two guards
 harden it (both threaded through `Robot()`):

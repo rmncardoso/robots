@@ -47,7 +47,7 @@ from strands import tool
 from strands.types.tools import ToolContext
 
 from strands_robots.mesh import security as _security
-from strands_robots.mesh.core import mesh_disabled_by_env
+from strands_robots.mesh.core import _reports_failure_to_stop, mesh_disabled_by_env
 from strands_robots.tools._hitl_audit import log_operator_response
 from strands_robots.utils import finite_number_error, positive_count_error, positive_finite_number_error
 
@@ -499,6 +499,55 @@ def _ok(text: str) -> dict[str, Any]:
     return {"status": "success", "content": [{"text": text}]}
 
 
+def _stop_not_confirmed(envelope: Any, budget: float) -> str | None:
+    """Why a single-target ``stop`` envelope does not confirm the stop, or ``None``.
+
+    ``Mesh.send`` answers with one of three shapes, and the ``stop`` branch
+    used to read none of them - only a *raised* ``send`` reached the error
+    path. The peer's ``{"type": "response", "result": ...}`` carries the
+    handler's own return, graded with
+    :func:`~strands_robots.mesh.core._reports_failure_to_stop`, the one owner
+    of the "did it say no" rule. The peer's ``{"type": "error", ...}`` is a
+    lockout, a replay or an authorization rejection and carries no ``result``
+    at all. ``{"status": "timeout"}`` and ``{"status": "error", ...}`` are
+    ``send``'s own verdicts - nothing answered inside *budget*, or a
+    precondition was refused before anything was published. The last three are
+    this branch's own reading because they are ``send``'s envelope contract
+    rather than a handler's return, which the shared rule deliberately does
+    not model.
+
+    A timeout is a failure HERE and stays out of the shared rule on purpose.
+    For one named peer, no answer inside the budget is a stop the caller cannot
+    claim happened, and ``status="success"`` over it is the affirmative lie the
+    stop verb exists to stop telling. ``emergency_stop`` keeps counting a
+    silent peer as a gap rather than a refusal (see
+    :func:`~strands_robots.mesh.core._peers_that_did_not_stop`), so widening
+    the shared rule would change the fleet-wide count on both paths.
+
+    Args:
+        envelope: What ``Mesh.send`` returned.
+        budget: The wait the send was given, so a timeout can name it.
+
+    Returns:
+        A one-line reason carrying the answer, or ``None`` when the envelope
+        does not report a failure. A shape carrying no verdict either way is
+        ``None`` too, for the reason the shared rule gives: a false "did not
+        stop" on the safety path trains operators to ignore the warning.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("status") == "timeout":
+        return f"no answer within {budget:g}s"
+    # json.dumps escapes a line break inside a peer's error text, so the reason
+    # cannot split the CRITICAL record it is rendered into (py/log-injection).
+    if envelope.get("type") == "error" or _reports_failure_to_stop(envelope):
+        return json.dumps(envelope, default=str)[:600]
+    result = envelope.get("result")
+    if isinstance(result, dict) and _reports_failure_to_stop(result):
+        return json.dumps(result, default=str)[:600]
+    return None
+
+
 # ── Numeric-option domain ──────────────────────────────────────────────────
 #
 # Which of the two numeric options each action actually consumes. Scoped per
@@ -800,6 +849,37 @@ def _gateway_mesh() -> Any | None:
             return None
 
 
+def _undiscovered_peers_reason() -> str:
+    """Explain why a robot-less process heard no presence at all.
+
+    A process with no local :class:`~strands_robots.mesh.core.Mesh` hears the
+    fleet only through the gateway :func:`_gateway_mesh` brings up. When that
+    gateway does not come up, ``get_peers()`` returns an empty list because
+    nothing ever listened -- not because the fleet is empty. Reporting that as
+    ``0 remote`` answers a question nobody asked: it is byte-identical to a real
+    discovery that found nothing, so an operator cannot tell a killed mesh from
+    a quiet one, and ``peers``' standing remedy ("create a Robot()") is advice
+    the kill switch would refuse in turn.
+
+    Returns:
+        A sentence naming the reason, for a read-only action to append to its
+        report. Names ``STRANDS_MESH`` when the kill switch is what stopped the
+        gateway -- the one knob the generic remedy cannot stand in for -- and
+        otherwise points at the debug log, which holds the bring-up failure
+        :func:`_gateway_mesh` swallowed.
+    """
+    if mesh_disabled_by_env():
+        return (
+            f"no discovery ran: STRANDS_MESH={os.getenv('STRANDS_MESH', '')!r} is a hard kill "
+            "switch, so no Zenoh session was opened and no presence was heard. Unset it (or set "
+            "it to true) to discover peers."
+        )
+    return (
+        "no discovery ran: the robot-less gateway mesh did not start, so no presence was heard. "
+        "Enable DEBUG logging on strands_robots.tools.robot_mesh for the bring-up failure."
+    )
+
+
 def _resolve_mesh(target: str) -> Any | None:
     """Return a local Mesh in this process to use as the gateway for RPC.
 
@@ -1092,21 +1172,60 @@ def _device_connect_dispatch(
             # already-validated positive finite budget, not a guard: min() would
             # pass nan straight through (min(nan, 5.0) is nan).
             result = conn.invoke(target, "stop", _with_identity({}), timeout=min(timeout, 5.0))
-            r = result.get("result", result)
+            r = result.get("result", result) if isinstance(result, dict) else result
+            # Graded with the rule Mesh.emergency_stop reads (_reports_failure_to_stop),
+            # as the fleet-wide branch below is: an authz refusal or a stop_policy
+            # that could not halt a rollout arrives as status="error" inside a
+            # DELIVERED reply, not as a raised invoke. Counting delivery returned
+            # the refusal under status="success" and audited it as ok=True, so an
+            # agent branching on the envelope proceeded as if the arm had halted.
+            if isinstance(r, dict) and _reports_failure_to_stop(r):
+                answer = json.dumps(r, default=str)
+                logger.critical(
+                    "[safety] stop over Device Connect: %r reported it did NOT stop: %s",
+                    target,
+                    answer[:600],
+                )
+                _audit_tool_action(action, target, False, f"reported it did NOT stop: {answer[:600]}")
+                return _DCResult(_err(f"Stop {target}: reported it did NOT stop: {answer[:1500]}"))
             _audit_tool_action(action, target, True, "")
             return _DCResult(_ok(f"Stop {target}: {json.dumps(r, default=str)}"))
 
         if action == "emergency_stop":
             devices = conn.list_devices()
-            stopped = 0
+            stopped: list[str] = []
+            # Graded with the rule Mesh.emergency_stop reads (_reports_failure_to_stop):
+            # a device answers its stop RPC with an envelope, and an authz refusal
+            # or a stop_policy that could not halt a rollout comes back as
+            # status="error" inside a DELIVERED reply, not as a raised invoke.
+            # Counting delivery told the operator every device stopped while the
+            # device itself had just said it did not. An unreachable device stays
+            # a gap in the count rather than a refusal, as on the mesh path.
+            refused: dict[str, Any] = {}
             for d in devices:
+                device_id = str(d.get("device_id", "?"))
                 try:
-                    conn.invoke(d["device_id"], "stop", _with_identity({}), timeout=3.0)
-                    stopped += 1
+                    result = conn.invoke(device_id, "stop", _with_identity({}), timeout=3.0)
                 except Exception:  # noqa: BLE001 - best-effort fan-out
-                    pass
-            _audit_tool_action(action, "*", True, f"stopped={stopped}/{len(devices)}")
-            return _DCResult(_ok(f"E-STOP: {stopped}/{len(devices)} devices stopped"))
+                    continue
+                r = result.get("result", result) if isinstance(result, dict) else result
+                if isinstance(r, dict) and _reports_failure_to_stop(r):
+                    refused[device_id] = r
+                else:
+                    stopped.append(device_id)
+            text = f"E-STOP: {len(stopped)}/{len(devices)} devices stopped"
+            if refused:
+                logger.critical(
+                    "[safety] emergency_stop over Device Connect: %d device(s) reported they did NOT stop: %s",
+                    len(refused),
+                    sorted(refused),
+                )
+                _audit_tool_action(
+                    action, "*", False, f"stopped={len(stopped)}/{len(devices)} refused={sorted(refused)}"
+                )
+                return _DCResult(_err(f"{text}; reported they did NOT stop: {json.dumps(refused, default=str)[:1500]}"))
+            _audit_tool_action(action, "*", True, f"stopped={len(stopped)}/{len(devices)}")
+            return _DCResult(_ok(text))
 
         if action == "broadcast":
             # Security hardening: dispatch the *validated* command that the
@@ -1427,12 +1546,20 @@ def robot_mesh(
         return _err(f"mesh module unavailable: {exc}")
 
     locals_ = get_local_robots()
+    gateway = None
     if not locals_:
         # #10: robot-less process - bring up the gateway BEFORE reading peers
         # so presence subscription populates session peer tracking. The
         # gateway itself waits one heartbeat period on first bring-up.
-        _gateway_mesh()
+        gateway = _gateway_mesh()
     peers = get_peers()
+    # Whether the peer count below is a measurement at all: a robot-less process
+    # whose gateway never came up listened to nothing, and the read-only actions
+    # say so rather than reporting an empty fleet they did not observe.
+    undiscovered = None if (locals_ or gateway is not None) else _undiscovered_peers_reason()
+    observed = f"local={len(locals_)} remote={len(peers)}"
+    if undiscovered:
+        observed = f"{observed} discovery=none"
 
     # ── action: peers ─────────────────────────────────────────────────────
     if action == "peers":
@@ -1453,20 +1580,24 @@ def robot_mesh(
                 ts = p.get("task_status")
                 if ts:
                     lines.append(f"      task: {ts} - {p.get('instruction', '')}")
-        elif not locals_:
+        if undiscovered:
+            lines.append("")
+            lines.append(undiscovered)
+        elif not peers and not locals_:
             lines.append("")
             lines.append("No peers. Create a Robot() or Simulation() to auto-join the mesh.")
         # #322: audit read-only observation actions too, so the audit log is a
         # complete record of agent mesh access (not just actuation). Closes the
         # forensic gap where peers/status/inbox/unsubscribe left no trail.
-        _audit_tool_action(action, target, True, f"local={len(locals_)} remote={len(peers)}")
+        _audit_tool_action(action, target, True, observed)
         return _ok("\n".join(lines))
 
     # ── action: status ────────────────────────────────────────────────────
     if action == "status":
         # #322: read-only status is audited too (see peers branch above).
-        _audit_tool_action(action, target, True, f"local={len(locals_)} remote={len(peers)}")
-        return _ok(f"[mesh] local={len(locals_)} remote={len(peers)} peers={[p['peer_id'] for p in peers]}")
+        _audit_tool_action(action, target, True, observed)
+        text = f"[mesh] local={len(locals_)} remote={len(peers)} peers={[p['peer_id'] for p in peers]}"
+        return _ok(f"{text}\n{undiscovered}" if undiscovered else text)
 
     # All remaining actions need an outbound mesh.
     mesh = _resolve_mesh(target)
@@ -1556,13 +1687,24 @@ def robot_mesh(
         if not target:
             _audit_tool_action(action, target, False, "missing target")
             return _err("stop requires target")
+        # Capped at 5s so a stop cannot hang - a cap over an already-validated
+        # positive finite budget, not a guard (min(nan, 5.0) is nan).
+        budget = min(timeout, 5.0)
         try:
-            # Capped at 5s so a stop cannot hang - a cap over an already-validated
-            # positive finite budget, not a guard (min(nan, 5.0) is nan).
-            result = mesh.send(target, {"action": "stop"}, timeout=min(timeout, 5.0))
+            result = mesh.send(target, {"action": "stop"}, timeout=budget)
         except Exception as exc:  # noqa: BLE001
             _audit_tool_action(action, target, False, f"dispatch error: {type(exc).__name__}: {exc}")
             return _err(f"[stop -> {target}] dispatch error: {type(exc).__name__}: {exc}")
+        # ``send`` returns an envelope for every outcome it does not raise for,
+        # and the receiving peer has already audited a refused stop as
+        # ``command_refused`` on its side. Reading only "did send raise" made
+        # this end of the same turn record ``ok=True`` over a lockout rejection,
+        # a timeout and a handler that said it did not stop.
+        reason = _stop_not_confirmed(result, budget)
+        if reason is not None:
+            logger.critical("[safety] stop -> %r: the peer did NOT confirm the stop: %s", target, reason)
+            _audit_tool_action(action, target, False, f"did not stop: {reason}")
+            return _err(f"[stop -> {target}] did NOT stop: {reason}")
         _audit_tool_action(action, target, True, "")
         return _ok(f"[stop -> {target}] {json.dumps(result, default=str)[:600]}")
 
@@ -1624,7 +1766,8 @@ def robot_mesh(
         # subscribing to every peer's stream (the cross-peer telemetry-leak
         # this surface exists to close). Require a literal peer id BEFORE
         # interpolating, mirroring the ``_REPO_TAG_RE`` shape-validation
-        # pattern in ``gr00t_inference.py`` for the same class of attack.
+        # pattern in ``strands_robots.tools.gr00t_inference`` for the same
+        # class of attack.
         if not _PEER_ID_RE.match(target):
             _audit_tool_action(action, target, False, "watch target not a literal peer id")
             return _err(

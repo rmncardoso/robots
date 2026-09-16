@@ -39,8 +39,9 @@ Contract notes (shared by all three):
   destroyed/recompiled or a policy starts mid-run, the loop aborts with a
   structured error instead of stepping a stale model.
 * **Dataset-recording interplay** (pinned by test): primitive motion does NOT
-  feed frames into an active ``start_recording`` dataset session - only
-  ``run_policy``'s per-frame hook records episodes. Camera MP4 recording
+  feed frames into an active ``start_recording`` dataset session -
+  ``run_policy``'s per-frame hook and ``step`` (one frame per ``1/fps`` of sim
+  time) record episodes; a primitive steps its own loop. Camera MP4 recording
   (``start_cameras_recording``) still captures primitive motion, since it
   samples the live scene on its own thread.
 """
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -71,12 +73,18 @@ from strands_robots.simulation.motion_primitives_base import (
     _WRIST_HINTS as _WRIST_HINTS,
 )
 from strands_robots.simulation.motion_primitives_base import (
+    OBSTRUCTION_MAX_CONTACTS,
     MotionPrimitivesCore,
     _err,
     _quat_angle_error,
 )
 from strands_robots.simulation.mujoco.backend import _NO_WORLD_MSG, mj_name_to_id
-from strands_robots.simulation.mujoco.scene_ops import joint_drive_map
+from strands_robots.simulation.mujoco.scene_ops import (
+    actuator_target_body_ids,
+    geom_label,
+    joint_drive_map,
+    mj_contact_is_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +164,7 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
         if robot.policy_running:
             return _err(
                 f"{action}: a policy started on '{robot_name}' mid-run; aborting. "
-                f"Stop it first: action='stop_policy', name='{robot_name}'."
+                f"Stop it first: action='stop_policy', robot_name='{robot_name}'."
             )
         return None
 
@@ -897,6 +905,14 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
                 reached = True
                 break
 
+        # Not reached: read what the engine saw at the final tick so the
+        # refusal can name the contact or the joint that stopped the servo
+        # instead of guessing at "joint limits/contacts".
+        obstruction: dict[str, Any] | None = None
+        if not reached:
+            with self._lock:
+                obstruction = self._servo_obstruction(model, data, arm_jact)
+
         return self._move_to_result(
             robot_name,
             target,
@@ -913,7 +929,164 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
             orientation_error=orientation_error,
             orientation_tol=orientation_tol,
             ik_orientation_residual=ik_orientation_residual,
+            obstruction=obstruction,
         )
+
+    def _commanded_robot_body_ids(self, model: Any, commanded_joint_ids: Iterable[int]) -> set[int]:
+        """Every body in the kinematic tree the commanded joints belong to.
+
+        Derived from the joints the primitive commanded rather than from the
+        :class:`SimRobot` record, because those joints are what the caller is
+        being told about and a primitive that commands none refuses before any
+        of this. Their tree is rooted at the body the world carries
+        (:meth:`_root_body`), so a self-collision (jaw against base) and a
+        collision with the scene (jaw against a cube) both count as "the robot
+        is in contact", while the cube's own contacts with the floor do not.
+
+        Args:
+            model: The ``mujoco.MjModel`` holding the kinematic tree.
+            commanded_joint_ids: The joints the primitive drove; must be non-empty.
+
+        Returns:
+            Body ids in that tree, including its root.
+        """
+        first = min(int(j) for j in commanded_joint_ids)
+        return self._subtree(model, self._root_body(model, int(model.jnt_bodyid[first])))
+
+    def _servo_obstruction(self, model: Any, data: Any, commanded_jact: dict[int, int]) -> dict[str, Any]:
+        """What stopped the servo at the final tick: contacts on the robot, joints at a limit.
+
+        Must be called under ``self._lock``. Runs ``mj_forward`` first so the
+        contact list belongs to the final joint configuration, the same way
+        :meth:`get_contacts` does. A contact counts when it is pushing back
+        (:func:`mj_contact_is_active` - a pair inside the detection range but
+        in the gap carries no force, at any ``dist``)
+        and at least one of its geoms belongs to the commanded joints' own
+        kinematic tree (:meth:`_commanded_robot_body_ids`); a joint
+        counts when it is one the primitive COMMANDED to a new value, has
+        limits, and its position sits at a bound (see
+        :meth:`_joints_at_limit`). Joints a primitive merely holds at their
+        live position did not stop it, so a bound one of those is not offered
+        as the cause.
+
+        Args:
+            model: The ``mujoco.MjModel``.
+            data: The ``mujoco.MjData`` after the final servo tick.
+            commanded_jact: ``joint_id -> actuator_id`` for the joints the
+                servo commanded to a new value (``move_to``'s arm half of the
+                pose map; ``rotate_wrist``'s single wrist joint).
+
+        Returns:
+            ``{"contacts": [...], "contacts_total": n, "joints_at_limit": [...]}``
+            in the shape :meth:`_obstruction_text` reads; contacts capped at
+            :data:`OBSTRUCTION_MAX_CONTACTS`, nearest (most negative
+            distance) first.
+        """
+        mj = self._mj
+        mj.mj_forward(model, data)
+        body_ids = self._commanded_robot_body_ids(model, commanded_jact)
+
+        # One entry per geom PAIR, at its deepest point: a box resting on a
+        # plane yields up to four contact points for the same two geoms, and
+        # naming the pair four times tells the caller nothing more.
+        nearest: dict[tuple[int, int], float] = {}
+        for i in range(int(data.ncon)):
+            c = data.contact[i]
+            if not mj_contact_is_active(c):
+                continue
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if int(model.geom_bodyid[g1]) not in body_ids and int(model.geom_bodyid[g2]) not in body_ids:
+                continue
+            key = (g1, g2)
+            nearest[key] = min(nearest.get(key, math.inf), float(c.dist))
+        contacts: list[dict[str, Any]] = [
+            {"geom1": geom_label(model, g1, mj), "geom2": geom_label(model, g2, mj), "dist": dist}
+            for (g1, g2), dist in nearest.items()
+        ]
+        contacts.sort(key=lambda c: c["dist"])
+
+        joints_at_limit = self._joints_at_limit(mj, model, data.qpos, commanded_jact)
+
+        return {
+            "contacts": contacts[:OBSTRUCTION_MAX_CONTACTS],
+            "contacts_total": len(contacts),
+            "joints_at_limit": joints_at_limit,
+        }
+
+    @staticmethod
+    def _subtree(model: Any, root_id: int) -> set[int]:
+        """``root_id`` and every body below it."""
+        out = {root_id}
+        for body_id in range(int(model.nbody)):
+            cursor = body_id
+            while cursor > 0:
+                if cursor in out:
+                    out.add(body_id)
+                    break
+                cursor = int(model.body_parentid[cursor])
+        return out
+
+    @staticmethod
+    def _root_body(model: Any, body_id: int) -> int:
+        """The top of ``body_id``'s kinematic tree - the body the world carries."""
+        cursor = int(body_id)
+        while cursor > 0 and int(model.body_parentid[cursor]) > 0:
+            cursor = int(model.body_parentid[cursor])
+        return cursor
+
+    def _finger_contacts(
+        self,
+        model: Any,
+        data: Any,
+        gripper_acts: list[int],
+    ) -> dict[str, int] | None:
+        """Bodies outside the robot that touch its fingers, with contact counts.
+
+        The fingers are the bodies the gripper actuators move, resolved through
+        the shared transmission reader
+        :func:`~strands_robots.simulation.mujoco.scene_ops.actuator_target_body_ids`,
+        together with each one's subtree and its parent's (a fixed jaw or a
+        hand carries pads too). Reading the drive's joint instead would find no
+        finger on a tendon gripper - one ``ctrl`` coupling both jaws is the
+        standard MJCF two-finger idiom and how every Franka here is actuated -
+        and an unlocated finger touches nothing by construction.
+
+        The world body (ground plane) and the machine the fingers belong to are
+        not "held": the robot is the tree above them (:meth:`_root_body`), read
+        from the fingers themselves so it holds for any robot, and so that an
+        arm link folded against its own gripper is not offered as a grasp.
+
+        Returns:
+            Body name to contact count, or ``None`` when the transmission names
+            no body at all. An empty mapping says "nothing is touching the
+            fingers", which is a measurement; a caller that never located the
+            fingers has not made it, and ``None`` keeps that reply silent
+            rather than confidently wrong.
+        """
+        mj = self._mj
+        roots: set[int] = set()
+        for act_id in gripper_acts:
+            roots |= {int(b) for b in actuator_target_body_ids(model, int(act_id), mj)}
+        if not roots:
+            return None
+        fingers: set[int] = set()
+        machine: set[int] = set()
+        for body_id in roots:
+            fingers |= self._subtree(model, body_id)
+            parent = int(model.body_parentid[body_id])
+            if parent > 0:
+                fingers |= self._subtree(model, parent)
+            machine |= self._subtree(model, self._root_body(model, body_id))
+        held: dict[str, int] = {}
+        for i in range(int(data.ncon)):
+            con = data.contact[i]
+            b1, b2 = int(model.geom_bodyid[con.geom1]), int(model.geom_bodyid[con.geom2])
+            for finger, other in ((b1, b2), (b2, b1)):
+                if finger in fingers and other != 0 and other not in machine:
+                    name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, other) or f"body {other}"
+                    held[name] = held.get(name, 0) + 1
+                    break
+        return held
 
     def set_gripper(
         self,
@@ -952,6 +1125,15 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
             is visible rather than silent; structured error when the gripper
             cannot be resolved or no source gives usable set-points. Never
             raises.
+
+            A ``close`` also reports what the fingers ended up touching, so a
+            grasp that missed does not read like one that landed: ``holding``
+            (body names) and ``finger_contacts`` (name to contact count) join
+            the payload, and the text names them ("Closed on 'red_cube' (11
+            contacts)") or says a lift would carry nothing. Both keys are
+            absent when the drive's transmission names no body to watch
+            (:meth:`_finger_contacts`), rather than reporting an empty grasp
+            the backend never looked for.
         """
         steps, arg_err = self._validate_set_gripper_args(state, steps)
         if arg_err is not None:
@@ -1028,6 +1210,13 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
             act_names = [
                 self._short_name(mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, a), namespace) for a in gripper_acts
             ]
+            # What the fingers closed on, read from the contacts after the
+            # last tick. A close that touches no object is the normal outcome
+            # of a grasp attempt that missed, and the caller's next move (lift)
+            # is wrong unless it hears that here.
+            held: dict[str, int] | None = None
+            if state == "close":
+                held = self._finger_contacts(model, data, gripper_acts)
         return self._set_gripper_result(
             robot_name,
             state,
@@ -1036,6 +1225,7 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
             {n: targets[a] for n, a in zip(act_names, gripper_acts, strict=True)},
             {n: setpoint_sources[a] for n, a in zip(act_names, gripper_acts, strict=True)},
             joint_positions,
+            held=held,
         )
 
     def rotate_wrist(
@@ -1196,6 +1386,16 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
                 reached = True
                 break
 
+        # Not reached: read what the engine saw at the final tick so the
+        # refusal names the contact or the joint bound that stopped the wrist
+        # instead of reporting only the residual. Scoped to the wrist joint
+        # alone: this primitive HOLDS every other joint at its live position,
+        # so a bound one of those did not stop the call.
+        obstruction: dict[str, Any] | None = None
+        if not reached:
+            with self._lock:
+                obstruction = self._servo_obstruction(model, data, {wrist_jnt: pose_jact[wrist_jnt]})
+
         return self._rotate_wrist_result(
             robot_name,
             float(tol),
@@ -1207,4 +1407,5 @@ class MotionPrimitivesMixin(MotionPrimitivesCore):
             final_yaw=final_yaw,
             yaw_error=yaw_error,
             uncommanded_drives=uncommanded_drives,
+            obstruction=obstruction,
         )

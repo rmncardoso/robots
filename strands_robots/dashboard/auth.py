@@ -19,6 +19,13 @@ Configuration:
         so it must carry the scheme and any non-default port.
     ``STRANDS_DASH_AUTH_RP_ID``: pins the relying-party id when the hostname
         legitimately changed. See :func:`rp_id_verdict`.
+    ``STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN``: the secret the FIRST passkey
+        enrollment must present. Unset by default, in which case the module
+        mints one itself and keeps it in a ``0600`` file beside the credential
+        store (``STRANDS_DASH_AUTH_ENROLL_TOKEN_FILE`` relocates it); see
+        :func:`_first_enrollment_proof`. Either way the first enrollment is
+        never admitted on the strength of where the connection appears to come
+        from - a loopback peer is not proof of presence at the machine.
     ``STRANDS_DASH_AUTH_TOKEN_TTL`` (default 86400), ``..._SESSION_MAX_AGE``
         (default 2592000) and ``..._HANDOFF_TTL`` (default 300): how long a
         session token lives, the absolute age past which no renewal extends it,
@@ -67,6 +74,8 @@ from webauthn.helpers.structs import (
     ResidentKeyRequirement,
     UserVerificationRequirement,
 )
+
+from strands_robots.dashboard import log_redaction
 
 _ENV = "STRANDS_DASH_AUTH_"
 
@@ -192,6 +201,92 @@ def _bootstrap_token() -> str:
     return os.getenv(_ENV + "BOOTSTRAP_TOKEN", "").strip()
 
 
+#: Where the self-minted first-enrollment token lives when no
+#: ``STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN`` is configured: beside the credential
+#: store, so the same directory permissions guard both.
+_ENROLL_TOKEN_NAME = "enroll_token"
+_enroll_lock = threading.Lock()
+
+
+def _enroll_token_path() -> Path:
+    override = os.getenv(_ENV + "ENROLL_TOKEN_FILE", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return _store_path().with_name(_ENROLL_TOKEN_NAME)
+
+
+def _write_enroll_token(path: Path) -> str:
+    """Mint a fresh token into *path* at ``0600``, atomically, and return it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    fd, tmp = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return token
+
+
+def _local_enroll_token() -> str:
+    """The token the first enrollment must echo when no bootstrap token is configured.
+
+    Minted on first demand, kept in a ``0600`` file beside the credential store
+    (:func:`_enroll_token_path`), retired by :func:`_retire_local_enroll_token`
+    once a passkey exists. Reading it needs the filesystem as the service user,
+    which is the one fact that separates "the operator at this machine" from
+    "a remote party whose packets arrive from 127.0.0.1" - and it is a fact no
+    request header or socket address can stand in for (F-007, CWE-290).
+
+    A file that has become readable by anyone else is treated as spent: it is
+    replaced rather than honoured, since whoever loosened it may have read it.
+    """
+    path = _enroll_token_path()
+    with _enroll_lock:
+        try:
+            mode = path.stat().st_mode & 0o777
+            token = path.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            token, mode = "", 0
+        if token and not (mode & 0o077):
+            return token
+        if token:
+            logger.warning("%s is readable by other users (mode %o); replacing it with a fresh token", path, mode)
+        token = _write_enroll_token(path)
+        logger.warning(
+            "no %sBOOTSTRAP_TOKEN is set, so a one-time token for the first passkey enrollment has been "
+            "written to %s (mode 0600). Read it on this machine and pass it as the bootstrap value to "
+            "enroll the owner passkey; it is deleted once a passkey exists.",
+            _ENV,
+            path,
+        )
+        return token
+
+
+def _retire_local_enroll_token() -> None:
+    """Delete the self-minted token: with a passkey enrolled it has nothing left to guard."""
+    with _enroll_lock, contextlib.suppress(OSError):
+        _enroll_token_path().unlink()
+
+
+def _first_enrollment_proof() -> tuple[str, str]:
+    """What the first enrollment must present, and where that expectation came from.
+
+    Returns:
+        ``("env", token)`` when ``STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN`` is set,
+        otherwise ``("file", token)`` with the self-minted local token. There
+        is no third case: the first enrollment always has something to be
+        checked against, so it can never be decided from the connection alone.
+    """
+    configured = _bootstrap_token()
+    if configured:
+        return ("env", configured)
+    return ("file", _local_enroll_token())
+
+
 def _forced_rp_id() -> str:
     return os.getenv(_ENV + "RP_ID", "").strip()
 
@@ -209,7 +304,8 @@ _lock = threading.Lock()
 # is an invariant maintained by hand at every write - and the two can disagree,
 # at which point a stale hit is indistinguishable from a fresh one. Keyed this
 # way they cannot: the key is the dict's key, so a value is only reachable
-# through the identity it was read under. ``mesh/_acl_config.py`` keys its ACL
+# through the identity it was read under. ``strands_robots.mesh._acl_config``
+# keys its ACL
 # cache on a file identity tuple for the same reason. Holds at most one entry -
 # there is one store path per process - so an operator (or an attacker)
 # rewriting the store cannot grow it.
@@ -256,7 +352,7 @@ def store_corruption() -> dict[str, str] | None:
 
 
 def _preserve_corrupt(path: Path, exc: Exception) -> None:
-    """Move an unparseable store aside instead of clobbering it, and remember that we did."""
+    """Move a store this module cannot use aside instead of clobbering it, and remember that we did."""
     global _corrupt
     backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
     try:
@@ -314,6 +410,50 @@ def _remember_locked(identity: tuple | None, raw: str, store: dict[str, Any]) ->
         _cache[identity] = _CachedStore(raw, store)
 
 
+def _parsed_store(raw: str) -> dict[str, Any]:
+    """The store *raw* holds, or ``ValueError`` naming why it cannot be one.
+
+    Parsing is not usability. Every reader here indexes the parsed document
+    without a second look - ``_jwt_secret`` takes ``store["jwt_secret"]``,
+    ``has_credentials`` takes ``len(store.get("credentials", []))`` - so a file
+    that is valid JSON and still not a store hands each of them a value it has
+    no branch for, and the fault surfaces as a ``KeyError``, ``TypeError`` or
+    ``AttributeError`` from inside whichever route asked. Presenting any session
+    token against a store with no ``jwt_secret`` did exactly that: ``KeyError``
+    inside :func:`verify_token`, which is a 500 on every guarded route and says
+    nothing an operator could act on, where the same request without the token
+    was a clean 401. A non-string secret was quieter and worse - every token
+    failed to verify (401 forever) while signing in raised from PyJWT.
+
+    Raising here routes all of that into the recovery :func:`_load` already
+    has for a store it cannot read: the bytes are kept aside, the reason is
+    recorded for :func:`store_corruption`, and a working default takes over -
+    so the dashboard comes up sealed against enrollment from anywhere but the
+    machine, instead of answering 500 until someone reads a traceback.
+
+    Args:
+        raw: The store file's contents.
+
+    Returns:
+        The parsed store, usable by every reader in this module.
+
+    Raises:
+        ValueError: The text is not JSON, or is JSON that cannot serve as a
+            store. ``json.JSONDecodeError`` is a ``ValueError``, so both
+            arrive at the caller through one channel.
+    """
+    store = json.loads(raw)
+    if not isinstance(store, dict):
+        raise ValueError(f"store is a JSON {type(store).__name__}, not an object")
+    secret = store.get("jwt_secret")
+    if not isinstance(secret, str) or not secret:
+        raise ValueError(f"store has no usable jwt_secret (found {type(secret).__name__})")
+    creds = store.get("credentials", [])
+    if not isinstance(creds, list) or not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in creds):
+        raise ValueError("store credentials are not a list of records each carrying an id")
+    return store
+
+
 def _load() -> dict[str, Any]:
     """Read the store, serving memory only while the file still holds its bytes.
 
@@ -332,7 +472,7 @@ def _load() -> dict[str, Any]:
                 cached = _cache.get(identity)
                 if cached is not None and cached.raw == raw:
                     return cached.store
-                store: dict[str, Any] = json.loads(raw)
+                store: dict[str, Any] = _parsed_store(raw)
             except (OSError, ValueError) as exc:
                 _preserve_corrupt(path, exc)
             else:
@@ -474,7 +614,22 @@ def known_rp_ids(store: dict | None = None) -> set:
 
 
 def rp_id_verdict(host_rp_id: str, forced: str = "", known: set | None = None) -> tuple:
-    """Decide the rp_id for a ceremony: ``(rp_id, reason)``, or ``(None, reason)``."""
+    """Decide the rp_id for a ceremony: ``(rp_id, reason)``, or ``(None, reason)``.
+
+    Args:
+        host_rp_id: The host half of the authority the request was reached at,
+            or ``""`` when the request carried no ``Host`` header. Empty is a
+            missing reading, never a hostname: it is refused rather than read
+            as any particular host, because the one host this function trusts
+            unconditionally is loopback and a caller must not reach that
+            verdict by omitting a header.
+        forced: ``STRANDS_DASH_AUTH_RP_ID``, or ``""``.
+        known: The enrolled rp_ids; :func:`known_rp_ids` when omitted.
+
+    Returns:
+        ``(rp_id, reason)`` with the rp_id to bind, or ``(None, reason)`` when
+        no rp_id can be bound.
+    """
     # Loopback outranks even the pin, and that ordering is deliberate: a browser at
     # http://localhost:8090 CANNOT use 'robots.cagatay.my' as an rp_id -- the spec requires the
     # rp_id to be a registrable suffix of the page's origin, so honouring the pin here would make
@@ -484,6 +639,14 @@ def rp_id_verdict(host_rp_id: str, forced: str = "", known: set | None = None) -
         return (host_rp_id, "loopback")
     if forced:
         return (forced, "forced by STRANDS_DASH_AUTH_RP_ID")
+    # A caller that sent no Host header supplied no rp_id, and the rungs below
+    # decide one by comparing the host to the enrolled set. Reading absence as a
+    # host skips that comparison: it is the only way into this function that
+    # answers without consulting the store, and it answers with the deployment's
+    # own name. Refused here so the operator reads which reading was missing,
+    # rather than a ceremony being bound to a name nobody sent.
+    if not host_rp_id:
+        return (None, "the request carried no Host header, so no relying-party id was offered")
     known = known_rp_ids() if known is None else known
     if host_rp_id in known:
         return (host_rp_id, "matches an enrolled credential")
@@ -493,10 +656,14 @@ def rp_id_verdict(host_rp_id: str, forced: str = "", known: set | None = None) -
 
 
 def _derive_rp_id(request_or_ws: Any) -> str:
-    host = _host_only(_headers(request_or_ws).get("host", "localhost"))
+    # "" when the request sent no Host header, which rp_id_verdict refuses. The
+    # value this used to stand in -- "localhost" -- is the one host that outranks
+    # both the pin and the enrolled set, so omitting the header was a way to be
+    # read as a browser on this machine.
+    host = _host_only(_headers(request_or_ws).get("host", ""))
     rp_id, reason = rp_id_verdict(host, _forced_rp_id())
     if rp_id is None:
-        logger.warning("refused WebAuthn ceremony: %s", reason)
+        logger.warning("refused WebAuthn ceremony: %s", log_redaction.one_line(reason))
         raise HTTPException(
             400,
             {
@@ -585,14 +752,39 @@ def _served_origin(request_or_ws: Any) -> str:
     The ``Host`` header supplies the authority half, which is the same source
     :func:`_derive_rp_id` already binds through :func:`rp_id_verdict` -- so the two
     expectations agree by construction, and a host a stranger made up is refused
-    there rather than reappearing here as a different answer.
+    there rather than reappearing here as a different answer. A request that sent
+    no ``Host`` header supplies no authority, and the two doors agree about that
+    too: neither stands one in.
+
+    Raises:
+        HTTPException: 400 when no origin is configured and the request carried
+            no ``Host`` header, so the origin cannot be determined.
     """
     forced = _forced_origin()
     if forced:
         # Normalised because WebAuthn compares origins byte-for-byte: a trailing
         # slash in the env var would otherwise fail every ceremony.
         return forced.rstrip("/")
-    return f"{_connection_scheme(request_or_ws)}://{_headers(request_or_ws).get('host', 'localhost:8090')}"
+    authority = str(_headers(request_or_ws).get("host", "")).strip()
+    if not authority:
+        # Standing in an authority here would state where this deployment is
+        # reachable on the strength of a header that never arrived, and
+        # :func:`origin_verdict` then compares the caller's Origin against that
+        # invention -- a comparison the caller passes by offering the invented
+        # value, which is the tautology that function exists to refuse. Refused
+        # for the same reason :func:`_connection_scheme` refuses a transport
+        # with no scheme: an expectation is refused rather than guessed.
+        logger.warning("refused WebAuthn ceremony: request carried no Host header")
+        raise HTTPException(
+            400,
+            {
+                "error": "this connection cannot be used for a passkey ceremony",
+                "detail": "the request carried no Host header, so the origin a ceremony must be "
+                "verified against cannot be determined",
+                "hint": "set STRANDS_DASH_AUTH_ORIGIN to the origin the dashboard is served at",
+            },
+        )
+    return f"{_connection_scheme(request_or_ws)}://{authority}"
 
 
 def _derive_origin(request_or_ws: Any) -> str:
@@ -605,7 +797,7 @@ def _derive_origin(request_or_ws: Any) -> str:
         return expected
     origin, reason = origin_verdict(_headers(request_or_ws).get("origin", ""), expected)
     if origin is None:
-        logger.warning("refused WebAuthn ceremony: %s", reason)
+        logger.warning("refused WebAuthn ceremony: %s", log_redaction.one_line(reason))
         raise HTTPException(
             400,
             {
@@ -734,7 +926,9 @@ def _stash_challenge(
         if ip:
             evicted = _evict_oldest(_challenges, _CHAL_MAX_PER_IP - 1, ip=ip)
             if evicted:
-                logger.warning("challenge cap: dropped %d stale challenge(s) from %s", evicted, ip)
+                logger.warning(
+                    "challenge cap: dropped %d stale challenge(s) from %s", evicted, log_redaction.one_line(ip)
+                )
         if len(_challenges) >= _CHAL_MAX:
             _evict_oldest(_challenges, _CHAL_MAX - 1)
             logger.warning("challenge table full (%d); evicted oldest", _CHAL_MAX)
@@ -837,7 +1031,9 @@ def issue_token(
 ) -> str:
     """A session token. `iat0` is the ORIGINAL sign-in, carried unchanged through every
     renewal so the absolute cap in renewal_verdict() cannot be reset by re-issuing.
-    `via` marks how the token was minted (e.g. "handoff") for later forensics."""
+    `via` marks how the token was minted (e.g. "handoff") for later forensics, and is
+    likewise carried through every renewal by renew_if_due(): a session that began as a
+    URL handoff stays recognisable as one for as long as it lives."""
     now = int(time.time())
     payload = {
         "sub": subject,
@@ -930,6 +1126,13 @@ def renew_if_due(token: str, now: float | None = None) -> str | None:
         A newly issued token, never expiring earlier than the one held and never
         past the session's maximum age, or None when the session is still fresh,
         has reached that maximum, or does not verify.
+
+    The renewed token carries the held one's ``via`` marker, for the same reason
+    it carries ``iat0``: both describe the ORIGINAL sign-in, and a renewal is the
+    same session continuing rather than a new one. Dropping ``via`` here would
+    erase the marker at the first renewal, and a handoff token - minted with a
+    lifetime far shorter than ``TOKEN_TTL`` - is already past the half-life
+    threshold when it is minted, so its first renewal is its first use.
     """
     if not token:
         return None
@@ -940,11 +1143,13 @@ def renew_if_due(token: str, now: float | None = None) -> str | None:
     verdict = renewal_verdict(claims, time.time() if now is None else now)
     if not verdict.get("renew"):
         return None
+    via = claims.get("via")
     return issue_token(
         str(claims.get("sub") or ""),
         str(claims.get("name") or ""),
         iat0=verdict.get("iat0"),
         exp=verdict.get("exp"),
+        via=str(via) if via else None,
     )
 
 
@@ -1015,66 +1220,82 @@ def client_is_loopback(client_host: str | None) -> bool:
         return client_host == "localhost"
 
 
+def _first_enrollment_refusal(request: Any, source: str) -> str:
+    """Why an unproven first enrollment was refused, worded for the reader's situation.
+
+    Every branch is a refusal - nothing here can admit - so the peer address and
+    the proxy evidence are consulted for wording only. A reader behind a tunnel
+    is told they are behind one; a reader on the machine is told where the
+    token is; a disk error is named where one occurred, because a refusal that
+    blames the wrong cause sends the operator to the wrong place.
+    """
+    head = (
+        "the first passkey enrolled becomes the owner of this dashboard, so enrolling it needs proof "
+        "from the machine itself and the bootstrap token presented is not it"
+    )
+    if source == "env":
+        remedy = f"pass the configured {_ENV}BOOTSTRAP_TOKEN as the bootstrap value"
+    else:
+        remedy = (
+            f"read the one-time bootstrap token this server wrote to {_enroll_token_path()} (mode 0600, on "
+            f"the machine running the dashboard) and pass it as the bootstrap value, or set {_ENV}BOOTSTRAP_TOKEN"
+        )
+    proxied_by = _arrived_through_a_proxy(request)
+    peer = _socket_peer(request)
+    if proxied_by is not None:
+        where = f"this request arrived through a proxy or tunnel (it carries {proxied_by!r})"
+    elif client_is_loopback(peer):
+        where = (
+            "a loopback peer is not that proof - a same-host port forward (socat, ssh -L, nginx stream, "
+            "a DNAT rule) makes any remote client look like 127.0.0.1"
+        )
+    else:
+        where = "this request came from another machine"
+    damage = store_corruption()
+    if damage:
+        where += (
+            f"; the credential store was unreadable and has been kept as {damage['backup'] or 'a backup'} "
+            f"({damage['reason']}), so this is a re-seal"
+        )
+    return f"{head}: {where}. To enroll, {remedy}."
+
+
 # --- WebAuthn ceremonies ------------------------------------------------------
 
 
 def begin_registration(request: Any, label: str = "passkey", bootstrap: str = "") -> dict[str, Any]:
     """Start a passkey enrollment. The FIRST enrollment seals the dashboard;
-    later ones require a valid session (enforced by the route)."""
+    later ones require a valid session (enforced by the route).
+
+    The first enrollment hands out ownership of the fleet rather than merely
+    using it, so it is admitted on PROOF and never on topology: *bootstrap*
+    must equal the configured ``STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN`` or, when
+    none is set, the token this module minted into a ``0600`` file beside the
+    credential store (:func:`_first_enrollment_proof`). Earlier revisions
+    admitted a request whose socket peer was loopback and which carried no
+    proxy header. That is not presence at the machine: a same-host L4
+    forwarder (``socat``, ``ssh -L``, nginx ``stream``, HAProxy ``mode tcp``,
+    a DNAT rule, ``kubectl port-forward``) relays raw bytes, adds no HTTP
+    header, and hands every remote peer a ``127.0.0.1`` source - so both
+    heuristics passed and a stranger could enroll the owner passkey (F-007,
+    CWE-290 / CWE-348). The peer and the proxy evidence are still read, but
+    only to word the refusal.
+    """
     store = _load()
     first_time = len(store.get("credentials", [])) == 0
-    required = _bootstrap_token()
-    if first_time and required:
-        if not secrets.compare_digest(bootstrap or "", required):
-            raise HTTPException(403, "bootstrap token required for first enrollment")
 
+    # The rp_id verdict comes first: a bare-IP Host cannot hold a passkey from
+    # anywhere, so that is the diagnosis worth giving before any question of
+    # who is asking.
     rp_id = _derive_rp_id(request)
     if not rpid_is_usable(rp_id):
         raise _rpid_error(rp_id)
 
-    # The first enrollment seals the dashboard, so it is the one request that hands out
-    # ownership of the fleet rather than merely using it. With no bootstrap token configured
-    # there is nothing to check it against, so it is limited to the machine itself: whoever is
-    # at the keyboard is the only party who can be presumed to be the owner. A disk error is
-    # one way to arrive here and a genuinely new install is the other; the second is the
-    # commoner one and the more valuable to seize, so both are gated and only the wording
-    # differs. The socket peer is deliberate -- see _socket_peer, and note that an unknown
-    # peer is NOT the machine.
-    damage = store_corruption()
-    if first_time and not required:
-        # A loopback socket peer is necessary but not sufficient: behind a
-        # same-host proxy or tunnel started without --proxy-headers, every
-        # remote visitor's peer is 127.0.0.1. The proxy's own forwarding
-        # headers are the evidence that the request came through one, so a
-        # loopback peer that carries any of them is refused too - the values
-        # are never read (see _arrived_through_a_proxy).
-        proxied_by = _arrived_through_a_proxy(request)
-        if proxied_by is not None:
-            raise HTTPException(
-                403,
-                "the first passkey enrolled becomes the owner of this dashboard, and this request "
-                f"arrived through a proxy or tunnel (it carries {proxied_by!r}), so it cannot be taken "
-                "as the machine itself even though the connection came from loopback. Enroll from a "
-                "browser on the machine with no proxy in between, or set STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN "
-                "and pass it. If the dashboard sits behind a same-host proxy, start uvicorn with "
-                "--proxy-headers and --forwarded-allow-ips so the peer address is the real client's.",
-            )
-        if not client_is_loopback(_socket_peer(request)):
-            if damage:
-                raise HTTPException(
-                    403,
-                    "the credential store was unreadable and has been kept as "
-                    f"{damage['backup'] or 'a backup'} ({damage['reason']}). Enrolling a new passkey "
-                    "is limited to the machine itself until one exists again - open the dashboard on "
-                    "that machine, or set STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN and pass it.",
-                )
-            raise HTTPException(
-                403,
-                "the first passkey enrolled becomes the owner of this dashboard, and no "
-                "STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN is set for it to be checked against, so it is "
-                "limited to the machine itself - open the dashboard on that machine, or set "
-                "STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN and pass it.",
-            )
+    if first_time:
+        source, expected = _first_enrollment_proof()
+        # Bytes, so a non-ASCII guess is a mismatch rather than a TypeError.
+        if not secrets.compare_digest((bootstrap or "").encode("utf-8"), expected.encode("utf-8")):
+            raise HTTPException(403, _first_enrollment_refusal(request, source))
 
     user_id = store.get("user_id")
     if not user_id:
@@ -1141,6 +1362,10 @@ def finish_registration(request: Any, challenge_id: str, credential: dict) -> di
         }
     )
     _save(store)
+    # A passkey now guards the dashboard, so the self-minted first-enrollment
+    # token has nothing left to protect; leaving it on disk would only be a
+    # secret waiting to be found.
+    _retire_local_enroll_token()
     token = issue_token(cred_id, name=rec["extra"].get("label", "passkey"))
     return {"ok": True, "token": token, "credential_id": cred_id}
 
@@ -1210,7 +1435,9 @@ def finish_authentication(request: Any, challenge_id: str, credential: dict) -> 
     # authentication VERIFIED against rec["extra"]["rp_id"], which is proof, not a guess.
     if not match.get("rp_id") and rec["extra"].get("rp_id"):
         match["rp_id"] = rec["extra"]["rp_id"]
-        logger.info("recorded rp_id %r for credential %s", match["rp_id"], match.get("name"))
+        # The credential's name is the label the enrolling request chose, kept in the
+        # store and read back here, so it arrives from outside like any header would.
+        logger.info("recorded rp_id %r for credential %s", match["rp_id"], log_redaction.one_line(match.get("name")))
     _save(store)
     token = issue_token(cast(str, cred_id), name=match.get("name", "passkey"))
     return {"ok": True, "token": token, "credential_id": cred_id}
@@ -1234,7 +1461,13 @@ def status(request: Any = None) -> dict[str, Any]:
         "enabled": auth_enabled(),
         "setup_required": len(store.get("credentials", [])) == 0,
         "credentials": list_credentials(),
-        "bootstrap_required": bool(_bootstrap_token()) and len(store.get("credentials", [])) == 0,
+        # The first enrollment always needs a proof now, so this is exactly
+        # setup_required; kept as its own field because the login screen reads
+        # it. bootstrap_source says which proof, never the proof itself.
+        "bootstrap_required": len(store.get("credentials", [])) == 0,
+        "bootstrap_source": ("env" if _bootstrap_token() else "file")
+        if len(store.get("credentials", [])) == 0
+        else None,
     }
     if request is not None:
         # The rp_id block is advisory: it tells the login screen which relying-party

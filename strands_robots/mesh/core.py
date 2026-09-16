@@ -56,6 +56,53 @@ logger = logging.getLogger(__name__)
 _LOCAL_ROBOTS: dict[str, Mesh] = {}
 _LOCAL_ROBOTS_LOCK = threading.Lock()
 
+#: Startup posture warnings this process has already emitted, by kind.
+#: ``STRANDS_MESH_OVERRIDE_CODE`` and ``STRANDS_MESH_MULTICAST`` describe the
+#: process, not a peer: every :class:`Mesh` in it reads the same environment,
+#: so the second instance (a sim's per-robot child peer, a fleet of arms in
+#: one process) would only repeat the banner under another name. Emit once.
+_POSTURE_WARNINGS_EMITTED: set[str] = set()
+_POSTURE_WARNINGS_LOCK = threading.Lock()
+
+
+def _warn_posture_once(kind: str, msg: str, *args: Any) -> bool:
+    """Log ``msg`` at WARNING the first time ``kind`` is seen in this process.
+
+    Returns ``True`` when the warning was emitted, ``False`` when an earlier
+    :meth:`Mesh.start` in this process already said it.
+    """
+    with _POSTURE_WARNINGS_LOCK:
+        if kind in _POSTURE_WARNINGS_EMITTED:
+            return False
+        _POSTURE_WARNINGS_EMITTED.add(kind)
+    logger.warning(msg, *args)
+    return True
+
+
+def _reset_posture_warnings() -> None:
+    """Forget which posture warnings were emitted (tests that assert on them)."""
+    with _POSTURE_WARNINGS_LOCK:
+        _POSTURE_WARNINGS_EMITTED.clear()
+
+
+#: Why ``Mesh.start`` refuses under mTLS with a permissive ACL, and the four
+#: ways out. Logged by :meth:`Mesh._refuse_under_permissive_default_acl` and
+#: printed by ``strands-robots doctor`` for the same posture, so the two never
+#: name different env vars.
+PERMISSIVE_ACL_REFUSAL = (
+    "Mesh did NOT start: it would accept any TLS-signed peer "
+    "on every topic (no access-control list configured).\n"
+    "  Pick one:\n"
+    "    - Local dev / single machine?  Set STRANDS_MESH_LOCAL_DEV=true "
+    "(turns off mTLS+ACL for localhost experiments).\n"
+    "    - Sharing a trusted lab network?  Set "
+    "STRANDS_MESH_ACCEPT_PERMISSIVE_ACL=1 to accept this posture.\n"
+    "    - Production?  Point STRANDS_MESH_ACL_FILE at a role-separated "
+    "ACL (see examples/mesh/mesh_acl_example.json5).\n"
+    "    - Don't need the mesh?  It is OFF by default now -- just drop "
+    "mesh=True (or set STRANDS_MESH=false)."
+)
+
 
 def get_local_robots() -> dict[str, Mesh]:
     """Return a snapshot of in-process mesh-enabled robots."""
@@ -199,6 +246,15 @@ RESUME_REPLAY_CACHE_MAX: int = _parse_positive_int_env("STRANDS_MESH_RESUME_REPL
 #: message would otherwise put ten copies of it on the wire every second. The
 #: ``reason`` beside it is the exception's type name, which is bounded already.
 MAX_DEGRADED_DETAIL_LEN: int = 256
+
+#: Total budget for joining the sensor loops :meth:`Mesh.start` launched, spent
+#: across all of them rather than per loop: the loops wind down in parallel and
+#: notice the stop within 10ms (:class:`~strands_robots.mesh.pacing.Ticker`), so
+#: a per-loop budget would let one wedged driver read cost nine times this. Named
+#: so the docstring, the WARNING and the tests read one value. Matches
+#: :data:`strands_robots.mesh.input._INPUT_JOIN_TIMEOUT_S` and
+#: :data:`strands_robots.teleop_mixin._TELEOP_JOIN_TIMEOUT_S` in purpose.
+LOOP_JOIN_TIMEOUT_S: float = 2.0
 
 
 def _resume_freshness_window_s() -> float:
@@ -700,12 +756,7 @@ class Mesh(SensorLoopsMixin):
         if not is_permissive:
             return False
 
-        accept_permissive = os.getenv("STRANDS_MESH_ACCEPT_PERMISSIVE_ACL", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if accept_permissive:
+        if _acl_config.permissive_acl_acknowledged():
             logger.info(
                 "[mesh] %s: permissive default ACL active under mtls "
                 "(STRANDS_MESH_ACCEPT_PERMISSIVE_ACL=1 acknowledged) -- "
@@ -714,20 +765,7 @@ class Mesh(SensorLoopsMixin):
             )
             return False
 
-        logger.error(
-            "[mesh:%s] Mesh did NOT start: it would accept any TLS-signed peer "
-            "on every topic (no access-control list configured).\n"
-            "  Pick one:\n"
-            "    - Local dev / single machine?  Set STRANDS_MESH_LOCAL_DEV=true "
-            "(turns off mTLS+ACL for localhost experiments).\n"
-            "    - Sharing a trusted lab network?  Set "
-            "STRANDS_MESH_ACCEPT_PERMISSIVE_ACL=1 to accept this posture.\n"
-            "    - Production?  Point STRANDS_MESH_ACL_FILE at a role-separated "
-            "ACL (see examples/mesh/mesh_acl_example.json5).\n"
-            "    - Don't need the mesh?  It is OFF by default now -- just drop "
-            "mesh=True (or set STRANDS_MESH=false).",
-            self.peer_id,
-        )
+        logger.error("[mesh:%s] " + PERMISSIVE_ACL_REFUSAL, self.peer_id)
         return True
 
     # Lifecycle
@@ -748,8 +786,11 @@ class Mesh(SensorLoopsMixin):
             # turns a silent operational landmine into an explicit, logged
             # decision. Operators who genuinely want no remote-resume posture
             # (e.g. physical-only recovery) see the warning and accept it.
+            # Once per process: the posture is the environment's, and a
+            # second Mesh here (a sim's child peer) reads the same one.
             if not os.getenv("STRANDS_MESH_OVERRIDE_CODE", "").strip():
-                logger.warning(
+                _warn_posture_once(
+                    "override_code",
                     "[safety:%s] No emergency-stop resume code set. If any peer "
                     "broadcasts an e-stop, this robot stays locked until you "
                     "physically restart it (one message can freeze the whole "
@@ -778,7 +819,8 @@ class Mesh(SensorLoopsMixin):
             )
 
             if _zc_bool_env("STRANDS_MESH_MULTICAST", default=False):
-                logger.warning(
+                _warn_posture_once(
+                    "multicast",
                     "[safety:%s] Multicast scouting is ON "
                     "(STRANDS_MESH_MULTICAST=true). Any device on the LAN can "
                     "discover and attract fleet robots without credentials "
@@ -953,6 +995,13 @@ class Mesh(SensorLoopsMixin):
     def stop(self) -> None:
         """Stop all loops and release the session reference.
 
+        Waits for the loops :meth:`start` launched before releasing anything they
+        publish through, so a tick already inside :meth:`publish` cannot land on
+        the wire after this peer has announced it left. The wait is bounded by
+        :data:`LOOP_JOIN_TIMEOUT_S` and shared across the loops; a sensor read
+        that blocks past it leaves its loop free to publish once more, and that
+        loop is named at WARNING rather than the stop being reported as complete.
+
         Drops every :meth:`subscribe` subscription and clears :attr:`inbox`:
         the subscribers are undeclared with the session reference, and the
         ``(topic, callback)`` pairs behind them are not retained, so
@@ -965,6 +1014,8 @@ class Mesh(SensorLoopsMixin):
                 return
             self._running = False
             self._stop_event.set()
+
+        self._join_loops()
 
         with _LOCAL_ROBOTS_LOCK:
             _LOCAL_ROBOTS.pop(self.peer_id, None)
@@ -1027,6 +1078,41 @@ class Mesh(SensorLoopsMixin):
             self._has_session_ref = False
 
         logger.info("[mesh] %s off mesh", self.peer_id)
+
+    def _join_loops(self) -> None:
+        """Wait for the loops :meth:`start` launched, then say what did not stop.
+
+        Called by :meth:`stop` before it undeclares the subscribers and drops the
+        session reference, because that is what the loops publish through: a tick
+        already inside :meth:`publish` when the flag flipped would otherwise land
+        on the wire after this peer announced it had left, using a session
+        reference it no longer holds.
+
+        ``join()`` returns ``None`` whether or not a thread finished, so the
+        liveness read after it is the only thing that tells a stopped loop from
+        one that outlasted :data:`LOOP_JOIN_TIMEOUT_S`. A driver whose sensor read
+        blocks past that budget - a serial read on a wedged bus is the ordinary
+        case - leaves its loop free to publish once more after :meth:`stop`
+        returns, so that outcome is logged at WARNING naming the loops rather than
+        being announced as a stop that happened. The roster is left in place: a
+        caller can read :attr:`_threads` for those handles, and :meth:`start`
+        rebuilds it on a rejoin.
+        """
+        deadline = time.monotonic() + LOOP_JOIN_TIMEOUT_S
+        for thread in list(self._threads):
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if late := [t.name for t in self._threads if t.is_alive()]:
+            logger.warning(
+                "[mesh] %s: %d of %d loop(s) did not stop within %.1fs and may "
+                "publish once more after stop() returns: %s. A sensor read that "
+                "blocks - a serial bus that stopped answering is the ordinary "
+                "cause - is what holds a tick open past the budget.",
+                self.peer_id,
+                len(late),
+                len(self._threads),
+                LOOP_JOIN_TIMEOUT_S,
+                ", ".join(late),
+            )
 
     @property
     def alive(self) -> bool:
@@ -2272,6 +2358,21 @@ class Mesh(SensorLoopsMixin):
                             "ok": False,
                             "error": f"{type(r).__name__} cannot enumerate rollouts in flight; nothing was stopped",
                         }
+                    # Lower every target's cooperative flag BEFORE the first
+                    # join. ``stop_policy`` waits (bounded) for the worker it
+                    # flagged to exit, and this fanout is sequential, so
+                    # without this pre-pass one robot whose policy server is
+                    # wedged inside inference holds the stop REQUEST off every
+                    # robot behind it in ``targets`` - measured on a 3-robot
+                    # world with one wedged server, the two healthy workers
+                    # exited a full second later than they do without the
+                    # wait, still driving their arms for that second. The
+                    # engine's own teardown sequences its multi-robot stop the
+                    # same way: request on every robot, then join. Engines
+                    # without the pre-pass are unaffected - their
+                    # ``stop_policy`` is what answers either way.
+                    if hasattr(r, "_request_policy_stop_all"):
+                        r._request_policy_stop_all(targets)
                     results = {name: dict(r.stop_policy(name)) for name in targets}
                     # ``ok`` is derived from the per-robot answers, never
                     # assumed. Reporting ok=True here counted a refused
@@ -3312,7 +3413,32 @@ class Mesh(SensorLoopsMixin):
         return resps
 
     def tell(self, target: str, instruction: str, **kw: Any) -> dict[str, Any]:
-        """Shorthand: ask a peer to execute a natural-language instruction."""
+        """Shorthand: ask a peer to run a policy with a natural-language instruction.
+
+        Sends ``{"action": "execute", "instruction": instruction, **kw}``.
+        The instruction alone is not a command the peer can act on - it is
+        the text a policy conditions on - so ``policy_provider=`` is
+        required: :func:`~strands_robots.mesh.security.validate_command`
+        refuses an execute without one before it leaves this process
+        ("Silent defaults are not honoured on the security boundary").
+        Checkpoints travel as Hub ids (``pretrained_name_or_path="lerobot/…"``,
+        an org in ``STRANDS_MESH_HF_REPO_ALLOW``); a local path is refused on
+        the wire. ``duration`` defaults to 30 s when omitted.
+
+        Example::
+
+            mesh.tell(peer, "hold the tray steady", policy_provider="lerobot_local",
+                      pretrained_name_or_path="lerobot/smolvla_base", duration=10.0)
+
+        Args:
+            target: The peer id to address.
+            instruction: Natural-language instruction the policy conditions on.
+            **kw: The policy - ``policy_provider`` (required), its checkpoint or
+                port, ``duration`` and any provider keyword the wire allows.
+
+        Returns:
+            The peer's reply for the ``execute`` command.
+        """
         return self.send(target, {"action": "execute", "instruction": instruction, **kw})
 
     # Subscribe / publish_step / on_stream

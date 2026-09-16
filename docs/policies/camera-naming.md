@@ -48,11 +48,15 @@ camera names the runtime observation must contain.
 
    ```python
    sim.add_camera(name="front", position=[0.22, 0.025, 0.6], target=[0.22, 0.025, 0])
-   sim.add_camera(name="wrist", parent_body="so101/gripper")
+   sim.add_camera(name="wrist", parent_body="so101/gripper",
+                  position=[0.058, 0.0, -0.029], target=[-0.024, 0.0, -0.297])
    ```
 
    `parent_body` mounts the camera ON a body so the wrist view rides with the
-   arm. It is supported on the **mujoco** and **newton** backends; the isaac
+   arm; `position` and `target` are then in that body's frame, and both are
+   required (omit them and `add_camera` refuses, naming a starting pose for
+   that body - the world-frame defaults would put a "wrist" camera 1.7 m from
+   the wrist looking back at the arm). It is supported on the **mujoco** and **newton** backends; the isaac
    backend refuses it with an error naming this alternative, because it parents
    camera prims to the stage camera scope rather than to an articulation link.
    On isaac, place the wrist camera in world coordinates (omit `parent_body`)
@@ -107,6 +111,37 @@ consume (for example the MuJoCo `default` free camera): the named views still
 bind to their own slots and the extra camera is dropped, instead of the extra
 camera positionally displacing a real view. Set `strict_keys=True` to turn an
 unresolved camera name into a hard error rather than a positional guess.
+
+## The free view is the last candidate for a positional slot
+
+When NO camera matches a declared key by name, every camera goes to the
+positional fallback - including the free view a backend registers for itself
+(`default`, and the other `FREE_CAMERA_TOKENS` spellings). `create_world`
+registers that view before any `add_camera` call, so it leads `list_cameras()`
+and `get_observation()`; filling the slots in observation order therefore gave
+slot 0 to a fixed three-quarter debug view of the whole scene and, with more
+cameras than slots, dropped the caller's last real view to seat it.
+
+Cameras the caller added are now ranked ahead of the free view, so a guess picks
+real views first:
+
+```python
+sim.add_camera(name="cam_a", ...)   # observation order: default, cam_a, cam_b
+sim.add_camera(name="cam_b", ...)   # policy declares .../front and .../wrist
+
+# before: default -> .../front, cam_a -> .../wrist, cam_b dropped
+# now:    cam_a   -> .../front, cam_b -> .../wrist, default dropped
+```
+
+The free view is ranked last, not removed: a scene whose only camera is the free
+view still fills the slot it filled before. Real cameras keep their relative
+order among themselves, so the ordering decides only which camera a *guess*
+picks - a name the policy declares still binds by name, and an explicit
+`camera_key_map` still outranks both (including on the declarative
+`embodiment` path, where it replaces the source key the embodiment declares
+for the image feature it claims). The fallback stays loud either way
+(`positional_fallback_used` and a per-camera WARN); `strict_keys=True` still
+turns it into an error.
 
 ## See also
 

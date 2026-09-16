@@ -22,7 +22,8 @@ plain JSON dicts, exactly as rosbridge transmits them.
 
 Actions:
     status         - roslibpy availability + connectivity to host:port.
-    list_topics    - topics with their types (rosapi /rosapi/topics).
+    list_topics    - every topic rosapi reports, with its type where rosapi
+                     reports one (rosapi /rosapi/topics).
     list_services  - services (rosapi /rosapi/services).
     echo           - subscribe and return up to N messages as JSON. Type
                      auto-resolved via rosapi when omitted.
@@ -257,6 +258,10 @@ class _RosbridgeBackend:
 _backend = _RosbridgeBackend()
 
 
+# Rendered in place of a topic's type when rosapi's reply named none for it.
+TYPE_NOT_REPORTED = "type not reported by rosapi"
+
+
 def _ok(text: str) -> dict[str, Any]:
     return {"status": "success", "content": [{"text": text}]}
 
@@ -280,8 +285,29 @@ def _rosapi_call(ros: Any, service: str, srv_type: str, values: dict[str, Any], 
 
 
 def _list_topics(ros: Any, timeout: float) -> str:
+    """List every topic rosapi reports, with its type where rosapi reports one.
+
+    ``rosapi/Topics`` answers with ``topics`` and ``types`` as index-paired
+    arrays, but only ``topics`` is guaranteed: roslibpy's own client asserts
+    ``"topics" in result`` and reads that array alone
+    (:meth:`roslibpy.Ros.get_topics`). Pairing the two by index would drop
+    every topic past the end of a short ``types``, and drop all of them when
+    ``types`` is absent - reporting an empty graph to a caller who asked which
+    topics exist. The count of topics is the answer, so each one is listed
+    either way and a topic rosapi gave no type for says so.
+    """
     resp = _rosapi_call(ros, "/rosapi/topics", "rosapi/Topics", {}, timeout)
-    pairs = sorted(zip(resp.get("topics", []), resp.get("types", [])))
+    names = list(resp.get("topics", []))
+    types = list(resp.get("types", []))
+    if len(types) != len(names):
+        logger.warning(
+            "rosapi /rosapi/topics reported %d topic(s) and %d type(s); every topic is listed "
+            "and the ones rosapi named no type for read as [%s]",
+            len(names),
+            len(types),
+            TYPE_NOT_REPORTED,
+        )
+    pairs = sorted((name, types[i] if i < len(types) else TYPE_NOT_REPORTED) for i, name in enumerate(names))
     return "\n".join(f"{name} [{type_}]" for name, type_ in pairs)
 
 
@@ -392,6 +418,15 @@ def use_rosbridge(
     numeric_error = numeric_option_error(action, _ACTION_NUMERIC_OPTIONS, timeout=timeout, count=count, rate=rate)
     if numeric_error:
         return _err(numeric_error)
+    # The names an action cannot run without are graded here too, for the same
+    # reason: a forgotten ``type`` must not dial the bridge for the full timeout
+    # and then be reported as a bridge that did not reconnect.
+    if action == "echo" and not topic:
+        return _err("echo requires topic")
+    if action == "service_call" and (not service or not type):
+        return _err("service_call requires service and type")
+    if action == "publish" and (not topic or not type):
+        return _err("publish requires topic and type")
 
     if action == "status":
         if not _backend.available():
@@ -429,9 +464,9 @@ def use_rosbridge(
             if action == "list_services":
                 return _ok(_list_services(ros, timeout))
 
-            if action == "echo":
-                if not topic:
-                    return _err("echo requires topic")
+            # Each verb's names are non-empty here (refused above); spelling them
+            # on the condition is what narrows them for the call.
+            if action == "echo" and topic:
                 msg_type = type or _resolve_topic_type(ros, topic, timeout)
                 if not msg_type:
                     return _err(f"cannot resolve type for {topic}; pass type=pkg/Name")
@@ -444,17 +479,13 @@ def use_rosbridge(
                 )
                 return _ok(f"echo {topic} ({msg_type}):\n{body}{note}")
 
-            if action == "service_call":
-                if not service or not type:
-                    return _err("service_call requires service and type")
+            if action == "service_call" and service and type:
                 import json
 
                 resp = _service_call(ros, service, type, fields, timeout)
                 return _ok(f"response:\n{json.dumps(resp, indent=2, default=str)}")
 
-            if action == "publish":
-                if not topic or not type:
-                    return _err("publish requires topic and type")
+            if action == "publish" and topic and type:
                 _publish(ros, topic, type, fields, count, rate)
                 return _ok(f"published {count} message(s) to {topic}")
 

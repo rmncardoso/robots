@@ -13,6 +13,17 @@ description: Two Robot() instances coordinating over the Zenoh mesh - peer disco
 !!! info "Device Connect is the recommended networking layer"
     What's described here is the built-in **Zenoh mesh** — the automatic fallback. When the [`device-connect`](device-connect.md) extra is installed, `Robot().run()` and `robot_mesh()` use [**Device Connect**](device-connect.md) (structured RPC, presence, registry, safety) and fall back to this mesh only when it's unavailable. Both ride on Zenoh.
 
+On a fresh install the mesh refuses to start until you choose a security
+posture: with no ACL configured, `Robot(..., mesh=True)` logs `Mesh did NOT
+start` and leaves `robot.mesh.alive` as `False`. For localhost experiments set
+the developer preset in every process that joins; the lab and production
+postures (`STRANDS_MESH_ACCEPT_PERMISSIVE_ACL`, `STRANDS_MESH_ACL_FILE`) are on
+the [Security](security.md) page.
+
+```bash
+export STRANDS_MESH_LOCAL_DEV=1   # both processes below; localhost only
+```
+
 ```python
 # process A
 from strands_robots import Robot
@@ -140,6 +151,18 @@ locally decided keys - `peer_id`, `type`, `hostname`, `age`, `reachable` - win a
 name collision with it. A peer heartbeating `"age": 0` does not report itself
 fresh, one claiming `"reachable": true` does not report itself in contact, and
 one naming another peer's id does not answer a lookup for that peer.
+
+**The same rule decides a lockout badge.** A safety envelope's `t` is the
+*sender's* wall clock, admitted anywhere inside the two bounds above, so it may
+sit a minute behind the clock of the process reading it. Anything a monitor ranks
+against its own observations - when it first saw a peer, when it last watched
+that peer accept a command - is therefore ordered against the instant it
+*learned* of the stop, not against `t`. `Lockout` records both:
+`since` is the reported instant, for display; `arrived` is the local one, and
+every verdict is decided on it. Reading `t` instead let a peer that was already
+on the mesh look freshly spawned ("may never have received it"), and let a
+command accepted before the stop was even known count as proof the peer was
+clear.
 
 Repeated wrong codes arm a brute-force cooldown
 (`STRANDS_MESH_RESUME_MAX_FAILS`, `STRANDS_MESH_RESUME_BACKOFF_S`): during the
@@ -311,6 +334,13 @@ change, or a hub that went away and came back. The peer keeps its identity
 across it: the `peer_id` is unchanged, and an engaged e-stop lockout stays
 engaged, so a network blip is not a way to forget a stop.
 
+`stop()` waits for the sensor loops before it releases anything they publish
+through, so by the time it returns the peer really is off the wire rather than
+merely flagged as gone. The wait is bounded and shared across the loops: a sensor
+read that blocks - a serial bus that stopped answering is the ordinary cause -
+holds one tick open past the budget, and that loop is then named at WARNING as
+still able to publish once more, instead of the stop being reported as complete.
+
 What does not survive is your own `subscribe()` topics. `start()` re-declares
 the peer's built-in topics from the table above; the subscribers `subscribe()`
 returned are undeclared with the session reference and their callbacks are not
@@ -332,12 +362,19 @@ if name is None:
 
 ```python
 from strands import Agent
-from strands_robots.tools import robot_mesh
+from strands_robots import robot_mesh
 
 agent = Agent(tools=[sim_a, robot_mesh])
 agent("Find every robot on the mesh and ask each one to report its status")
 agent("E-STOP all peers")
 ```
+
+!!! warning "A single-peer stop is graded by the answer, not by delivery"
+    `robot_mesh(action="stop", target=...)` reads the envelope `Mesh.send` returns rather than whether the send raised. A peer whose handler reports it did not stop (the same rule `emergency_stop` grades with), a peer-level `type: error` (a lockout, replay or authorization rejection), a `send` precondition error, or no answer inside the budget (the caller's `timeout`, capped at 5s) each make the result `status="error"` naming the peer and its answer, audit the verdict as a failure, and log at `CRITICAL`. A response that reports no verdict either way is not read as a refusal. The timeout reading is deliberately this action's own: a fleet-wide `emergency_stop` keeps counting a silent peer as a gap in its count rather than a refusal.
+
+!!! warning "An empty peer list is not the same as no discovery"
+    `robot_mesh(action="peers")` and `action="status"` answer from any process, including one with no local `Robot()`/`Simulation()` - such a process hears the fleet only through a robot-less gateway peer the tool brings up on demand. When that gateway does not come up, both actions report `no discovery ran` beside the count rather than an empty fleet nothing listened for, and name `STRANDS_MESH` when the kill switch is why: the standing "create a `Robot()`" remedy would be refused by that same switch. The audit record for the call carries `discovery=none`. A gateway that did come up and heard nothing keeps the plain `0 remote` - that zero is a measurement.
+
 
 ## Mesh teleop
 

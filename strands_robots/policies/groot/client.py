@@ -7,6 +7,7 @@ using msgpack with custom encode/decode hooks.
 import io
 import json
 import logging
+import socket as _socket
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,70 @@ from strands_robots.utils import coerce_zmq_timeout_ms, require_optional
 from .data_config import ModalityConfig
 
 logger = logging.getLogger(__name__)
+
+_SERVER_NAME = "GR00T policy server"
+
+# How long :func:`_listener_present` gives a bare TCP connect to the server's
+# port. It only has to tell "nothing listening" from "listening but silent",
+# so a second is plenty on a LAN and short next to any inference budget.
+_PROBE_TIMEOUT_S = 1.0
+
+
+def _listener_present(host: str, port: int) -> bool | None:
+    """Whether anything accepts a TCP connection on ``host:port`` right now.
+
+    Called after a request timed out, to say which side the wait was on: an
+    absent process (connection refused - ZMQ's ``connect`` is lazy and never
+    reports it, so a typo in the port looks exactly like a slow model) or a
+    listener that accepted the frame and never answered (checkpoint still
+    loading, or a wedged forward pass). ``None`` when the probe itself could
+    not decide - a name that does not resolve, a firewall that drops instead
+    of refusing - so the report falls back to naming both possibilities.
+    """
+    try:
+        with _socket.create_connection((host, port), timeout=_PROBE_TIMEOUT_S):
+            return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        return None
+
+
+def unreachable_server_error(*, uri: str, endpoint: str, timeout_ms: int, listener: bool | None) -> str:
+    """The report for a request that timed out, worded for the side that failed.
+
+    Args:
+        uri: ``tcp://host:port`` the client dialled.
+        endpoint: The request that got no answer, named so a caller batching
+            several knows which one.
+        timeout_ms: The budget that expired - it is the knob, so it is named.
+        listener: :func:`_listener_present`'s verdict.
+
+    Returns:
+        One sentence each for what happened, why (as far as the probe can
+        tell) and what to do; the remedy names the parameter that changes the
+        budget and the command that starts a server.
+    """
+    head = f"{_SERVER_NAME} at {uri} did not answer '{endpoint}' within timeout_ms={timeout_ms}."
+    if listener is False:
+        return (
+            f"{head} Nothing is listening on that port (connection refused), so no server is running there "
+            "or host/port name the wrong place. Start one - gr00t_inference(action='start', "
+            f"port={uri.rsplit(':', 1)[-1]}) runs the container, or `python -m gr00t.eval.run_gr00t_server "
+            f"--port {uri.rsplit(':', 1)[-1]}` inside an Isaac-GR00T install - or pass the host/port it is "
+            "actually on."
+        )
+    if listener is True:
+        return (
+            f"{head} The port is listening, so the server is still loading (a large checkpoint takes "
+            "minutes) or it is wedged: read its log to tell those apart, and raise timeout_ms if the model "
+            "is simply slower than the budget."
+        )
+    return (
+        f"{head} Could not tell whether anything is listening there (the probe got neither a refusal nor a "
+        "connection). Check host/port and that a server is running there (gr00t_inference(action='start') "
+        "or `python -m gr00t.eval.run_gr00t_server`), or raise timeout_ms if it is only slow."
+    )
 
 
 def _load_zmq():
@@ -42,8 +107,24 @@ class MsgSerializer:
         return msgpack.packb(data, default=MsgSerializer._encode)
 
     @staticmethod
-    def from_bytes(data: bytes) -> dict:
-        """Unpack msgpack bytes back into a dict, decoding numpy arrays and ModalityConfig values."""
+    def from_bytes(data: bytes) -> Any:
+        """Unpack msgpack bytes into the value they encode, decoding numpy arrays and ModalityConfig values.
+
+        Returns:
+            Whatever value *data* encodes. ``unpackb`` decodes any valid msgpack
+            value, not just a map - the single byte ``0x2a`` is the integer 42,
+            and a string, list, nil or bool decode just as cleanly - so this is
+            deliberately not annotated ``dict``. A caller that needs a map or a
+            list grades for one; see
+            :meth:`Gr00tInferenceClient._decode_reply`.
+
+        Raises:
+            ValueError: If *data* is not exactly one msgpack object.
+                ``msgpack``'s ``ExtraData``, ``FormatError`` and ``StackError``
+                are all ``ValueError``, so trailing bytes, a truncated frame and
+                a frame that is not msgpack at all arrive here.
+            TypeError: If *data* is not bytes-like.
+        """
         msgpack = _load_msgpack()
         return msgpack.unpackb(data, object_hook=MsgSerializer._decode)
 
@@ -80,6 +161,41 @@ class MsgSerializer:
             np.save(buffer, obj, allow_pickle=False)
             return {"__ndarray_class__": True, "as_npy": buffer.getvalue()}
         return obj
+
+
+def _unreadable_reply(*, uri: str, endpoint: str, problem: str, frame: bytes) -> str:
+    """Return the report for a server reply this client cannot read.
+
+    The reference client (``gr00t.policy.server_client.PolicyClient``) already
+    treats one wrong-peer frame this way - a bare ``b"ERROR"`` is refused with
+    "Make sure we are running the correct policy server" - and reads its
+    ``error`` field only off a reply that ``isinstance(response, dict)``. The
+    two doors here generalise that: bytes that are not msgpack and a value that
+    decodes but is neither a map nor a list are both "the peer did not send a
+    reply", and neither is a fact about the codec.
+
+    Args:
+        uri: The ``tcp://host:port`` this client dialled, so the report names the
+            endpoint actually in use rather than the one the caller meant.
+        endpoint: The request the reply answered (``"ping"`` / ``"get_action"``
+            / ``"reset"``), so a caller with several round-trips behind it knows
+            which one came back unreadable.
+        problem: What is wrong with the frame, in the server's own vocabulary.
+        frame: The raw reply, quoted from the front so an operator can recognise
+            a wire format - an HTTP error page, JSON, a bare msgpack scalar.
+
+    Returns:
+        A message naming the peer, the endpoint, the problem, the frame's opening
+        bytes, and the remedy.
+    """
+    return (
+        f"{_SERVER_NAME} at {uri} answered {endpoint!r} with an unreadable reply: "
+        f"{problem}; it begins {frame[:60]!r}. A peer that answers here in another wire "
+        f"format is not a GR00T policy server: check the port serves "
+        f"gr00t.policy.server_client.PolicyServer (msgpack REQ/REP over ZMQ, as started by "
+        f"gr00t.eval.run_gr00t_server) and not another policy server "
+        f"(strands_robots.inference.server speaks JSON over WebSocket)."
+    )
 
 
 class Gr00tInferenceClient:
@@ -181,7 +297,72 @@ class Gr00tInferenceClient:
             logger.debug("Ping failed: %s", exc)
             return False
 
-    def call_endpoint(self, endpoint: str, data: dict | None = None) -> dict:
+    def _decode_reply(self, message: bytes, endpoint: str) -> dict | list:
+        """Decode one server reply into a map or a list, or refuse it naming the peer.
+
+        Both refusals replace a report that names the codec, or no report at all,
+        with one that names the peer and the endpoint. Bytes that are not msgpack
+        raised ``ExtraData: unpack(b) received extra data.`` from inside
+        ``msgpack``, which names neither the host, the port nor the request it
+        answered. A value that decodes but is neither a map nor a list was worse
+        than that: ``"error" in response`` is a membership test, so a string
+        answers it ``False`` without raising and was returned as the declared
+        ``dict``, to fail one frame later in
+        MODULE strands_robots.policies.groot.policy with ``AttributeError: 'str'
+        object has no attribute 'items'``; an ``int`` or ``nil`` raised
+        ``TypeError: argument of type 'int' is not iterable`` from the test
+        itself; and a string that happens to contain ``"error"`` took the
+        server-error branch and raised ``TypeError: string indices must be
+        integers`` - three reports for one wire fault, none naming the server.
+
+        A list is admitted because the reference server sends one:
+        ``gr00t.policy.server_client.PolicyServer`` packs each handler's return
+        value as-is, and ``get_action`` returns ``(action, info)``, which msgpack
+        carries as a 2-element list. :meth:`get_action` unpacks that shape.
+
+        ``ConnectionError`` needs no private subclass here, unlike the WebSocket
+        clients in this package: nothing between this seam and the caller catches
+        ``OSError``, and ``zmq.Again`` is not one, so no broad clause can clobber
+        the report on its way out. :meth:`ping` still absorbs it, which is that
+        method's contract - any failure means "not reachable" - and
+        ``Gr00tPolicy.reset`` still logs it and continues, which is its.
+
+        Args:
+            message: The raw reply frame, treated as opaque.
+            endpoint: The request it answered, named in the report.
+
+        Returns:
+            The decoded reply, a map or a list.
+
+        Raises:
+            ConnectionError: If *message* is not exactly one msgpack object, or
+                decodes to a value that is neither a map nor a list. The codec
+                failure is kept as the cause of the former.
+        """
+        uri = f"tcp://{self.host}:{self.port}"
+        try:
+            reply = MsgSerializer.from_bytes(message)
+        except (TypeError, ValueError) as exc:
+            raise ConnectionError(
+                _unreadable_reply(
+                    uri=uri,
+                    endpoint=endpoint,
+                    problem=f"not msgpack ({type(exc).__name__}: {exc})",
+                    frame=message,
+                )
+            ) from exc
+        if not isinstance(reply, dict | list):
+            raise ConnectionError(
+                _unreadable_reply(
+                    uri=uri,
+                    endpoint=endpoint,
+                    problem=f"expected a msgpack map or list, got {type(reply).__name__}",
+                    frame=message,
+                )
+            )
+        return reply
+
+    def call_endpoint(self, endpoint: str, data: dict | None = None) -> dict | list:
         """Send a request to the server and return the parsed response.
 
         Args:
@@ -189,9 +370,19 @@ class Gr00tInferenceClient:
             data: Optional request payload.
 
         Returns:
-            Parsed response dict from the server.
+            Parsed response from the server: a dict for every endpoint the
+            reference server registers except ``get_action``, whose
+            ``(action, info)`` tuple arrives as a 2-element list.
 
         Raises:
+            ConnectionError: If no reply arrived within ``timeout_ms`` - the
+                report names the URI, the endpoint, the budget and, from a TCP
+                probe, whether anything is listening there (see
+                :func:`unreachable_server_error`); ``zmq.Again`` is kept as the
+                cause. Pre-fix that ``zmq.Again`` escaped raw, so the runner
+                printed ``Policy failed: Resource temporarily unavailable`` -
+                no host, no port, no remedy. Or if the reply is neither a
+                msgpack map nor a list - see :meth:`_decode_reply`.
             RuntimeError: If the server returns an error response.
         """
         request: dict = {"endpoint": endpoint}
@@ -199,10 +390,25 @@ class Gr00tInferenceClient:
             request["data"] = data
         if self.api_token:
             request["api_token"] = self.api_token
-        self.socket.send(MsgSerializer.to_bytes(request))
-        message = self.socket.recv()
-        response = MsgSerializer.from_bytes(message)
-        if "error" in response:
+        try:
+            self.socket.send(MsgSerializer.to_bytes(request))
+            message = self.socket.recv()
+        except self._zmq.Again as exc:
+            # A REQ socket that timed out is stuck in its send/recv lockstep:
+            # the next ``send`` raises EFSM. Re-create it here so the caller's
+            # retry (or ``ping``) is a real attempt and not a second failure
+            # about the state machine.
+            self.reconnect()
+            raise ConnectionError(
+                unreachable_server_error(
+                    uri=f"tcp://{self.host}:{self.port}",
+                    endpoint=endpoint,
+                    timeout_ms=self.timeout_ms,
+                    listener=_listener_present(self.host, self.port),
+                )
+            ) from exc
+        response = self._decode_reply(message, endpoint)
+        if isinstance(response, dict) and "error" in response:
             raise RuntimeError(f"Server error: {response['error']}")
         return response
 
@@ -217,15 +423,31 @@ class Gr00tInferenceClient:
         The server returns ``(action, info)`` as a 2-tuple (msgpack-ed to a
         2-element list); we return just the action dict since the info dict
         is currently empty in all upstream embodiments.
+
+        Raises:
+            ConnectionError: If the reply is a list that is not ``(action, info)``
+                - a length other than 2, or a first element that is not a map.
+                Pre-fix such a list was returned as the declared action dict and
+                failed one frame later on ``.items()``, naming the Python type
+                and not the server. The wire-level refusals are
+                :meth:`_decode_reply`'s.
         """
         response = self.call_endpoint("get_action", {"observation": observations, "options": None})
+        # Older / custom servers may return the bare action dict.
+        if isinstance(response, dict):
+            return response
         # N1.6/N1.7 servers return a (action_dict, info_dict) tuple - msgpack
-        # decodes tuples as lists, so we may see either shape here.
-        if isinstance(response, list | tuple) and len(response) == 2:
+        # decodes tuples as lists, so this is the shape the reference server sends.
+        if len(response) == 2 and isinstance(response[0], dict):
             action, _info = response
             return action
-        # Older / custom servers may return the bare action dict.
-        return response
+        raise ConnectionError(
+            f"{_SERVER_NAME} at tcp://{self.host}:{self.port} answered 'get_action' with a list this "
+            f"client cannot read as an action chunk: expected (action, info) - a 2-element list whose "
+            f"first element is a map - or a bare action map, got a list of {len(response)} whose elements "
+            f"are {[type(item).__name__ for item in response]}. Check the port serves "
+            f"gr00t.policy.server_client.PolicyServer and not another msgpack REQ/REP service."
+        )
 
     def __del__(self):
         # The socket is created with LINGER=0 (see _init_socket) so close()

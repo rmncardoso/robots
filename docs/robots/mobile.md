@@ -16,25 +16,9 @@ sim = Robot("crazyflie")        # Bitcraze Crazyflie 2 quadcopter
 
 ## Catalog
 
-| Name | Description | Joints | Aliases |
-|------|-------------|-------:|---------|
-| `aliengo` | Unitree Aliengo Quadruped (12-DOF) | 13 | `unitree_aliengo` |
-| `anymal_b` | ANYbotics ANYmal B Quadruped (12-DOF) | 13 | `anybotics_anymal_b` |
-| `anymal_c` | ANYbotics ANYmal C Quadruped (12-DOF) | 13 | `anybotics_anymal_c` |
-| `crazyflie` | Bitcraze Crazyflie 2 Nano-Quadcopter | 1 | `cf2`, `bitcraze_crazyflie` |
-| `earthrover` | EarthRover Mini Plus (mobile outdoor navigation) _(hardware-only, no sim asset)_ | ? | `earth_rover`, `earthrover_mini_plus`, `frodobots` |
-| `go1` | Unitree Go1 Quadruped (12-DOF) | 13 | `unitree_go1` |
-| `google_robot` | Google Robot (mobile base + arm, RT-X) | 10 | `oxe_google` |
-| `lekiwi` | LeKiwi mobile manipulator (6-DOF arm on 3-omniwheel base, 9 actuators) | 9 | - |
-| `lekiwi_client` | LeKiwi networked client (drives a remote LeKiwi host over ZMQ) _(hardware-only, no sim asset)_ | ? | `lekiwi_remote`, `lekiwi_net` |
-| `robot_soccer_kit` | Robot Soccer Kit (multi-robot soccer, 65-DOF total) | 65 | `rsk` |
-| `skydio_x2` | Skydio X2 Autonomous Drone | 1 | - |
-| `spot` | Boston Dynamics Spot (with arm) | 20 | `boston_dynamics_spot` |
-| `stretch` | Hello Robot Stretch (original, mobile manipulator) | 18 | `hello_robot_stretch_original` |
-| `stretch3` | Hello Robot Stretch 3 (mobile manipulator) | 41 | `hello_robot_stretch`, `hello_robot_stretch_3` |
-| `tiago_dual` | PAL Robotics TIAGo++ Dual-Arm Mobile (26-DOF) | 26 | `tiago++`, `pal_tiago_dual` |
-| `unitree_a1` | Unitree A1 Quadruped | 13 | `a1` |
-| `unitree_go2` | Unitree Go2 Quadruped | 40 | `go2` |
+Every robot in this family, generated from `robots.json` at build time. Renders are MuJoCo sim renders, never hardware photos.
+
+{{robot_cards:mobile, mobile_manip, aerial}}
 
 ## Flying a real Crazyflie
 
@@ -97,26 +81,6 @@ quadcopter has no joints for a manipulation policy's action to land on. Telemetr
 (`stateEstimate` position, `stabilizer` attitude, `pm.vbat`) is cached for the mesh; a bare
 Crazyflie has no ranger deck, so no lidar topic is published.
 
-## Featured renders
-
-### `spot`
-
-![spot](../assets/sim_render_spot.png){ width=400 }
-
-_Boston Dynamics Spot (with arm)_
-
-### `stretch3`
-
-![stretch3](../assets/sim_render_stretch3.png){ width=400 }
-
-_Hello Robot Stretch 3 (mobile manipulator)_
-
-### `unitree_go2`
-
-![unitree_go2](../assets/sim_render_unitree_go2.png){ width=400 }
-
-_Unitree Go2 Quadruped_
-
 ## Real hardware: the Go2 native driver
 
 The Go2 has no lerobot robot type, so `mode="real"` builds the native CycloneDDS
@@ -132,6 +96,11 @@ go2.release_sport_mode()       # hands the legs over - see below
 go2.send_action({"FL_calf_joint": -1.5})
 ```
 
+The driver talks CycloneDDS through `unitree_sdk2py`, a vendor SDK that is not
+an extra of this project; the install recipe per platform is in
+[Installing the Unitree SDK](humanoids.md#installing-the-unitree-sdk), and a
+missing SDK is refused with that recipe rather than only its module name.
+
 Two Go2 specifics are worth knowing before writing a controller.
 
 **Sport mode must be released first.** The Go2 ships with an onboard sport-mode
@@ -139,7 +108,17 @@ service driving the legs. Until it is released, a `rt/lowcmd` frame puts that
 controller and your commands on the same twelve motors, so every write path
 (`send_action`, `run_policy`, `start_task`) refuses until `release_sport_mode()`
 confirms the robot reports no active mode. Releasing is deliberately *not* a side
-effect of `connect_eagerly()`, which only subscribes to read.
+effect of `connect_eagerly()`, which only subscribes to read. The release is
+asynchronous, so `release_sport_mode(attempts=N)` polls: N release-then-verify
+rounds, each release followed by the `CheckMode()` read that confirms it, and a
+refusal names the mode that last read reported.
+
+The gate follows the last reading rather than the first success. The write path
+reads a cached verdict so it stays usable at 500 Hz, and nothing else re-asks the
+robot, so a Go2 that re-enters a motion mode - the app, a fall-recovery, an
+operator's remote - is only noticed by the next `release_sport_mode()`. A release
+that reads a mode still holding the legs therefore shuts the gate again, and
+`send_action` refuses (naming that mode) until a release confirms an empty one.
 
 **Actions are keyed by joint name, never by index.** `rt/lowcmd`'s `motor_cmd`
 array follows Unitree's `LegID` order - front-right, front-left, rear-right,
@@ -237,6 +216,14 @@ out-of-range magnitude at full speed, which is exactly what a caller writing the
 percent scale needs to be told about: `linear=1` and `linear=100` are the same command once
 both saturate. `lamp` is read as a boolean rather than for truthiness, so `lamp="off"`
 is refused instead of switching the headlamp on.
+
+The `sensors` summary reads the lamp the same way. The SDK carries the field as the `1`/`0`
+that `lamp` write puts on the wire, so those integers and the two booleans are the readings;
+anything else - a firmware that no longer carries `lamp`, or one that spells it `"off"` -
+reads `?`, like every other field the snapshot does not carry. Read for truthiness the
+summary answered for the rover: a dropped field reported the headlamp *off* and the string
+`"off"` reported it *on*. The whole `/data` block beside the summary is unchanged, so a
+caller that wants the raw field still reads it.
 
 Every endpoint - including `POST /control`, which *drives* - is built from that one
 string, so it has to address the host you wrote. A value whose authority names one host

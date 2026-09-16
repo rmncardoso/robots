@@ -15,7 +15,7 @@ interoperates with Humble, Jazzy, Rolling, and beyond.
 | | `use_ros` | `use_rtps` |
 |---|-----------|------------|
 | Role | client / observer | **participant / robot** |
-| Backend | in-process `rclpy` | `cyclonedds` (pip wheel) |
+| Backend | in-process `rclpy` | `cyclonedds` (pip wheel; source build on Linux aarch64) |
 | Needs sourced ROS 2 | yes | **no** |
 | Type coverage | any installed interface | curated IDL bundle |
 | Runs on macOS / CI bare | no (needs ROS) | **yes** |
@@ -26,8 +26,40 @@ robot** - publishing topics a real ROS 2 stack (rviz, nav2, a teleop node) will
 consume, indistinguishable from hardware on the wire.
 
 ```bash
-pip install 'strands-robots[ros2]'   # cyclonedds - a self-contained wheel
+pip install 'strands-robots[ros2]'   # cyclonedds - a self-contained wheel on macOS / Windows / Linux x86_64
 ```
+
+### Linux aarch64 (Jetson)
+
+No cyclonedds release publishes a Linux aarch64 wheel (checked against every
+release on PyPI), so on a Jetson, a Thor dev kit or a humanoid's onboard PC the
+same command resolves to the **sdist**, and its build needs an existing Cyclone
+DDS C install pointed at by `CYCLONEDDS_HOME` (plus `python3-dev`). Two ways to
+have one:
+
+```bash
+# (a) a sourced ROS 2 distro already ships it
+sudo apt install ros-$ROS_DISTRO-cyclonedds
+CYCLONEDDS_HOME=/opt/ros/$ROS_DISTRO pip install 'strands-robots[ros2]'
+
+# (b) no ROS 2 on the box: build Cyclone DDS from source (ENABLE_TYPELIB stays ON)
+git clone https://github.com/eclipse-cyclonedds/cyclonedds
+cmake -S cyclonedds -B cyclonedds/build -DCMAKE_INSTALL_PREFIX=$HOME/cyclonedds
+cmake --build cyclonedds/build --target install
+export CYCLONEDDS_HOME=$HOME/cyclonedds     # keep it set at runtime too - add to ~/.bashrc
+pip install 'strands-robots[ros2]'
+```
+
+At runtime the binding locates `libddsc` itself, trying a wheel's bundled copy,
+then `$CYCLONEDDS_HOME/lib`, then the normal loader path. So keep
+`CYCLONEDDS_HOME` exported whenever the install prefix is somewhere the loader
+does not already search - route (b)'s `$HOME/cyclonedds`, or
+`/opt/ros/$ROS_DISTRO` in a shell that has not sourced the distro. Install to the
+default `/usr/local` prefix instead and `ldconfig` finds `libddsc.so.0`, so the
+import needs no variable at all. If `CYCLONEDDS_HOME` *is* set it must be
+correct: the loader raises `CycloneDDSLoaderException: Failed to load CycloneDDS
+library from <CYCLONEDDS_HOME>/lib/libddsc.so` instead of falling back to the
+system path, so a stale export breaks an install that would otherwise work.
 
 ## Actions
 
@@ -102,7 +134,7 @@ and DDS reports a type mismatch as silence rather than as an error.
 ## Examples
 
 ```python
-from strands_robots.tools import use_rtps
+from strands_robots import use_rtps
 
 use_rtps(action="status")
 use_rtps(action="types")
@@ -160,9 +192,11 @@ a single pip wheel, no rclpy and no sourced distro:
 ```python
 from strands_robots import Robot
 
-# rclpy-free: publishes /so101/joint_states (+ camera image_raw) and subscribes
-# /so101/joint_command -> send_action, all over cyclonedds RTPS.
-arm = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps")
+# rclpy-free: publishes /so101/joint_states (+ camera image_raw) over cyclonedds
+# RTPS. Telemetry-only: the inbound /so101/joint_command -> send_action surface
+# (ros2_commands=True, the default) drives the arm, so on this transport it needs
+# the dds_security_config or explicit opt-out described below to start.
+arm = Robot("so101", mode="real", ros2_bridge=True, ros2_transport="rtps", ros2_commands=False)
 ```
 
 The two transports emit byte-identical topics, so a real ROS 2 node (or
@@ -171,7 +205,7 @@ The two transports emit byte-identical topics, so a real ROS 2 node (or
 ```bash
 ros2 topic echo /so101/joint_states     # decodes the cyclonedds-published JointState
 ros2 topic pub --once /so101/joint_command sensor_msgs/msg/JointState \
-  '{name: ["shoulder_pan.pos"], position: [0.1]}'   # drives the arm
+  '{name: ["shoulder_pan.pos"], position: [0.1]}'   # drives the arm once commands are on (below)
 ```
 
 The trade-off is the same as `use_rtps`: type coverage is bounded by the IDL
@@ -204,9 +238,9 @@ gated. Because this gate branches on the same flag, `enable_commands` /
 `ros2_commands` is checked rather than read by truthiness: a non-boolean is
 refused before any DDS state exists, so a `"false"` from a deployment config
 cannot be reported back as "an enabled command bridge" and answered with the
-insecure opt-out that would open it. `dds_security_config` requires the following keys (each a path or a
-`file:` / `data:` URI per the OMG DDS-Security spec); `permissions_ca` is
-optional:
+insecure opt-out that would open it. `dds_security_config` requires the following keys (each a **non-empty string**:
+a path or a `file:` / `data:` URI per the OMG DDS-Security spec); `permissions_ca`
+is optional, and held to the same domain when supplied:
 
 ```python
 from strands_robots import Robot
@@ -230,7 +264,11 @@ arm = Robot(
 The credentials are wired into the cyclonedds `DomainParticipant` QoS together
 with the builtin DDS-Security plugins, so **both** the outbound telemetry and the
 inbound command surface ride an authenticated, access-controlled graph. A
-half-filled config is rejected at construction.
+half-filled config is rejected at construction, and so is a well-shaped one whose
+credential is not a string: the participant carries a property per credential, so
+a `None` would be dropped (auth plugin loaded, no private key) and a `bytes` path
+spelled as its `repr`. The refusal names the key and what arrived
+(`{'private_key': 'NoneType'}`), and no participant is created.
 
 `dds_security_config` is RTPS-specific: passing it with `ros2_transport="rclpy"`
 raises, because the rclpy backend gets its DDS Security from the ROS 2 RMW

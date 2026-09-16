@@ -65,7 +65,7 @@ import numpy as np
 from strands_robots.locomotion_envelope import target_velocity_component_error
 from strands_robots.policies._log_safety import sanitize_log_value
 from strands_robots.policies.base import Policy
-from strands_robots.utils import finite_number_error, require_optional, sequence_length
+from strands_robots.utils import boolean_flag_error, finite_number_error, require_optional, sequence_length
 
 from .config import _DEFAULT_CMD_SCALE, WBCConfig
 from .control import compute_targets, pd_control, projected_gravity
@@ -192,7 +192,11 @@ class WBCPolicy(Policy):
             directory.
         walk: When ``True`` (default) load and prefer the walk policy
             (``walk_policy_path``) for forward locomotion. When ``False`` only
-            the main policy is loaded/used.
+            the main policy is loaded/used. A boolean, checked rather than read
+            by truthiness - it selects a posture rather than scaling a
+            quantity, so a truthy spelling of off (``"false"``, ``"no"``,
+            ``"0"``) is refused rather than selecting the locomotion posture
+            the word asks to skip.
         target_velocity: Optional constructor-time default locomotion command
             ``[vx, vy, omega]`` (m/s, m/s, rad/s). Used when a call supplies no
             ``target_velocity`` kwarg - this is how a *static* walk works
@@ -204,7 +208,12 @@ class WBCPolicy(Policy):
             construction. Assignment is the only route: ``**kwargs`` below
             absorbs unknown keywords, so a session passed to this constructor is
             dropped. Production callers leave this ``False`` so a missing
-            checkpoint fails loudly at construction.
+            checkpoint fails loudly at construction. Checked with
+            :func:`~strands_robots.utils.boolean_flag_error` like ``walk``: it
+            selects a posture, and read by truthiness a string spelling of
+            ``False`` selected the seam, so the eager load the caller asked for
+            was skipped and the missing checkpoint surfaced only at the first
+            ``get_actions`` - as a refusal advising the value they had passed.
         **kwargs: Forward-compatibility absorber for the smart-string / registry
             resolution path. Per the #300 contract, providers MUST ignore
             unknown kwargs rather than raising.
@@ -212,7 +221,8 @@ class WBCPolicy(Policy):
     Raises:
         RuntimeError: If ``onnxruntime`` is missing, or a checkpoint file is
             absent, when ``allow_missing_models`` is ``False``.
-        ValueError: If the resolved config dimensions are inconsistent.
+        ValueError: If ``walk`` or ``allow_missing_models`` is not a boolean,
+            or the resolved config dimensions are inconsistent.
     """
 
     def __init__(
@@ -224,7 +234,19 @@ class WBCPolicy(Policy):
         allow_missing_models: bool = False,
         **kwargs: Any,
     ) -> None:
-        self._walk = bool(walk)
+        # Checked rather than coerced with bool(): the two values select
+        # postures - load and prefer the walk policy, or run the balance policy
+        # alone - and bool() is where "false", a spelling of the balance-only
+        # posture, became the locomotion one. See boolean_flag_error.
+        if error := boolean_flag_error(walk, "walk", "WBCPolicy"):
+            raise ValueError(error)
+        # Same domain for the seam flag in the same signature. Read by
+        # truthiness, "false" took the `allow_missing_models` branch below, so
+        # the eager load this spelling asks for was skipped and the refusal
+        # arrived one call later, naming the value the caller had passed.
+        if error := boolean_flag_error(allow_missing_models, "allow_missing_models", "WBCPolicy"):
+            raise ValueError(error)
+        self._walk = walk
         self._robot_state_keys: list[str] = []
         self._warned_no_velocity = False
         self._default_command = self._validate_velocity(target_velocity) if target_velocity is not None else None

@@ -49,9 +49,11 @@ from typing import Any
 
 import pytest
 
-from strands_robots.training.base import Trainer
-from strands_robots.training.sagemaker import _FORWARDED_FIELDS
-from tests.training._spec_field_reads import reads_spec_field
+pytest.importorskip("psutil")
+
+from strands_robots.training.base import Trainer  # noqa: E402
+from strands_robots.training.sagemaker import _FORWARDED_FIELDS  # noqa: E402
+from tests.training._spec_field_reads import reads_spec_field  # noqa: E402
 
 # The gates whose scope is a field rather than every backend, mapped to the
 # TrainSpec fields each owns. The learning-rate gate is deliberately absent: no
@@ -67,6 +69,11 @@ FIELD_SCOPED_GATES: dict[str, tuple[str, ...]] = {
     # reader scan AND on the forwarded set below.
     "_resume_problems": ("resume",),
     "_streaming_problems": ("streaming",),
+    # The three RL posture gates. Their fields live on ``RLTrainSpec`` and no
+    # provider forwards them, so they are graded on the reader scan only.
+    "_observation_normalization_problems": ("normalize_obs",),
+    "_advantage_normalization_problems": ("normalize_advantage",),
+    "_temperature_autotune_problems": ("autotune_alpha",),
     "_launch_topology_problems": ("num_gpus", "num_nodes"),
     # The RL run-size gate. Its two fields live on ``RLTrainSpec`` and no
     # provider forwards them, so it is graded on the reader scan only.
@@ -260,6 +267,7 @@ class TestEveryFieldScopedGuardSeesBothFormsOfARead:
             "test_gradient_clip_domain.py",
             "test_initial_temperature_domain.py",
             "test_launch_topology_domain.py",
+            "test_learning_starts_count_domain.py",
             "test_lora_hyperparameter_domain.py",
             "test_loss_weight_domain.py",
             "test_network_width_domain.py",
@@ -270,6 +278,7 @@ class TestEveryFieldScopedGuardSeesBothFormsOfARead:
             "test_rl_run_size_domain.py",
             "test_rl_checkpoint_interval_domain.py",
             "test_rl_replay_domain.py",
+            "test_rl_posture_flag_domain.py",
             "test_seed_domain.py",
             "test_target_entropy_domain.py",
             "test_td3_noise_domain.py",

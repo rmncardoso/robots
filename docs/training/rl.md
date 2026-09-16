@@ -11,7 +11,14 @@ the only path to a locomotion / whole-body-control policy where no expert
 trajectories exist.
 
 RL trainers live in `strands_robots.training.rl` and are selected through the
-**same** `create_trainer` factory:
+**same** `create_trainer` factory. They compute in torch, and the environment
+adapters step a MuJoCo `SimEngine`, so install the `[rl]` extra first (it folds
+`[sim-mujoco]` in, and `gymnasium` for the `GymSimEnv` wrapper that presents a
+`SimEnv` to external RL libraries):
+
+```bash
+pip install 'strands-robots[rl]'
+```
 
 ```python
 from strands_robots.training import create_trainer
@@ -39,7 +46,22 @@ observation vector from named `get_observation` keys and the step reward from
 any reward terms you pass (each a `Callable[[SimEngine], float]`). It uses the holosoma
 `actor_obs_keys` / `critic_obs_keys` split: the actor sees only deployable
 observations, while the critic may additionally see privileged simulation-only
-keys (asymmetric actor-critic).
+keys (asymmetric actor-critic). The critic observation is `actor_obs_keys`
+followed by each `critic_obs_keys` entry not already among them, so naming a
+privileged key adds to what the critic sees rather than replacing it, repeating
+an actor key adds nothing, and both `None` and `[]` leave the critic symmetric:
+
+```python
+env = SimEnv(
+    engine,
+    actor_obs_keys=["Elbow", "Elbow.vel"],   # what the deployed policy sees
+    critic_obs_keys=["Jaw"],                 # privileged, sim-only, additional
+    reward_terms=[elbow_reach_reward],
+    action_dim=6,
+)
+assert env.actor_obs_keys == ["Elbow", "Elbow.vel"]           # num_actor_obs  == 2
+assert env.critic_obs_keys == ["Elbow", "Elbow.vel", "Jaw"]   # num_critic_obs == 3
+```
 
 ```python
 import strands_robots as sr
@@ -254,7 +276,33 @@ and observation normalization frozen, so its numbers are what a deployed
 `policy.pt` would produce. It returns `num_episodes`, `mean_return`,
 `std_return`, `min_return`, `max_return`, `mean_length`, `success_rate` (the
 fraction of episodes that ended on a genuine terminal via the env's
-`success_fn`, not a time-out) and the per-episode `returns`.
+`success_fn`, not a time-out), the per-episode `returns`, and two fields that say
+whether that rate measured the policy at all.
+
+`success_rate` degenerates to a constant from two opposite directions, and neither
+is visible in the number:
+
+| field | value | what it means | rate it forces |
+| --- | --- | --- | --- |
+| `success_measured` | `False` | the env has no `success_fn`, so nothing can terminate and every episode times out | hard `0.0` |
+| `episodes_successful_at_reset` | `> 0` | the predicate already held at reset, so those episodes terminate on their first step whatever the policy commands | hard `1.0` each |
+
+Both are logged as warnings as well. Read them before trusting `success_rate`: a
+hard `0.0` is indistinguishable from a policy that was scored and failed
+everything, and a hard `1.0` is a rate a policy commanding its own current pose
+earns identically. The second is almost always a threshold on the wrong side of
+the initial state - a placement predicate the object's own spawn satisfies, or a
+lift height below where the object already rests. `SimEnv.step` samples
+`success_fn` only after an applied action, so `evaluate()` samples it once per
+episode at reset to count this; that sample is diagnostic and never fatal, so a
+predicate reading state only a first step establishes is simply not counted.
+
+Neither field changes a returned figure. Domain randomisation legitimately draws
+initial states per episode through `reset_fn`, so a partial
+`episodes_successful_at_reset` is a fact about those draws rather than a broken
+predicate, and silently correcting the rate would hide the misconfiguration that
+produced it. `PolicyRunner.evaluate` and `PolicyRunner.evaluate_benchmark` report
+the same two facts for the same `success_rate`.
 
 `num_episodes` must be a positive integer, checked against the same shared count
 domain as `total_timesteps` / `rollout_steps` / `num_envs`: it is the `range()`
@@ -302,6 +350,29 @@ is `nan` - and failed inside torch's `Normal` constraint.
 separately rather than against that shared domain, because the accepted sets
 differ: PPO parallelizes and accepts any count `>= 1`, while the MuJoCo-backed
 FastSAC is single-env and requires exactly `1`.
+
+Those three factors and `buffer_size` also have to *reach* `learning_starts`, and
+on the two off-policy backends `validate()` checks that they do. The threshold is
+the replay fill the first gradient step waits for, and two counts bound the fill a
+run ever reaches: the step budget it collects,
+`max(1, total_timesteps // steps) * steps`, and the ring buffer's own capacity.
+Either below the threshold takes **zero** gradient steps for the whole run.
+Both halves of that contract - the threshold's own domain plus
+`learning_starts >= batch_size`, and whether the threshold is ever reached - are
+one shared rule rather than a copy in each off-policy backend, so the two report
+them identically.
+`learning_starts >= batch_size` does not cover it - that relation sizes the first
+batch, not the wait for it - so `total_timesteps=20` against
+`learning_starts=32`, and `buffer_size=8` against `learning_starts=16`, each
+returned `[]` from `validate()` and then `status="success"` with a written
+checkpoint and an exported `policy.pt`: the randomly initialized network `setup`
+built, since nothing had trained it. Both are plain positive integers that pass
+every per-field domain, and `buffer_size=1` is the same one-slot buffer as
+`buffer_size=True` - which the count domain already refuses for exactly this
+outcome. Each short count is now reported on its own, naming the threshold it
+cannot reach, so a caller sees every value it has to raise. The relation is asked
+only of counts: a non-count in any operand is left to the gate that names that
+field, rather than described as an unreachable threshold.
 
 `hidden_dims` must be a sequence of positive integer layer widths, checked by
 `validate()` on all three RL backends - each builds every network it trains by
@@ -357,6 +428,21 @@ to an infinity on the first step, and because the temperature multiplies the
 log-probability in the actor loss the resulting checkpoint holds non-finite
 parameters. Both previously reported success. It is inert when
 `autotune_alpha=False`, which builds no temperature optimizer.
+
+The three RL posture flags - `normalize_obs` on every backend,
+`normalize_advantage` on PPO, `autotune_alpha` on FastSAC - are `bool`s on the
+same shared domain as `TrainSpec.resume` and `streaming`, checked by the
+`validate()` of each backend that reads them and by no other. Each selects a
+posture rather than scaling a quantity, and each was read by truthiness where it
+is spent (`... if spec.normalize_obs else None`, `if spec.normalize_advantage:`,
+`if self.autotune_alpha:`), so the spellings a caller reaches for to opt out -
+`"false"`, `"no"`, `"0"` - selected the affirmative branch, and `0` or `None`
+selected the negative one without being a declared spelling of it. Every one
+previously passed `validate()`. `autotune_alpha` is checked **ahead of** the
+`alpha_lr` check it gates, and that check reads the rate only once the flag is a
+usable `True`: `autotune_alpha="false", alpha_lr=-1.0` used to be refused as
+`alpha_lr` - the rate of an optimizer the caller had asked not to build - and is
+now refused as the flag.
 
 `init_alpha` - the temperature that rate moves - must be a positive finite
 number, checked by the same `validate()`. FastSAC stores the temperature's

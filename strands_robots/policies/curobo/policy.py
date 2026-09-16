@@ -74,6 +74,23 @@ from strands_robots.policies._log_safety import sanitize_log_value
 from strands_robots.policies.base import Policy, chunk_count_error
 from strands_robots.utils import name_list_error, require_optional
 
+#: The remedy :meth:`CuroboPolicy._build_motion_gen` hands a caller whose
+#: environment has no ``curobo``. It is a ``system_install=`` remedy, not a pip
+#: line, because neither pip line would supply the module: cuRobo is not
+#: published on PyPI (the ``nvidia-curobo`` package there is an unrelated v0.1
+#: squatter), and the ``[curobo]`` extra is kept empty on purpose so that
+#: ``pip install 'strands-robots[curobo]'`` is a no-op rather than an install of
+#: the squatter - an instruction that reports success and changes nothing is
+#: exactly what ``require_optional`` documents ``system_install`` as replacing.
+CUROBO_SYSTEM_INSTALL_HINT = (
+    "cuRobo is not published on PyPI (the nvidia-curobo package there is an unrelated "
+    "squatter) and the [curobo] extra is empty, so no pip line supplies it.\n"
+    "Install it from the upstream source checkout, then retry:\n"
+    "  git clone https://github.com/NVlabs/curobo.git\n"
+    "  pip install -e ./curobo\n"
+    "cuRobo needs a CUDA-enabled torch; docs/policies/curobo.md has the prerequisites."
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +105,55 @@ _JOINT_NAME_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]*\Z"
 # loudly if a sidecar / config bug returns a multi-megabyte trajectory
 # rather than silently consuming RAM.
 _MAX_TRAJECTORY_WAYPOINTS = 100_000
+
+
+def _trajectory_shape_error(trajectory: list[list[float]]) -> str | None:
+    """Grade an extracted plan as a rectangular block of joint positions.
+
+    :meth:`CuroboPolicy._next_chunk` resolves the joint key names *once* per
+    chunk, from the width of that chunk's first waypoint, and then pairs those
+    keys with every waypoint in it. Those keys are therefore a claim about the
+    first waypoint applied to all the others, so a waypoint the claim does not
+    describe is commanded partially rather than reported: a narrower one leaves
+    its trailing joints uncommanded (they hold, mid-motion), a wider one has its
+    trailing positions dropped, and a waypoint carrying no position at all
+    becomes an empty action dict - a command that moves no joint, inside a
+    non-empty chunk that every downstream ``if not actions`` guard therefore
+    passes.
+
+    A planner's degree-of-freedom count does not change mid-plan, so a plan that
+    is not rectangular is a broken plan and not an executable one. Grading it
+    when it is cached - rather than when a chunk of it is served - is what keeps
+    the refusal ahead of the motion: the offending waypoint may sit in the
+    second or tenth chunk, by which time the arm has already run the first.
+    :meth:`MoveIt2Policy._unpack_trajectory` refuses a positionless waypoint for
+    the same reason.
+
+    Args:
+        trajectory: Extracted ``[T, ndof]`` waypoint rows.
+
+    Returns:
+        A reason naming the first offending waypoint, or ``None`` when every
+        waypoint carries the same non-zero number of joint positions. An empty
+        trajectory is not this function's subject and is graded as ``None``.
+    """
+    if not trajectory:
+        return None
+    width = len(trajectory[0])
+    for index, row in enumerate(trajectory):
+        if not row:
+            return (
+                f"waypoint {index} of {len(trajectory)} carries no joint position; "
+                "a waypoint without a position commands nothing"
+            )
+        if len(row) != width:
+            return (
+                f"waypoint {index} of {len(trajectory)} carries {len(row)} joint positions "
+                f"but waypoint 0 carries {width}; joint key names are resolved from the first "
+                "waypoint, so a waypoint of a different width is commanded partially"
+            )
+    return None
+
 
 # Well-known goal fields (issue #300) an LLM may pack into the natural-language
 # instruction as a JSON object. Doubles as the pre-filter for the fallback
@@ -561,8 +627,11 @@ class CuroboPolicy(Policy):
 
         Lives in its own method so the constructor seam stays clean and
         unit tests can override ``__init__`` paths without touching this
-        path. Importing cuRobo is gated by :func:`require_optional` so
-        the ``[curobo]`` extra is the actionable error.
+        path. Importing cuRobo is gated by :func:`require_optional` with
+        :data:`CUROBO_SYSTEM_INSTALL_HINT` as the remedy - the source
+        checkout, not a pip line: cuRobo is not on PyPI and the
+        ``[curobo]`` extra is empty, so ``pip install
+        'strands-robots[curobo]'`` would exit 0 having changed nothing.
 
         The method name ``_build_motion_gen`` is preserved for parity
         with the legacy 0.7.x test fixtures and external monkeypatches;
@@ -570,12 +639,7 @@ class CuroboPolicy(Policy):
         """
         require_optional(
             "curobo",
-            # cuRobo is NOT on PyPI (the ``nvidia-curobo`` v0.1 package
-            # is an unrelated squatter). Real install is from source:
-            #   git clone https://github.com/NVlabs/curobo.git
-            #   pip install -e ./curobo
-            pip_install="-e git+https://github.com/NVlabs/curobo.git#egg=curobo",
-            extra="curobo",
+            system_install=CUROBO_SYSTEM_INSTALL_HINT,
             purpose="CuroboPolicy motion planning",
         )
         # Import lazily so module load doesn't pay the CUDA-init cost
@@ -663,7 +727,7 @@ class CuroboPolicy(Policy):
         keys = self._resolve_joint_keys(len(rows[0]) if rows else 0)
         actions: list[dict[str, Any]] = []
         for row in rows:
-            actions.append({k: float(v) for k, v in zip(keys, row, strict=False)})
+            actions.append({k: float(v) for k, v in zip(keys, row, strict=True)})
         return actions
 
     def _plan_and_cache(
@@ -765,6 +829,11 @@ class CuroboPolicy(Policy):
                 f"CuroboPolicy got {len(trajectory)} waypoints, exceeds "
                 f"{_MAX_TRAJECTORY_WAYPOINTS} guard. Likely a misconfigured "
                 "interpolation_dt. Refusing to cache."
+            )
+        if error := _trajectory_shape_error(trajectory):
+            raise RuntimeError(
+                f"CuroboPolicy planning failed: {error}, so the plan is not executable. "
+                f"target_pose={target_pose!r}, target_joints={target_joints!r}. Refusing to cache."
             )
         self._cached_trajectory = trajectory
         self._cached_cursor = 0

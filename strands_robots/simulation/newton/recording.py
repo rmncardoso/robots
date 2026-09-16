@@ -36,6 +36,7 @@ from strands_robots.simulation.recording import (
     camera_schema_key_collision_error,
     dataset_recording_option_error,
     dataset_recording_posture_error,
+    recorded_cameras_line,
     undriven_robot_state,
 )
 from strands_robots.utils import camera_schema_key, name_list_error
@@ -272,10 +273,7 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
         # bypass this method, and ``last_dataset_root`` - which
         # ``stop_recording(bucket=...)`` syncs and ``verify_dataset_episodes``
         # reads once the recorder is dropped - named the stale path.
-        from strands_robots.dataset_recorder import resolve_dataset_dir
-
-        dataset_dir = resolve_dataset_dir(repo_id, root)
-        world._backend_state["last_dataset_root"] = str(dataset_dir)
+        dataset_dir = self._stash_dataset_target(repo_id, root)
 
         try:
             (
@@ -324,6 +322,14 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
             # (``arm0__wrist_cam``); an unknown name fails loudly (no silent
             # drop), listing what exists. Scoping filters the ``recording_cameras``
             # tuples so the on_frame hook renders only the selected views.
+            # Scene camera name -> dataset column key, in dataset column order, and
+            # the scene's full camera list. start_recording's reply names the
+            # cameras by their SCENE name (the spelling every camera surface
+            # answers for) and reads "no camera recorded" off the scene rather
+            # than assuming a cause.
+            scene_cameras = [src for src, _safe, _w, _h in recording_cameras]
+            recorded_cameras = {src: safe for src, safe, _w, _h in recording_cameras}
+
             if cameras is not None:
                 raw_to_safe = {src: safe for src, safe, _w, _h in recording_cameras}
                 safe_to_raw = {safe: src for src, safe in raw_to_safe.items()}
@@ -360,6 +366,7 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
                 camera_keys = selected_safe
                 camera_dims = {safe: camera_dims[safe] for safe in selected_safe}
                 recording_cameras = [tpl for tpl in recording_cameras if tpl[0] in selected_raw]
+                recorded_cameras = {safe_to_raw[safe]: safe for safe in selected_safe}
 
             world._backend_state["recording_cameras"] = recording_cameras
 
@@ -384,9 +391,9 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
                 logger.info("Resuming existing dataset for append: %s", dataset_dir)
                 resumed = _DatasetRecorder.resume(repo_id=repo_id, root=root, task=task, vcodec=vcodec)
                 self._verify_resume_schema(resumed, state_names_full, camera_keys, camera_dims, fps=fps)
-                world._backend_state["dataset_recorder"] = resumed
+                recorder = resumed
             else:
-                world._backend_state["dataset_recorder"] = _DatasetRecorder.create(
+                recorder = _DatasetRecorder.create(
                     repo_id=repo_id,
                     fps=fps,
                     robot_type=robot_type,
@@ -401,13 +408,15 @@ class NewtonRecordingMixin(DatasetRecordingMixin):
                     video_width=self.default_width,
                     video_height=self.default_height,
                 )
+            resumed_line = self._arm_dataset_recorder(world._backend_state, recorder, resumed=resume_existing)
             return {
                 "status": "success",
                 "content": [
                     {
                         "text": (
                             f"Recording Newton scene to LeRobotDataset: {repo_id}\n"
-                            f"{len(joint_names)} joints, {len(camera_keys)} cameras @ {fps}fps\n"
+                            f"{resumed_line}"
+                            f"{recorded_cameras_line(joint_names, recorded_cameras, scene_cameras, cameras, fps)}"
                             f"Codec: {vcodec} | Task: {task or '(set per policy)'}\n"
                             f"Run policies to capture frames, then stop_recording to save the episode"
                         )

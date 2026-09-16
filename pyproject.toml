@@ -232,11 +232,16 @@ microduck = [
     # Pollen Microduck locomotion policies - ONNX actors with the input
     # normaliser fused into the exported graph. onnxruntime runs the graph;
     # the provider self-configures from the ONNX metadata, so nothing else is
-    # needed to load a weight file. Weights are NOT bundled - they ship in
-    # Pollen's microduck repo under policies/*.onnx. A MuJoCo rollout uses the
-    # separate [sim-mujoco] extra. See strands_robots/policies/microduck/ and
-    # docs/policies/microduck.md.
+    # needed to load a weight file. Weights are NOT bundled - Pollen publishes
+    # them on the Hub at pollen-robotics/microduck-policies (the policies/
+    # directory of their git repo is gone), and huggingface_hub fetches a bare
+    # weight name from there. A MuJoCo rollout uses the separate [sim-mujoco]
+    # extra. See strands_robots/policies/microduck/ and docs/policies/microduck.md.
     "onnxruntime>=1.17.0,<2.0.0",
+    # Floor 1.5 for the same reason as [wbc]: hf_hub_download is old, but every
+    # other extra that reads the Hub already pins this window, so one resolver
+    # window for the whole install.
+    "huggingface_hub>=1.5,<2.0.0",
 ]
 # Bitcraze client library for the Crazyflie 2.x native driver: CRTP over a
 # Crazyradio dongle (or the USB cable), the commander/high-level-commander
@@ -398,6 +403,19 @@ sim = [
     # tests/test_robot_descriptions_floor_ships_the_registry_modules.py owns
     # the number and derives it from the registry; keep the two in step.
     "robot_descriptions>=1.23.0,<2.0.0",
+]
+# From-scratch RL (strands_robots.training.rl: PPO, FastSAC, FastTD3, the
+# SimEnv/VecSimEnv adapters and the GymSimEnv wrapper). torch is what every
+# trainer and the replay buffer compute in; gymnasium is what GymSimEnv presents
+# a SimEnv as, for external RL libraries. Both were previously reachable only
+# through other extras (torch via kimodo / lerobot, gymnasium via lerobot), so
+# `create_trainer("ppo")` on any install without one of those died on the
+# interpreter's `No module named 'torch'`. The env adapters step a SimEngine,
+# which is why the MuJoCo backend is folded in.
+rl = [
+    "strands-robots[sim-mujoco]",
+    "torch>=2.0.0",
+    "gymnasium>=0.29,<2.0",
 ]
 sim-mujoco = [
     "strands-robots[sim]",
@@ -580,8 +598,19 @@ device-connect = [
 # So, like the [curobo] extra, this stays minimal: it pulls only the
 # pip-installable cyclonedds Python binding (a DDS RMW rclpy can use). Installing
 # this extra does NOT by itself provision ROS 2 - source a real distro first.
+# The ceiling admits the 11.x series because that is where the wheels are:
+# cyclonedds publishes cp37-cp310 wheels up to 0.10.5 and cp310-cp313 wheels from
+# 11.0.1, so under `requires-python = ">=3.12"` every version below 11 resolves
+# to the sdist, whose build needs a CycloneDDS C install (`CYCLONEDDS_HOME`).
+# A ceiling below 11 therefore contradicts the "self-contained pip wheel" this
+# extra exists to deliver. That wheel exists for macOS, Windows and Linux x86_64
+# only: no cyclonedds release publishes a linux aarch64 wheel, so on a Jetson /
+# onboard PC the extra resolves to the sdist and needs a Cyclone DDS C install
+# (CYCLONEDDS_HOME) - docs/rtps-integration.md#linux-aarch64-jetson.
+# `tests/test_lockfile_parity_gate.py` pins that the locked artifact is a wheel,
+# since a resolution inside the declared bounds is what `uv lock --check` grades.
 ros2 = [
-    "cyclonedds>=0.10.2,<1.0.0",
+    "cyclonedds>=0.10.2,<12",
 ]
 # Local-LLM agent path (no API key / no AWS -- the natural choice on an edge
 # device): strands.models.ollama.OllamaModel does a top-level `import ollama`.
@@ -641,6 +670,7 @@ all = [
     "strands-robots[lerobot]",
     "strands-robots[lerobot-async]",
     "strands-robots[sim-mujoco]",
+    "strands-robots[rl]",
     "strands-robots[mesh]",
     "strands-robots[mesh-iot]",
     "strands-robots[device-connect]",
@@ -676,6 +706,14 @@ Changelog = "https://github.com/strands-labs/robots/releases"
 
 [tool.hatch.version]
 source = "vcs"
+
+# The version is read from the nearest tag. Without the --match, git describe
+# picks the nearest tag containing ANY digit, and a clone that also carries a
+# fork's artifact tags (artifact-902-action-keys, artifacts-pc020-obstruction,
+# ...) fails to build outright: "Can't parse version from tag". Only release
+# tags (v0.5.1) carry a version, so only they are candidates.
+[tool.hatch.version.raw-options]
+git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["strands_robots"]

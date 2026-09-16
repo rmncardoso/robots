@@ -42,16 +42,17 @@ import random
 import sys
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from strands_robots._async_utils import _resolve_coroutine
 from strands_robots.dataset_recorder import RecordingFrameError
-from strands_robots.policies.base import collect_required_bodies, resolve_chunk_length
+from strands_robots.policies.base import collect_required_bodies, instruction_not_read_notice, resolve_chunk_length
 from strands_robots.rendering.video import require_clip_encoder
 from strands_robots.simulation.observers import (
     SCHEMA_VERSION as _OBSERVER_SCHEMA_VERSION,
@@ -145,7 +146,8 @@ def set_eval_seed(seed: int) -> None:
     installs that don't have torch (e.g. ``policy_provider="mock"``
     smoke tests).
     """
-    # Local import: base.py imports this module at module level, so reaching the
+    # Local import: ``simulation.base`` imports this module at module level, so
+    # reaching the
     # shared domain from here has to stay deferred - the same convention this
     # module already uses for simulation.benchmark / .recording / .predicates.
     from strands_robots.simulation.base import MAX_EVAL_SEED, randomization_seed_error
@@ -197,6 +199,318 @@ OnFrame = Callable[[int, dict[str, Any], dict[str, Any]], None]
 # Success function: called after each step during evaluate().
 # success_fn(observation) -> bool
 SuccessFn = Callable[[dict[str, Any]], bool]
+
+#: Largest ``k`` reported by :func:`pass_hat_k`. Beyond a handful of consecutive
+#: attempts the estimate is dominated by its own variance on the episode counts an
+#: evaluation actually runs, and a reader who needs more can compute it from
+#: ``n_success`` and ``episodes_completed``, which are both in the same result.
+_PASS_HAT_K_MAX = 8
+
+
+def pass_hat_k(n_completed: int, n_success: int, k_max: int = _PASS_HAT_K_MAX) -> dict[int, float]:
+    """Probability that ``k`` attempts drawn without replacement all succeed.
+
+    A success rate answers "how often does this work". It does not answer "can I
+    rely on it", and for anything driven repeatedly those are different questions:
+    a policy at 60% has a roughly 8% chance of clearing five consecutive attempts.
+    Reporting only the mean invites a deployment decision the mean does not
+    support.
+
+    Estimated as ``C(c, k) / C(n, k)`` for ``c`` successes out of ``n`` completed
+    attempts, which is the unbiased probability that a uniformly drawn ``k``-subset
+    of the attempts observed is all successes. Deliberately not ``success_rate **
+    k``: that form assumes the attempts are independent, and evaluation attempts on
+    one policy and one scene are correlated by construction (a systematic grasp
+    offset fails every attempt, not a fixed fraction of them), so it reports a
+    reliability the run never demonstrated. The subset form makes no independence
+    claim; it only describes the attempts that were run.
+
+    Args:
+        n_completed: Attempts that ran to a verdict. ``k`` above this is undefined
+            rather than zero - a run of 3 attempts says nothing about 5 in a row -
+            so those keys are absent instead of present and misleading.
+        n_success: Attempts among them that succeeded.
+        k_max: Largest ``k`` to report, clamped to ``n_completed``.
+
+    Returns:
+        ``{k: probability}`` for each ``k`` from 1 up to ``min(k_max,
+        n_completed)``. Empty when no attempt completed, since there is nothing to
+        draw a subset from. ``k=1`` equals the success rate by construction, and is
+        included as the anchor that makes the rest of the row readable.
+    """
+    if n_completed <= 0:
+        return {}
+    upper = min(k_max, n_completed)
+    return {
+        k: (0.0 if n_success < k else math.comb(n_success, k) / math.comb(n_completed, k)) for k in range(1, upper + 1)
+    }
+
+
+def action_commands_robot(action: Mapping[str, Any]) -> bool:
+    """Report whether one action from a policy's chunk commands the robot at all.
+
+    An action dict with no keys is handed to ``send_action`` like any other and
+    the backend accepts it, but it names no actuator, so nothing about the robot
+    is commanded by it. It is the per-action form of the empty chunk
+    :func:`uncommanded_eval_error` refuses: physics advances, a step is counted,
+    and no command reaches the robot. A policy reaches it whenever its decode
+    yields a row with no joint values - :meth:`CuroboPolicy._next_chunk` emits one
+    per waypoint when the planner's trajectory rows carry no joint position, since
+    the key list it zips against is then empty too.
+
+    Counting such an action as applied is what makes an evaluation of nothing but
+    those actions indistinguishable, in every published field, from one that
+    commanded every joint. Both rollout surfaces read this rule, and each reports
+    the tally it backs as ``actions_applied``: the evaluation routes refuse the
+    aggregate through :func:`uncommanded_eval_error`, and :meth:`PolicyRunner.run`
+    refuses it beside the total-unresolved refusal it mirrors. ``run``'s
+    per-actuator ``action_resolution_rate`` does not cover it: that map is keyed on
+    the robot's actuators, so a robot declaring none - the shipped ``talos`` and
+    ``asimov_v0`` descriptions both compile that way - contributes an empty map
+    and a ``partial_action_failure_rate`` of ``0.0``, which is what a robot with no
+    resolution problem looks like too.
+
+    Args:
+        action: One action dict from a chunk, as handed to ``send_action``.
+
+    Returns:
+        True when the action names at least one key, so applying it commands the
+        robot; False for an action that commands nothing.
+    """
+    return bool(action)
+
+
+def uncommanded_eval_error(
+    *,
+    surface: str,
+    robot_name: str,
+    episodes_completed: int,
+    steps_advanced: int,
+    actions_applied: int,
+) -> str | None:
+    """Refuse an evaluation that advanced physics without ever commanding the robot.
+
+    Both evaluation routes tolerate a policy call that returns an empty action
+    chunk: they advance one physics step so a degenerate policy cannot hang the
+    episode. That per-step tolerance is right - a policy may legitimately stall
+    for a step. What it does not decide is the aggregate: when EVERY call of an
+    entire evaluation comes back empty, ``send_action`` is never reached, and the
+    reported ``success_rate`` / ``avg_reward`` / ``pass_hat_k`` describe the
+    scene's initial state rather than the policy. Those figures are published
+    into a results table, where they are indistinguishable from a policy that was
+    exercised and scored zero.
+
+    :meth:`PolicyRunner.run` already refuses this condition on the first empty
+    chunk, and :meth:`PolicyRunner.replay` refuses the aggregate of the same
+    condition for a recorded episode whose frames carry no action. This is the
+    rule those two share, stated once for the evaluation routes.
+
+    Args:
+        surface: Public entry point the refusal is reported through, e.g.
+            ``"eval_policy"`` - the caller names itself so the message points at
+            the call the reader made rather than at an internal method.
+        robot_name: Robot the evaluation resolved and never commanded.
+        episodes_completed: Episodes that ran to a verdict. Zero means the
+            evaluation never started an episode, which is a different report
+            (there is no metric to distrust), so it is not refused here.
+        steps_advanced: Control steps the evaluation advanced across those
+            episodes. Zero likewise leaves nothing to have been silent about.
+        actions_applied: Actions that commanded at least one of the robot's
+            keys (see :func:`action_commands_robot`) - not calls made to
+            ``send_action``, which an action commanding nothing reaches too. The
+            refusal fires only when this is zero: a PARTIAL shortfall is real
+            policy behaviour and is reported as a count, not refused, since
+            refusing it would contradict the per-step tolerance above.
+
+    Returns:
+        The refusal text, or ``None`` when the evaluation commanded the robot at
+        least once (or ran no scored step at all).
+    """
+    if actions_applied or not episodes_completed or not steps_advanced:
+        return None
+    return (
+        f"{surface} aborted: the policy never commanded '{robot_name}'. Across "
+        f"{episodes_completed} episode(s) and {steps_advanced} advanced control step(s), every "
+        "policy call returned an empty action chunk, so no action reached the robot and the "
+        "reported metrics describe the scene's initial state rather than the policy. Check that "
+        "the policy decodes an action chunk for this robot's action keys (run_policy refuses the "
+        "same condition on the first empty chunk)."
+    )
+
+
+def success_at_reset_warning(
+    *,
+    surface: str,
+    episodes_completed: int,
+    episodes_successful_at_reset: int,
+    reported: str = "success_rate / pass_hat_k",
+) -> str | None:
+    """Warn that episodes were already successful before the policy acted.
+
+    Both evaluation routes sample the success criterion only AFTER an applied
+    action, so an episode whose criterion already holds at reset succeeds on its
+    first step no matter what the policy commands. ``success_rate`` then reports a
+    hard 1.0 for every such episode regardless of what the policy does - the
+    mirror of the ``success_measured=False`` case, where a missing criterion
+    reports a hard 0.0 and is warned about for the same reason. A rate that a
+    policy commanding its own current pose earns identically is not a measurement
+    of the policy, and in the report it is indistinguishable from one that was
+    exercised and solved the task.
+
+    This is the sibling of :func:`uncommanded_eval_error`, which covers the other
+    route to the same harm: there the policy never commands, here the criterion
+    never needed it. Almost always a threshold on the wrong side of the scene's
+    initial state - a lift predicate whose height sits below where the object
+    already rests, or a placement predicate satisfied by the object's spawn.
+
+    Deliberately a warning and a reported count rather than a refusal. Domain
+    randomisation legitimately draws initial states per episode
+    (``on_episode_start``), so a partial count is a fact about those draws, not a
+    broken spec, and the count is what distinguishes the two. It also leaves
+    every reported figure untouched, the posture :func:`_warn_unresolved` states
+    for a criterion that degrades to a constant: surface the corruption without
+    changing a returned value.
+
+    Args:
+        surface: Public entry point the warning is reported through, e.g.
+            ``"eval_policy"`` - so the message points at the call the reader made.
+        episodes_completed: Episodes that ran to a verdict, for the ratio.
+        episodes_successful_at_reset: Episodes among them whose success criterion
+            already held at reset, before any action was applied.
+        reported: The figures this surface publishes that the count casts doubt on,
+            named so the warning points at fields the reader can actually look up.
+            Defaults to the pair both simulation routes report; a surface that
+            reports only a rate (:meth:`BaseRLAlgo.evaluate`, which has no
+            ``pass_hat_k``) narrows it, because a remedy naming a figure the
+            result does not carry sends the reader looking for nothing.
+
+    Returns:
+        The warning text, or ``None`` when no episode was already successful.
+    """
+    if episodes_successful_at_reset <= 0 or episodes_completed <= 0:
+        return None
+    every = episodes_successful_at_reset >= episodes_completed
+    return (
+        f"{surface}: {episodes_successful_at_reset} of {episodes_completed} episode(s) already "
+        "satisfied the success criterion at reset, before any action was applied, so "
+        f"{'the' if every else 'that part of the'} reported {reported} describes the "
+        "scene's initial state rather than the policy. Check the criterion against the initial "
+        "state (e.g. a lift threshold below the object's resting height); the result "
+        "reports this as episodes_successful_at_reset."
+    )
+
+
+def failure_at_reset_warning(
+    *,
+    surface: str,
+    episodes_completed: int,
+    episodes_failed_at_reset: int,
+) -> str | None:
+    """Warn that episodes were already failed before the policy acted.
+
+    The exact mirror of :func:`success_at_reset_warning`, sampled at the same
+    pre-episode probe and reported the same way. A benchmark spec's ``failure``
+    clause is evaluated only AFTER an applied action, so one that already holds
+    at reset ends the episode on its first step no matter what the policy
+    commands, and ``success_rate`` reports a hard ``0.0`` for every such episode.
+    That is the third route to the hard ``0.0`` this module already reasons about
+    - the other two are a missing criterion (``success_measured=False``) and a
+    ``success`` clause pinned to a constant, both already warned about - and it is
+    the only one reachable through a clause that is entirely well-formed, so no
+    compile-time or name-resolution check can see it: it is a fact about the
+    initial state rather than about the clause.
+
+    It costs more than the success mirror, for a reason particular to where the
+    two clauses are read. The eval loop samples ``is_failure`` BEFORE
+    ``is_success``, so a failure clause true at reset also pre-empts a success the
+    policy would have earned on that step: the episode is scored a failure
+    without the success criterion ever being consulted. In the report it is
+    indistinguishable from a policy that did something catastrophic immediately,
+    which is a legitimate outcome an early-terminating failure clause exists to
+    catch.
+
+    Almost always a threshold on the wrong side of the scene's initial state - a
+    "the object fell" clause whose height sits ABOVE where the object already
+    rests, or a "the base collapsed" clause whose height sits above the robot's
+    spawned stance. The shipped humanoid benchmarks pair a ``base_below_z``
+    collapse line with a per-robot standing height for exactly this reason.
+
+    Deliberately a warning and a reported count rather than a refusal, the same
+    posture as :func:`success_at_reset_warning`: domain randomisation legitimately
+    draws initial states per episode (``on_episode_start``), so a partial count is
+    a fact about those draws rather than a broken spec, and the count is what
+    distinguishes the two. Every reported figure is left as measured.
+
+    Args:
+        surface: Public entry point the warning is reported through, e.g.
+            ``"evaluate_benchmark"`` - so the message points at the call the
+            reader made.
+        episodes_completed: Episodes that ran to a verdict, for the ratio.
+        episodes_failed_at_reset: Episodes among them whose failure criterion
+            already held at reset, before any action was applied.
+
+    Returns:
+        The warning text, or ``None`` when no episode was already failed.
+    """
+    if episodes_failed_at_reset <= 0 or episodes_completed <= 0:
+        return None
+    every = episodes_failed_at_reset >= episodes_completed
+    return (
+        f"{surface}: {episodes_failed_at_reset} of {episodes_completed} episode(s) already "
+        "satisfied the failure criterion at reset, before any action was applied, so "
+        f"{'the' if every else 'that part of the'} reported success_rate / pass_hat_k describes the "
+        "scene's initial state rather than the policy - each such episode ended on its first step "
+        "with the success criterion never consulted. Check the criterion against the initial state "
+        "(e.g. a fall threshold above the object's resting height); the returned json reports this "
+        "as episodes_failed_at_reset."
+    )
+
+
+def stop_when_true_at_reset_warning(*, surface: str) -> str:
+    """Warn that a ``stop_when`` clause already held before the policy acted.
+
+    The clause is evaluated only AFTER an applied action, so one that already
+    holds when the rollout starts fires on the first step no matter what the
+    policy commands. The rollout then reports ``stopped_reason="predicate"``
+    after one step - the field an agent reads to tell "the world reached the
+    goal state" from "the step budget ran out" - and it is indistinguishable
+    from a rollout that actually drove the world there. This is the mirror of
+    the never-fires case guarded at the same pre-rollout probe site, where a
+    clause pinned to a constant ``False`` burns the whole budget reporting
+    ``stopped_reason="budget"``, indistinguishable from an honest miss.
+
+    Almost always a threshold on the wrong side of the scene's initial state -
+    a ``body_above_z`` whose height sits below where the object already rests,
+    or a ``contact_any`` on a body that starts out resting on its support.
+
+    The cost lands hardest on a collection loop, where ``stop_when`` is a
+    per-episode success gate: every episode ends after one step, so the
+    recorded dataset is one frame per episode, each episode tagged as having
+    reached the condition.
+
+    Deliberately a warning and a reported flag rather than a refusal, the same
+    posture as :func:`success_at_reset_warning`. A clause is evaluated against
+    whatever state the caller handed the rollout, and domain randomisation
+    legitimately draws a different initial state per episode, so a clause true
+    for one draw is a fact about that draw rather than a broken clause. It also
+    leaves every reported figure untouched: surface the corruption without
+    changing a returned value.
+
+    Args:
+        surface: Public entry point the warning is reported through, e.g.
+            ``"run_policy"`` - so the message points at the call the reader made.
+
+    Returns:
+        The warning text.
+    """
+    return (
+        f"{surface}: the stop_when clause already held before any action was applied, so the "
+        "rollout ended on its first step and stopped_reason='predicate' describes the scene's "
+        "initial state rather than the policy - indistinguishable from a rollout that drove the "
+        "world to the condition. Check the clause against the initial state (e.g. a body_above_z "
+        "threshold below the object's resting height); the returned json reports this as "
+        "stop_when_true_at_reset."
+    )
 
 
 def _criterion_verdict(
@@ -319,6 +633,25 @@ _VIDEO_KEY_ALIASES: dict[str, tuple[str, ...]] = {
 _VIDEO_ACCEPTED_KEYS: tuple[str, ...] = tuple(sorted(key for aliases in _VIDEO_KEY_ALIASES.values() for key in aliases))
 
 
+def _video_values_agree(first: Any, second: Any) -> bool:
+    """Whether two spellings of one ``video`` field carry the same value.
+
+    Args:
+        first: Value carried by the earlier-listed spelling.
+        second: Value carried by the later one.
+
+    Returns:
+        ``True`` when the two are equal, so resolving the field discards
+        nothing. A pair whose equality is not a single truth value (an array)
+        counts as disagreeing: the discard would be real either way, and naming
+        both keys is the answer a caller can act on.
+    """
+    try:
+        return bool(first == second)
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """Configuration for optional MP4 recording during :meth:`PolicyRunner.run`.
@@ -366,8 +699,10 @@ class VideoConfig:
     def _pick(d: dict[str, Any], field: str, default: Any = None) -> Any:
         """First present, non-``None`` value among ``field``'s accepted keys.
 
-        Looks the canonical key up first, then the legacy aliases, so
-        ``{"path": ..., "output_path": ...}`` resolves to the canonical one.
+        Looks the canonical key up first, then the legacy aliases. Two
+        spellings that carry DIFFERENT values are refused by
+        :meth:`_alias_conflict_error` before this runs, so no value reachable
+        here is discarded.
         Membership - not truthiness - decides: a caller-supplied ``0`` is
         returned as ``0`` (and rejected by :meth:`validation_error`) instead of
         collapsing into ``default`` the way an ``or`` chain would.
@@ -406,6 +741,40 @@ class VideoConfig:
         return positive_whole_number_error(value, key, "video")
 
     @classmethod
+    def _alias_conflict_error(cls, d: dict[str, Any]) -> str | None:
+        """Error text when two spellings of one field carry different values.
+
+        :meth:`_pick` resolves a field by taking the first spelling that carries
+        a value, so a dict naming two of them honors one and discards the other
+        - the silent drop this schema exists to refuse, reached through keys it
+        accepts. A camera named twice recorded the rollout from one of the two
+        views under ``status="success"``; a path named twice wrote one file and
+        left the other absent. Two spellings carrying the SAME value discard
+        nothing and are accepted.
+
+        Args:
+            d: The caller's video-config dict, already known to hold only
+                accepted keys.
+
+        Returns:
+            A message naming both spellings and their values, or ``None`` when
+            no field is spelled twice with a disagreement.
+        """
+        for field, aliases in _VIDEO_KEY_ALIASES.items():
+            carried = [(key, d[key]) for key in aliases if d.get(key) is not None]
+            if len(carried) < 2:
+                continue
+            winner, kept = carried[0]
+            for key, value in carried[1:]:
+                if not _video_values_agree(kept, value):
+                    return (
+                        f"video: {winner!r} and {key!r} are both spellings of {field}, and they "
+                        f"disagree ({kept!r} vs {value!r}); {winner!r} wins, so {key!r} would be "
+                        "discarded. Pass one spelling of it."
+                    )
+        return None
+
+    @classmethod
     def validation_error(cls, d: Any) -> str | None:
         """Error text when ``d`` is not a video config this class can honor.
 
@@ -415,8 +784,13 @@ class VideoConfig:
         leaves ``path`` unset and the rollout reports ``status="success"``
         with no MP4 anywhere, and ``{"path": p, "resolution": [320, 240]}``
         records at the default 640x480 while the caller believes otherwise.
-        This rejects any key outside the accepted set (with a closest-match
-        hint) and any known key whose value cannot be honored.
+        Two accepted spellings of one field are the same drop wearing an
+        accepted key: ``{"camera": "top", "camera_name": "wrist"}`` recorded
+        from ``top`` while the caller had also named ``wrist``, and ``{"path":
+        a, "output_path": b}`` wrote ``a`` and left ``b`` absent. This rejects
+        any key outside the accepted set (with a closest-match hint), any pair
+        of spellings that disagree about one field, and any known key whose
+        value cannot be honored.
 
         Args:
             d: The caller's ``video`` argument. ``None`` (recording off) and an
@@ -441,6 +815,12 @@ class VideoConfig:
             close = difflib.get_close_matches(str(key).lower(), _VIDEO_ACCEPTED_KEYS, n=1, cutoff=0.7)
             hint = f" Did you mean {close[0]!r}?" if close else ""
             return f"video: unknown key {key!r}.{hint} Accepted keys: {accepted}."
+        # Two spellings of one field: the collision is reported rather than
+        # resolved, for the reason an unknown key is. Ahead of the per-field
+        # domains below, because those grade the value that WINS - run after a
+        # collision they would pass over the discarded one in silence.
+        if error := cls._alias_conflict_error(d):
+            return error
         for field in ("path", "camera"):
             value = cls._pick(d, field)
             if value is not None and not isinstance(value, str):
@@ -1694,11 +2074,19 @@ class PolicyRunner:
             ``policy``, ``instruction``, ``n_steps``, ``steps_used`` (the
             control steps actually executed, equal to ``n_steps``),
             ``elapsed_s``, ``stopped_early``, ``stopped_reason``
+                (``"predicate"`` / ``"budget"`` / ``"cancelled"`` / ``"error"``),
+                ``stop_when_true_at_reset`` (bool) and ``stop_when_reset_warning``
             (``"predicate"`` - the ``stop_when`` condition fired; ``"budget"``
             - the step/duration horizon was exhausted; ``"cancelled"`` - a
             cooperative stop, e.g. ``stop_policy``; on ``status="error"``
             results the field is ``"error"``), ``action_errors``,
-            ``video_path`` (``None`` when
+            ``actions_applied`` (actions that commanded at least one of the
+            robot's keys - see
+            :func:`~strands_robots.simulation.policy_runner.action_commands_robot`
+            - which is NOT the number of ``send_action`` calls, since an action
+            naming no key reaches the backend like any other; a rollout whose
+            count is ``0`` never commanded the robot and is returned as
+            ``status="error"``), ``video_path`` (``None`` when
             no MP4 was written), ``video_frames``, ``video_fps`` (the rate the
             MP4 plays at - the requested ``fps`` capped to
             ``control_frequency``, since a rollout renders at most one frame
@@ -1736,6 +2124,13 @@ class PolicyRunner:
         # policy reset/inference or an action from a value that cannot be called.
         if observer_error := optional_callable_error(observer, "observer", "PolicyRunner.run"):
             raise ValueError(observer_error)
+        # The legacy hook carries the same domain, for a sharper reason: an
+        # exception from it is counted against the consecutive-failure watchdog,
+        # so a value that is not callable at all spent five applied actions
+        # before aborting the episode with "aborting silent dataset corruption"
+        # - a message about a recorder, for a caller mistake visible here.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "PolicyRunner.run"):
+            raise ValueError(hook_error)
 
         # A single rollout draws the policy's stochastic ops (VLA action-
         # chunk sampling, diffusion noise) from the unmanaged global RNG, so the
@@ -1750,7 +2145,7 @@ class PolicyRunner:
         # structured envelope to read a refusal from. Same shared rule as
         # SimEngine._validate_seed, raised rather than returned because raising
         # is this layer's contract.
-        # Local import: base.py imports PolicyRunner at module level, so
+        # Local import: ``simulation.base`` imports PolicyRunner at module level, so
         # reaching the shared domain from here has to stay deferred - the
         # same convention this module already uses for
         # simulation.benchmark / simulation.recording / simulation.predicates.
@@ -1896,6 +2291,10 @@ class PolicyRunner:
         # and every error return reports "error".
         stopped_reason: StoppedReason = "budget"
         stop_predicate_fired = False
+        # Whether the caller's stop_when clause ALREADY held before the policy
+        # acted. Sampled once below, beside the per-step check it qualifies; see
+        # :func:`stop_when_true_at_reset_warning`.
+        stop_when_true_at_reset = False
         # T26: skip camera rendering when the policy does not need images.
         _skip_images = not getattr(policy, "requires_images", True)
         # Named-body poses the policy declared it needs (mimic trackers read an
@@ -2128,6 +2527,12 @@ class PolicyRunner:
         # observer event reports it, and setup inside the try (substep derivation,
         # actuator discovery) can raise before the loop assigns it.
         _action_errors = 0  # count send_action failures (unresolved keys)
+        # Actions that commanded at least one key (see ``action_commands_robot``),
+        # NOT completed ``send_action`` calls - ``_applied_actions`` is that, and an
+        # action naming no key reaches the backend like any other. Bound out here
+        # with ``_action_errors`` so the terminal report can read it even when
+        # setup raised before the loop.
+        _actions_commanding = 0
         # Bound before the rollout so the ``except CooperativeStop`` handler and
         # the ``_apply`` closure never see an unbound name, the same reason
         # ``start_mono`` is bound above.
@@ -2256,7 +2661,15 @@ class PolicyRunner:
                     nonlocal step_count, _action_errors, consecutive_onframe_failures
                     nonlocal _total_failure_steps, _coarse_failure_steps, _last_unresolved
                     nonlocal _last_coarse_error, _applied_actions, _known_resolution_steps
+                    nonlocal _actions_commanding
 
+                    # Read BEFORE the send, off the action as the policy emitted it,
+                    # so the tally is a fact about the policy's output rather than
+                    # about a backend verdict. ``action_commands_robot`` is the
+                    # module's rule for the dict form; a numeric vector binds
+                    # positionally to every actuator, so a non-empty one commands.
+                    if action_commands_robot(action_dict) if isinstance(action_dict, Mapping) else len(action_dict) > 0:
+                        _actions_commanding += 1
                     _send_result = self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
                     # ``send_action`` has returned. Count the call here rather than
                     # beside ``step_count`` below so the tally survives a legacy hook
@@ -2478,6 +2891,22 @@ class PolicyRunner:
                         logger.info("stop_when fired at step %d; ending rollout early", step_count)
                     return fired
 
+                # Sample the clause ONCE before the policy acts. The loop below
+                # evaluates it only after an applied action, so a clause that
+                # already holds here fires on the first step whatever the policy
+                # commands - see :func:`stop_when_true_at_reset_warning`.
+                # Diagnostic only: it decides no reported figure and re-tags no
+                # rollout, so unlike the per-step call it is deliberately NOT
+                # fatal on a raise. A clause reading state that the first applied
+                # action would have established has not had one yet, and refusing
+                # the rollout over a probe the rollout never needed would turn a
+                # diagnostic into an outage.
+                if stop_when is not None:
+                    try:
+                        stop_when_true_at_reset = bool(stop_when(self.sim))
+                    except Exception as e:  # noqa: BLE001 - diagnostic, never fatal
+                        logger.debug("stop_when at reset raised %s; not sampled", e)
+
                 # ONE chunk-acquisition seam for the whole module, so a fix to
                 # chunk resolution or to the RTC delay contract lands on every
                 # rollout entry point at once.
@@ -2596,11 +3025,23 @@ class PolicyRunner:
             prefix = "Policy stopped early (stop_when condition met)"
         else:
             prefix = "Policy stopped"
+        _stop_when_reset_warning = (
+            stop_when_true_at_reset_warning(surface="run_policy") if stop_when_true_at_reset else None
+        )
+        if _stop_when_reset_warning is not None:
+            logger.warning("%s", _stop_when_reset_warning)
         text = (
             f"{prefix} on '{robot_name}'\n{type(policy).__name__} | {instruction}\n{elapsed:.1f}s | {step_count} steps"
         )
         if sim_time is not None:
             text += f" | sim_t={sim_time:.3f}s"
+        # A policy that never read the instruction says so beside the
+        # instruction it just echoed, or the line above reads as the task done.
+        _instruction_notice = instruction_not_read_notice(policy)
+        if _instruction_notice is not None:
+            text += f"\n{_instruction_notice}"
+        if _stop_when_reset_warning is not None:
+            text += f"\n{_stop_when_reset_warning}"
         if vwriter is not None:
             assert video is not None
             video_path = vwriter.path
@@ -2637,6 +3078,7 @@ class PolicyRunner:
             "robot_name": robot_name,
             "policy": type(policy).__name__,
             "instruction": instruction,
+            "instruction_read": _instruction_notice is None,
             "n_steps": step_count,
             # Alias of n_steps under the retry-loop name: the control steps
             # actually executed before the rollout ended. Paired with
@@ -2646,7 +3088,16 @@ class PolicyRunner:
             "elapsed_s": round(elapsed, 3),
             "stopped_early": stopped_early,
             "stopped_reason": stopped_reason,
+            # True when the stop_when clause already held before any action was
+            # applied, so stopped_reason="predicate" after one step describes the
+            # scene's initial state rather than the policy. Always present (False
+            # when no clause was given) so callers can rely on the key;
+            # stop_when_reset_warning carries the qualifying text, None otherwise.
+            # Every other reported figure is left as measured.
+            "stop_when_true_at_reset": stop_when_true_at_reset,
+            "stop_when_reset_warning": _stop_when_reset_warning,
             "action_errors": _action_errors,
+            "actions_applied": _actions_commanding,
             "video_path": None,
             "video_frames": 0,
             # The rate the MP4 plays at, which is the requested ``fps`` capped
@@ -2748,6 +3199,47 @@ class PolicyRunner:
             if observer is not None:
                 payload["observer_failures"] = _obs_failures
             return {"status": "error", "content": [{"text": text}, {"json": payload}]}
+        # The mirror of the block above. That one covers a policy that emitted
+        # keys none of which resolved; this one covers a policy that emitted no
+        # key at all. Both leave the robot uncommanded for the whole rollout, but
+        # only the first produces an unresolved key to count, so this one was
+        # reported ``success`` - and every field a caller would gate on reads
+        # healthy: ``action_errors`` is 0 because nothing was refused, and
+        # ``action_resolution_rate`` / ``partial_action_failure_rate`` are keyed on
+        # the robot's actuators, so a robot that has none contributes an empty map
+        # and a 0.0 rate, which is what a robot with no resolution problem looks
+        # like too. Refused on the AGGREGATE only: a single empty action is
+        # legitimate policy behaviour (``action_commands_robot`` states the rule,
+        # and the evaluation routes read it the same way), so the per-step
+        # tolerance is unchanged.
+        if step_count > 0 and _actions_commanding == 0:
+            _n_keys = len(_robot_actuators)
+            text += (
+                f"\n\nALL {step_count} action steps commanded no actuator "
+                f"-- the robot did not move. Every action the policy emitted named "
+                f"no key, so nothing about '{robot_name}' was commanded and every "
+                f"reported figure describes the scene under gravity rather than the "
+                f"policy. "
+                + (
+                    f"'{robot_name}' declares no actuator at all (robot_action_keys "
+                    f"reports 0 keys), so a policy bound to that list can only emit "
+                    f"empty actions: check that the robot's model has an <actuator> "
+                    f"block."
+                    if _n_keys == 0
+                    else f"'{robot_name}' declares {_n_keys} actuator(s) "
+                    f"(robot_action_keys), so check that the policy decodes an action "
+                    f"chunk for them rather than rows carrying no joint value."
+                )
+            )
+            # An error result always reports stopped_reason="error", for the same
+            # reason the sibling refusal above does: the rollout may have run its
+            # full budget, but the outcome is not a retryable "budget" completion.
+            payload["stopped_reason"] = "error"
+            payload["actions_applied"] = _actions_commanding
+            _emit_ended(outcome="error", stopped_reason="error")
+            if observer is not None:
+                payload["observer_failures"] = _obs_failures
+            return {"status": "error", "content": [{"text": text}, {"json": payload}]}
         if _action_errors > 0:
             if _coarse_failure_steps == 0:
                 text += f"\n\n{_action_errors}/{step_count} action steps had unresolved keys."
@@ -2787,10 +3279,15 @@ class PolicyRunner:
 
         Args:
             repo_id: HuggingFace dataset id (e.g. ``lerobot/pusht``).
-            robot_name: Target robot. Defaults to the first robot in the sim
-                when omitted; an explicit name not present in the sim is
-                rejected with a structured error (no silent replay onto a
-                non-existent robot).
+            robot_name: Target robot, resolved by the rule
+                :meth:`~strands_robots.simulation.base.SimEngine.run_policy`
+                and its siblings apply: ``None`` picks the sole loaded robot,
+                and a scene holding several of them returns an error listing
+                the candidates rather than replaying onto the first. A name
+                that IS supplied is never re-resolved, so one the sim does not
+                hold - including an empty string - is rejected with a
+                structured error naming it (no silent replay onto a
+                non-existent robot, or onto one the caller did not choose).
             episode: Episode index in the dataset. Must be a non-negative
                 whole number; any real scalar with an integral value is
                 accepted (including a NumPy scalar such as ``np.int64(2)``),
@@ -2825,8 +3322,16 @@ class PolicyRunner:
             ``"error"`` status when a recorded frame cannot actually be applied
             (unresolvable action keys, or a recorded vector whose width does not
             match the action-key map), reporting how many frames were applied
-            before the abort. A successful status therefore means every frame
-            reached the actuators.
+            before the abort. It aborts for the same reason when NO recorded
+            frame of the episode carried an ``action`` value at all - every
+            frame then takes the tolerated no-action branch, so the loop
+            advances physics and commands nothing, and that named the observed
+            columns rather than reporting a full-fidelity replay. A successful
+            status therefore means at least one recorded action reached the
+            actuators and every frame that carried one was applied; the
+            ``json`` block reports ``frames_with_action`` beside
+            ``frames_applied`` so a caller reads the two counts rather than
+            assuming they are equal.
         """
         # ``speed`` is a playback-rate multiplier used as the divisor in
         # ``frame_interval = 1 / (dataset_fps * speed)`` and, once computed,
@@ -2901,15 +3406,26 @@ class PolicyRunner:
         except ImportError:
             return {"status": "error", "content": [{"text": "lerobot not installed"}]}
 
+        # Resolve by the rule every policy surface shares - ``None`` picks the
+        # sole robot, a scene holding several is refused listing the candidates,
+        # and a name that IS supplied is never re-resolved. The private copy this
+        # replaces read ``robot_name or <first robot>``, so ``""`` (the shape an
+        # unset config value arrives in) was treated as omitted, and a
+        # two-robot scene replayed the recorded actions onto whichever robot
+        # ``list_robots()`` happened to put first - a success naming a robot the
+        # caller never chose, on the one surface here that actuates it.
         try:
-            resolved_robot = robot_name or self._require_default_robot()
+            resolved_robot = self.sim._resolve_single_robot(robot_name)
         except ValueError as e:
             return {"status": "error", "content": [{"text": f"{e}"}]}
 
         # Validate the target robot is actually in the sim before applying any
-        # actions. Without this an explicit ``robot_name`` that does not exist
-        # silently "replays" onto a phantom robot (send_action no-ops), mirroring
-        # neither run_policy nor eval_policy, both of which reject unknown robots.
+        # actions. A supplied name reaches this check unchanged, so one the
+        # scene does not hold - the empty string included - is reported by name
+        # rather than replaced. Without this an explicit ``robot_name`` that
+        # does not exist silently "replays" onto a phantom robot (send_action
+        # no-ops), mirroring neither run_policy nor eval_policy, both of which
+        # reject unknown robots.
         robots = self.sim.list_robots()
         if resolved_robot not in robots:
             return {
@@ -2917,10 +3433,18 @@ class PolicyRunner:
                 "content": [{"text": f"Robot '{resolved_robot}' not found in sim. Available robots: {robots}"}],
             }
 
+        # A dataset this session recorded to a custom ``root=`` lives nowhere
+        # LeRobot derives from the id alone: forwarding an absent root sent the
+        # read to ``$HF_LEROBOT_HOME/{repo_id}`` and, on the miss, to the Hub,
+        # which answered a "Repository Not Found" 404 with request ids - for a
+        # dataset written a moment ago by the same sim. The sim knows where it
+        # put it, so resolve that first and say so in the reply.
+        root, root_note = self._replay_root(repo_id, root)
+
         try:
             ds, episode_start, episode_length = load_lerobot_episode(repo_id, episode, root)
         except Exception as e:  # noqa: BLE001 - library errors are opaque
-            return {"status": "error", "content": [{"text": f"{e}"}]}
+            return {"status": "error", "content": [{"text": self._replay_load_failure(repo_id, root, e)}]}
 
         # Resolve the action-key ordering for action-vector index -> action
         # dict. The recorded ``action`` column is written in the robot's
@@ -2950,6 +3474,16 @@ class PolicyRunner:
         # frame, so it is deliberately excluded here.
         n_substeps = self._control_substeps(dataset_fps)
         frames_applied = 0
+        # A frame that ADVANCED and a frame that COMMANDED are two different
+        # counts, and only the second one is a replay. The tolerated
+        # no-action frame below increments the first, so counting only it made
+        # "Frames: N/N | status=success" the report for an episode that
+        # commanded nothing at all - see the refusal after the loop.
+        frames_with_action = 0
+        # The columns a frame without an action DID carry, kept for that
+        # refusal: the usual cause is a differently spelled action column, and
+        # that is the only place the observed names can be named.
+        actionless_frame_columns: list[str] = []
         # The replayed episode's own duration, on the same clock as the pacer
         # below for the same reason: it is measured, not recorded.
         start_mono = time.monotonic()
@@ -2990,6 +3524,10 @@ class PolicyRunner:
             if action_vals is None:
                 # No action at this index - advance physics one full control
                 # period so the frame still occupies its recorded time slice.
+                # Tolerated per frame, refused for the whole episode: see the
+                # ``frames_with_action`` check after the loop.
+                if not actionless_frame_columns and isinstance(frame, dict):
+                    actionless_frame_columns = sorted(str(k) for k in frame)
                 self.sim.step(n_steps=n_substeps)
                 frames_applied += 1
             else:
@@ -3078,20 +3616,59 @@ class PolicyRunner:
                         ],
                     }
                 frames_applied += 1
+                frames_with_action += 1
 
             sleep_time = frame_interval - (time.monotonic() - step_start_mono)
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
         duration = time.monotonic() - start_mono
+
+        # An episode in which NO frame carried an action is not a replay: every
+        # frame took the tolerated no-action branch above, so the loop only
+        # advanced physics and the recorded trajectory never reached an
+        # actuator. Reported as a full-fidelity success it was the same reading
+        # as a replay that worked, which is the degenerate-success shape this
+        # module refuses everywhere else (an unresolvable key, a width
+        # mismatch). A dataset's column schema is fixed for the whole episode,
+        # so this is a property of the dataset and not of one frame - and the
+        # usual cause is an action column under another name, which is why the
+        # observed column names are quoted.
+        if episode_length and not frames_with_action:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"Replay aborted: none of the {episode_length} recorded frames of episode "
+                            f"{episode} in '{repo_id}' carried an 'action' value, so nothing was sent to "
+                            f"'{resolved_robot}' - the {frames_applied} frames advanced physics only. "
+                            + (f"The frames carry {actionless_frame_columns}. " if actionless_frame_columns else "")
+                            + "Replay a dataset whose frames carry an 'action' column."
+                        )
+                    },
+                    {
+                        "json": {
+                            "episode": episode,
+                            "robot_name": resolved_robot,
+                            "frames_applied": frames_applied,
+                            "frames_with_action": 0,
+                            "total_frames": episode_length,
+                            "recorded_columns": actionless_frame_columns,
+                        }
+                    },
+                ],
+            }
+
         return {
             "status": "success",
             "content": [
                 {
                     "text": (
                         f"Replayed episode {episode} from {repo_id} on '{resolved_robot}'\n"
-                        f"Frames: {frames_applied}/{episode_length} | "
-                        f"Duration: {duration:.1f}s | Speed: {speed}x"
+                        f"Frames: {frames_applied}/{episode_length} "
+                        f"(actions applied: {frames_with_action}) | "
+                        f"Duration: {duration:.1f}s | Speed: {speed}x{root_note}"
                     )
                 },
                 {
@@ -3099,13 +3676,86 @@ class PolicyRunner:
                         "episode": episode,
                         "robot_name": resolved_robot,
                         "frames_applied": frames_applied,
+                        "frames_with_action": frames_with_action,
                         "total_frames": episode_length,
                         "duration_s": round(duration, 2),
                         "speed": speed,
+                        "root": root,
                     }
                 },
             ],
         }
+
+    def _last_recorded(self) -> tuple[str | None, str | None]:
+        """``(repo_id, root)`` of the dataset this sim last recorded, or Nones."""
+        # Through the engine's own seams rather than ``_world._backend_state``:
+        # this runner serves every backend, and the Isaac backend's ``_world``
+        # is the Isaac Sim ``World`` handle, which holds no such mapping - so
+        # reading it directly would resolve nothing on exactly one backend.
+        return self.sim._active_dataset_repo_id(), self.sim._active_dataset_root()
+
+    def _replay_root(self, repo_id: str, root: str | None) -> tuple[str | None, str]:
+        """Resolve the directory a replay reads when the caller named only the id.
+
+        An explicit ``root`` and an id that is itself a path are left to
+        :func:`~strands_robots.dataset_recorder.load_lerobot_episode`, which
+        resolves them by the rule recording wrote through. An ``owner/name`` id
+        with no root normally keeps its absent root (LeRobot's Hub snapshot
+        cache) - except when THIS sim recorded that very id to a directory
+        LeRobot would not derive, in which case the recording is read back from
+        where it was written and the reply names the directory. The default
+        location wins when it exists, so a dataset there is never shadowed.
+
+        Returns:
+            ``(root, note)``: the root to read and a reply suffix (``""`` when
+            nothing was resolved here).
+        """
+        if root:
+            return root, ""
+        from strands_robots.dataset_recorder import local_dataset_dir, resolve_dataset_dir
+
+        if local_dataset_dir(repo_id) is not None:
+            return None, ""
+        last_repo, last_root = self._last_recorded()
+        if last_repo != repo_id or not last_root:
+            return None, ""
+        last_dir = Path(last_root)
+        default_dir = resolve_dataset_dir(repo_id, None)
+        if not last_dir.is_dir() or last_dir.resolve() == default_dir.resolve():
+            return None, ""
+        if (default_dir / "meta").exists():
+            # A finalized dataset already at the default location is what an
+            # absent root has always read. A recording elsewhere must not move
+            # the directory under a call that already worked.
+            return None, ""
+        return str(
+            last_dir
+        ), f"\nRoot: {last_dir} (where this session recorded {repo_id}; pass root= to read elsewhere)"
+
+    def _replay_load_failure(self, repo_id: str, root: str | None, error: BaseException) -> str:
+        """The text for a dataset that could not be opened.
+
+        A Hub 404 for an ``owner/name`` id is translated: the caller almost
+        always means a local dataset that lives somewhere other than the
+        default, and the raw message (request ids, authentication advice) names
+        neither the directory that was tried nor the remedy. Everything else is
+        reported as the library said it.
+        """
+        text = f"{error}"
+        looks_like_hub_miss = "Repository Not Found" in text or type(error).__name__ == "RepositoryNotFoundError"
+        if root or not looks_like_hub_miss:
+            return text
+        from strands_robots.dataset_recorder import resolve_dataset_dir
+
+        default_dir = resolve_dataset_dir(repo_id, None)
+        last_repo, last_root = self._last_recorded()
+        hint = f" This session last recorded {last_repo} to {last_root}." if last_repo and last_root else ""
+        return (
+            f"No dataset {repo_id!r} at the local default {default_dir} and no Hub repository by that "
+            f"name. A dataset recorded with root= is read back with the same root= - pass "
+            f"root='<the directory start_recording was given>' to replay_episode, or record without "
+            f"root= so the default location is used.{hint}"
+        )
 
     # evaluate(): multi-episode success metrics
 
@@ -3160,9 +3810,14 @@ class PolicyRunner:
             success_fn: Legacy success predicate (see above).
             spec: :class:`BenchmarkProtocol` to drive the eval. When
                 provided, overrides the ``success_fn`` path.
-            seed: Master RNG seed. Each episode derives a child RNG from it,
-                so evaluations are reproducible within a process. Only used
-                when ``spec`` is provided.
+            seed: Master RNG seed. Each episode derives a child seed from it,
+                so evaluations are reproducible within a process. Used on BOTH
+                routes: the ``success_fn`` path draws the same per-episode seeds
+                from the same master RNG and forwards each to ``policy.reset``,
+                which this entry used to say it did not. Every episode record in
+                the result reports the ``seed`` its attempt ran on, so a single
+                failing episode can be replayed on its own; it is ``None`` for an
+                unseeded eval, which draws no per-episode seed at all.
             action_horizon: Max actions consumed per policy call before
                 requerying the observation, as in :meth:`run`. Clamped up to the
                 policy's own chunk length when it emits more.
@@ -3239,7 +3894,43 @@ class PolicyRunner:
             ``rtc_avg_inference_ms``, ``rtc_max_inference_ms``) so inference
             cost and latency masking are provable from the payload. When
             ``spec`` is used, it also contains ``cumulative_reward`` and
-            ``avg_reward`` fields per episode and aggregate.
+            ``avg_reward`` fields per episode and aggregate, plus
+            ``max_step_reward`` per episode and ``avg_max_step_reward`` in the
+            aggregate: the peak single-step reward, kept beside the running total
+            because the total is partly a step count, so on a dense-reward task a
+            long flailing attempt out-totals a short one that nearly finished.
+            ``max_step_reward`` is ``None`` for an attempt that ended before any
+            step was scored, and ``avg_max_step_reward`` averages only the
+            attempts that scored one (``None`` when none did) rather than reading
+            an unscored attempt as a peak of zero.
+
+            ``pass_hat_k`` maps ``k`` (as a string, since the payload is JSON) to
+            the probability that ``k`` attempts drawn from those run are all
+            successes - see :func:`pass_hat_k`. It answers whether a policy can be
+            relied on repeatedly, which ``success_rate`` does not: at a 60% rate,
+            five consecutive attempts succeed about 8% of the time. Keys above
+            ``episodes_completed`` are absent rather than ``0.0``, because a short
+            run has not measured a long streak and a zero would read as though it
+            had. Reported on BOTH routes, unlike the reward fields above: it is
+            derived from ``n_success`` and ``episodes_completed``, which the
+            ``success_fn`` path reports too, so it needs no ``spec``. Absent
+            altogether when no success criterion was in force, since every attempt
+            then counts as a failure for a reason unrelated to the policy.
+
+            ``episodes_successful_at_reset`` (int) counts episodes whose success
+            criterion already held at reset, before any action was applied. The
+            criterion is sampled only after an applied action, so such an episode
+            succeeds on its first step whatever the policy commands and its
+            contribution to ``success_rate`` / ``pass_hat_k`` describes the scene's
+            initial state rather than the policy - the mirror of
+            ``success_measured=False``, which reports a hard 0.0 for the same kind
+            of reason. Usually a threshold on the wrong side of the initial state
+            (a lift height below where the object already rests). Every reported
+            figure is left as measured; ``reset_success_warning`` carries the
+            qualifying text (``None`` when the count is zero) and each per-episode
+            record carries its own ``success_at_reset``. A partial count is not an
+            error: domain randomisation legitimately draws initial states per
+            episode.
 
             Every payload carries ``success_measured`` (bool): ``True`` when a
             success criterion was in force (a ``spec`` or a non-``None``
@@ -3264,7 +3955,7 @@ class PolicyRunner:
         """
         # Refuse before any frame reaches the engine's open recording.
         self._reject_recording_rate_mismatch(control_frequency, "PolicyRunner.evaluate")
-        # Local import: base.py imports PolicyRunner at module level, so
+        # Local import: ``simulation.base`` imports PolicyRunner at module level, so
         # reaching the shared domain from here has to stay deferred - the
         # same convention this module already uses for
         # simulation.benchmark / simulation.recording / simulation.predicates.
@@ -3291,6 +3982,13 @@ class PolicyRunner:
         # entry point would have refused.
         if horizon_error := positive_count_error(action_horizon, "action_horizon", "PolicyRunner.evaluate"):
             raise ValueError(horizon_error)
+        # The caller's telemetry hook, on the same domain as run()'s and refused
+        # for the reason the eval loop cannot: a hook exception there is
+        # best-effort telemetry, logged and never fatal, so a value that is not
+        # callable at all was reported once per frame and the evaluation still
+        # returned a success rate the hook had watched none of.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "PolicyRunner.evaluate"):
+            raise ValueError(hook_error)
         # The two bounds of this method's own episode loop, on the same shared
         # domain and raised for the same reason. A horizon outside the domain
         # degrades a rollout; a LOOP BOUND outside it removes the evaluation
@@ -3442,6 +4140,7 @@ class PolicyRunner:
         )
 
         results: list[dict[str, Any]] = []
+        episodes_successful_at_reset = 0
         # #191 - monotonic global step index handed to ``on_frame`` so a
         # synchronous recorder/telemetry hook sees a continuous count across
         # episode boundaries, exactly like the spec eval path and ``run()``.
@@ -3488,8 +4187,30 @@ class PolicyRunner:
         try:
             for ep in range(n_episodes):
                 self.sim.reset()
+                # Sample the success criterion ONCE before the policy acts. The
+                # loop below samples it only after an applied action, so a criterion
+                # that already holds here makes the episode succeed on its first step
+                # whatever the policy commands - see
+                # :func:`success_at_reset_warning`. Diagnostic only: it decides no
+                # reported figure, so unlike the per-step call it is deliberately not
+                # fatal on a raise (a criterion reading state that a first ``on_step``
+                # would have set has not had one yet).
+                success_at_reset = False
+                if resolved_check is not None:
+                    try:
+                        success_at_reset = bool(resolved_check(_observation_fn()))
+                    except Exception as e:  # noqa: BLE001 - diagnostic, never fatal
+                        logger.debug("success_fn at reset raised %s; not sampled", e)
+                if success_at_reset:
+                    episodes_successful_at_reset += 1
+
                 success = False
                 steps = 0
+                # Actions that actually reached ``send_action``. ``steps`` counts
+                # advanced control steps, which the empty-chunk branch below
+                # increments without commanding anything - so one number cannot
+                # carry both facts. See :func:`uncommanded_eval_error`.
+                actions_applied = 0
 
                 # Per-episode MP4 (foo_ep{i}.mp4). Validation + camera probe happen
                 # here; a bad path/camera fails the eval up-front (on ep 0) instead
@@ -3505,7 +4226,12 @@ class PolicyRunner:
                 # re-runs at the same master seed. Forwarded to ``policy.reset``
                 # too, because a service-mode policy samples in another process
                 # that ``set_eval_seed`` cannot reach. Best-effort, like every
-                # other ``reset`` call site.
+                # other ``reset`` call site. Bound to ``None`` first so the
+                # episode record below reports the seed on every route through
+                # the loop: an unseeded eval draws none (a master RNG is
+                # deliberately not built from entropy here), and ``None`` says
+                # that rather than naming a seed the episode never ran on.
+                episode_seed: int | None = None
                 if master_rng is not None:
                     episode_seed = master_rng.randint(0, 2**31 - 1)
                     set_eval_seed(episode_seed)
@@ -3539,6 +4265,8 @@ class PolicyRunner:
                             self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
                             _fire_on_frame(_observation, action_dict, steps)
                             steps += 1
+                            if action_commands_robot(action_dict):
+                                actions_applied += 1
                             # Check success against the LIVE post-action observation
                             # (mirrors the synchronous path / _evaluate_with_spec).
                             if resolved_check is not None and _criterion_verdict(
@@ -3575,6 +4303,8 @@ class PolicyRunner:
                             self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
                             _fire_on_frame(observation, action_dict, steps)
                             steps += 1
+                            if action_commands_robot(action_dict):
+                                actions_applied += 1
                             # Check success against the LIVE post-action observation,
                             # not the stale pre-action obs. Checking the pre-action
                             # obs detects success one step late and never records a
@@ -3589,7 +4319,16 @@ class PolicyRunner:
                         if success:
                             break
 
-                results.append({"episode": ep, "steps": steps, "success": success})
+                results.append(
+                    {
+                        "episode": ep,
+                        "steps": steps,
+                        "success": success,
+                        "seed": episode_seed,
+                        "actions_applied": actions_applied,
+                        "success_at_reset": success_at_reset,
+                    }
+                )
                 # #708 - roll the attached recorder over to a new episode so the
                 # dataset records per-episode boundaries rather than collapsing
                 # every rollout into one mega-episode.
@@ -3634,6 +4373,22 @@ class PolicyRunner:
         n_success = sum(1 for r in results if r["success"])
         success_rate = n_success / max(n_completed, 1)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
+        total_steps = sum(r["steps"] for r in results)
+        total_actions = sum(r["actions_applied"] for r in results)
+        uncommanded_error = uncommanded_eval_error(
+            surface="eval_policy",
+            robot_name=robot_name,
+            episodes_completed=n_completed,
+            steps_advanced=total_steps,
+            actions_applied=total_actions,
+        )
+        reset_success_warning = success_at_reset_warning(
+            surface="eval_policy",
+            episodes_completed=n_completed,
+            episodes_successful_at_reset=episodes_successful_at_reset,
+        )
+        if reset_success_warning is not None:
+            logger.warning("%s", reset_success_warning)
         _n_infer = len(inference_ms)
         rtc_telemetry = _with_prefetch_keys(
             {
@@ -3648,7 +4403,7 @@ class PolicyRunner:
         )
 
         return {
-            "status": "error" if recording_save_error is not None else "success",
+            "status": "error" if recording_save_error is not None or uncommanded_error is not None else "success",
             "content": [
                 {
                     "text": (
@@ -3660,21 +4415,59 @@ class PolicyRunner:
                         )
                         + f"Episodes: {n_completed}"
                         + (f" of {n_episodes} (stopped early)" if stopped_early else "")
-                        + f" | Success: {n_success}/{n_completed} ({success_rate:.1%})"
-                        + ("" if success_measured else " [no success criterion - not measured]")
+                        + (
+                            f" | Success: {n_success}/{n_completed} ({success_rate:.1%})"
+                            if success_measured
+                            # No fraction when nothing measured it: "0/3 (0.0%)
+                            # [not measured]" was read as a 0% baseline and each
+                            # episode reported as failed. The json keeps the
+                            # documented success_rate=0.0 + success_measured=false.
+                            else " | Success: not measured (no success criterion - pass success_fn, "
+                            "e.g. 'contact', or a benchmark spec)"
+                        )
                         + "\n"
                         f"Avg steps: {avg_steps:.0f}/{max_steps}"
+                        + f" | Actions applied: {total_actions}/{total_steps}"
+                        + (f"\n{uncommanded_error}" if uncommanded_error is not None else "")
+                        + (f"\n{reset_success_warning}" if reset_success_warning is not None else "")
                     )
                 },
                 {
                     "json": {
                         "success_rate": round(success_rate, 4),
                         "success_measured": success_measured,
+                        # Reported beside ``avg_steps`` because they are different
+                        # facts: a step the empty-chunk branch advanced counts as an
+                        # advanced step and commands nothing. A shortfall short of
+                        # zero is partial, so it is reported rather than refused.
+                        "actions_applied": total_actions,
+                        "steps_advanced": total_steps,
+                        "uncommanded_error": uncommanded_error,
+                        # Episodes whose success criterion already held at reset, so
+                        # their success was decided before the policy acted. See
+                        # :func:`success_at_reset_warning`; the rate is left as
+                        # measured and the count is what qualifies it.
+                        "episodes_successful_at_reset": episodes_successful_at_reset,
+                        "reset_success_warning": reset_success_warning,
                         "n_episodes": n_episodes,
                         "episodes_completed": n_completed,
                         "stopped_early": stopped_early,
                         "recording_save_error": recording_save_error,
                         "n_success": n_success,
+                        # Derived from ``n_success`` and ``episodes_completed``, both
+                        # reported here, rather than from a reward - so the reliability
+                        # figure belongs to this route as much as to the spec one, which
+                        # is where it shipped. Omitted entirely when no success criterion
+                        # was in force: every attempt then counts as a failure for a
+                        # reason unrelated to the policy, and a row of zeros would read
+                        # as measured unreliability rather than an unasked question. That
+                        # is the same rule that makes keys above ``episodes_completed``
+                        # absent rather than ``0.0``.
+                        **(
+                            {"pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()}}
+                            if success_measured
+                            else {}
+                        ),
                         "avg_steps": round(avg_steps, 1),
                         "max_steps": max_steps,
                         "policy_load_time_s": round(float(getattr(policy, "load_time_s", 0.0)), 3),
@@ -3786,8 +4579,16 @@ class PolicyRunner:
             set_eval_seed(seed)
         master_rng = random.Random(seed)
         spec_name = type(spec).__name__
+        # The registered id when the spec carries one, for the lines a caller
+        # reads: "benchmark DeclarativeBenchmark supports [...]" named the
+        # class every declarative benchmark shares, not which one refused.
+        spec_label = getattr(spec, "name", None) or spec_name
+        if not isinstance(spec_label, str) or not spec_label:
+            spec_label = spec_name
         max_steps = spec.max_steps
         results: list[dict[str, Any]] = []
+        episodes_successful_at_reset = 0
+        episodes_failed_at_reset = 0
 
         # #191 - global step counter passed to ``on_frame``. Crosses
         # episode boundaries so consumers that don't track ep ↔ step
@@ -3891,7 +4692,7 @@ class PolicyRunner:
                                 "text": (
                                     f"Benchmark compatibility error: robot '{e.robot_name}' "
                                     f"has data_config={e.data_config!r}, but benchmark "
-                                    f"{spec_name} supports {e.supported}."
+                                    f"{spec_label} supports {e.supported}."
                                 )
                             }
                         ],
@@ -3903,10 +4704,52 @@ class PolicyRunner:
                         "content": [{"text": f"on_episode_start failed in {spec_name}: {e}"}],
                     }
 
+                # Sample the success criterion ONCE before the policy acts. The
+                # loop below samples it only after an applied action, so a criterion
+                # that already holds here makes the episode succeed on its first step
+                # whatever the policy commands - see
+                # :func:`success_at_reset_warning`. Diagnostic only: it decides no
+                # reported figure, so unlike the per-step call it is deliberately not
+                # fatal on a raise (a criterion reading state that a first ``on_step``
+                # would have set has not had one yet).
+                success_at_reset = False
+                try:
+                    success_at_reset = bool(spec.is_success(self.sim))
+                except Exception as e:  # noqa: BLE001 - diagnostic, never fatal
+                    logger.debug("%s.is_success at reset raised %s; not sampled", spec_name, e)
+                if success_at_reset:
+                    episodes_successful_at_reset += 1
+                # And the failure criterion, at the same probe and for the same
+                # reason - see :func:`failure_at_reset_warning`. The loop below
+                # reads ``is_failure`` BEFORE ``is_success``, so one that already
+                # holds here ends the episode on its first step with the success
+                # criterion never consulted. Diagnostic only, and not fatal on a
+                # raise, for the reason the success probe above is not.
+                failure_at_reset = False
+                try:
+                    failure_at_reset = bool(spec.is_failure(self.sim))
+                except Exception as e:  # noqa: BLE001 - diagnostic, never fatal
+                    logger.debug("%s.is_failure at reset raised %s; not sampled", spec_name, e)
+                if failure_at_reset:
+                    episodes_failed_at_reset += 1
+
                 success = False
                 failure = False
                 steps = 0
+                # Actions that actually reached ``send_action``, kept apart from
+                # ``steps`` for the reason ``evaluate`` keeps them apart: the
+                # degenerate-policy branch below advances a step and commands
+                # nothing. See :func:`uncommanded_eval_error`.
+                actions_applied = 0
                 cumulative_reward = 0.0
+                # Peak single-step reward, kept beside the running total because the
+                # two answer different questions on a failed attempt: the total says
+                # how much shaped reward accrued over however many steps ran, so a
+                # long flailing episode can out-total a short one that nearly
+                # finished. The peak says how close the attempt ever came. ``None``
+                # until a step scores, so an attempt that ended before ``on_step``
+                # ran reports "no step was scored" rather than a fabricated 0.0.
+                max_step_reward: float | None = None
                 last_info: dict[str, Any] = {}
 
                 for _ in range(max_steps):
@@ -3963,6 +4806,8 @@ class PolicyRunner:
                                 break
                             action_applied = dict(action_in_chunk)
                             self.sim.send_action(action_applied, robot_name=robot_name, n_substeps=n_substeps)
+                            if action_commands_robot(action_applied):
+                                actions_applied += 1
                             # #191 - synchronous on_frame hook fires on the
                             # eval thread, after send_action + before
                             # on_step's reward bookkeeping. Use this for
@@ -4011,7 +4856,11 @@ class PolicyRunner:
                                     "status": "error",
                                     "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
                                 }
-                            cumulative_reward += float(info.reward)
+                            step_reward = float(info.reward)
+                            cumulative_reward += step_reward
+                            max_step_reward = (
+                                step_reward if max_step_reward is None else max(max_step_reward, step_reward)
+                            )
                             last_info = dict(info.info) if info.info else {}
                             if info.done:
                                 stop_episode = True
@@ -4044,7 +4893,9 @@ class PolicyRunner:
                                 "status": "error",
                                 "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
                             }
-                        cumulative_reward += float(info.reward)
+                        step_reward = float(info.reward)
+                        cumulative_reward += step_reward
+                        max_step_reward = step_reward if max_step_reward is None else max(max_step_reward, step_reward)
                         last_info = dict(info.info) if info.info else {}
                         if info.done:
                             break
@@ -4066,8 +4917,12 @@ class PolicyRunner:
                         "success": success,
                         "failure": failure,
                         "cumulative_reward": round(cumulative_reward, 4),
+                        "max_step_reward": (None if max_step_reward is None else round(max_step_reward, 4)),
                         "seed": episode_seed,
                         "info": last_info,
+                        "actions_applied": actions_applied,
+                        "success_at_reset": success_at_reset,
+                        "failure_at_reset": failure_at_reset,
                     }
                 )
                 # #708 - same per-episode recorder boundary as evaluate().
@@ -4109,13 +4964,42 @@ class PolicyRunner:
         success_rate = n_success / max(n_completed, 1)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         avg_reward = sum(r["cumulative_reward"] for r in results) / max(n_completed, 1)
+        total_steps = sum(r["steps"] for r in results)
+        total_actions = sum(r["actions_applied"] for r in results)
+        uncommanded_error = uncommanded_eval_error(
+            surface="evaluate_benchmark",
+            robot_name=robot_name,
+            episodes_completed=n_completed,
+            steps_advanced=total_steps,
+            actions_applied=total_actions,
+        )
+        reset_success_warning = success_at_reset_warning(
+            surface="evaluate_benchmark",
+            episodes_completed=n_completed,
+            episodes_successful_at_reset=episodes_successful_at_reset,
+        )
+        if reset_success_warning is not None:
+            logger.warning("%s", reset_success_warning)
+        reset_failure_warning = failure_at_reset_warning(
+            surface="evaluate_benchmark",
+            episodes_completed=n_completed,
+            episodes_failed_at_reset=episodes_failed_at_reset,
+        )
+        if reset_failure_warning is not None:
+            logger.warning("%s", reset_failure_warning)
+        # Averaged over the attempts that actually scored a step. An attempt that
+        # ended before ``on_step`` ran carries ``None`` and is excluded rather than
+        # counted as 0.0, which would drag the peak toward zero for a reason that has
+        # nothing to do with how close any attempt came.
+        _peaks = [r["max_step_reward"] for r in results if r["max_step_reward"] is not None]
+        avg_max_step_reward = round(sum(_peaks) / len(_peaks), 4) if _peaks else None
 
         return {
-            "status": "error" if recording_save_error is not None else "success",
+            "status": "error" if recording_save_error is not None or uncommanded_error is not None else "success",
             "content": [
                 {
                     "text": (
-                        f"Benchmark: {spec_name} | policy {type(policy).__name__} on '{robot_name}'\n"
+                        f"Benchmark: {spec_label} | policy {type(policy).__name__} on '{robot_name}'\n"
                         + (
                             f"Stopped after a lost recording episode - {recording_save_error}\n"
                             if recording_save_error is not None
@@ -4125,12 +5009,34 @@ class PolicyRunner:
                         + (f" of {n_episodes} (stopped early)" if stopped_early else "")
                         + f" | Success: {n_success} | Failure: {n_failure} ({success_rate:.1%} success)\n"
                         f"Avg reward: {avg_reward:.2f} | Avg steps: {avg_steps:.0f}/{max_steps}"
+                        + f" | Actions applied: {total_actions}/{total_steps}"
+                        + (f"\n{uncommanded_error}" if uncommanded_error is not None else "")
+                        + (f"\n{reset_success_warning}" if reset_success_warning is not None else "")
+                        + (f"\n{reset_failure_warning}" if reset_failure_warning is not None else "")
                     )
                 },
                 {
                     "json": {
                         "success_rate": round(success_rate, 4),
                         "success_measured": True,
+                        # Same split as ``evaluate``: an advanced step is not a
+                        # commanded action, and the difference is what tells a
+                        # scored zero apart from an unexercised policy.
+                        "actions_applied": total_actions,
+                        "steps_advanced": total_steps,
+                        "uncommanded_error": uncommanded_error,
+                        # Episodes whose success criterion already held at reset, so
+                        # their success was decided before the policy acted. See
+                        # :func:`success_at_reset_warning`; the rate is left as
+                        # measured and the count is what qualifies it.
+                        "episodes_successful_at_reset": episodes_successful_at_reset,
+                        "reset_success_warning": reset_success_warning,
+                        # Episodes whose FAILURE criterion already held at reset, so
+                        # they ended on their first step with the success criterion
+                        # never consulted. See :func:`failure_at_reset_warning`; the
+                        # rate is left as measured and the count is what qualifies it.
+                        "episodes_failed_at_reset": episodes_failed_at_reset,
+                        "reset_failure_warning": reset_failure_warning,
                         "n_episodes": n_episodes,
                         "episodes_completed": n_completed,
                         "stopped_early": stopped_early,
@@ -4139,6 +5045,8 @@ class PolicyRunner:
                         "n_failure": n_failure,
                         "avg_steps": round(avg_steps, 1),
                         "avg_reward": round(avg_reward, 4),
+                        "avg_max_step_reward": avg_max_step_reward,
+                        "pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()},
                         "max_steps": max_steps,
                         "seed": seed,
                         "benchmark_class": spec_name,
@@ -4209,12 +5117,6 @@ class PolicyRunner:
                     return numeric
         return None
 
-    def _require_default_robot(self) -> str:
-        robots = self.sim.list_robots()
-        if not robots:
-            raise ValueError("No robots in sim. Add one first.")
-        return robots[0]
-
     def _resolve_success_fn(self, success_fn: SuccessFn | str | None) -> SuccessFn | None:
         if success_fn is None:
             return None
@@ -4255,12 +5157,14 @@ class PolicyRunner:
             # scored every episode a failure - while still working against a
             # test double that returns the bare mapping.
             #
-            # Imported inside the method, not at module level: base.py imports
-            # this module at import time and predicates.py imports base under
+            # Imported inside the method, not at module level: ``simulation.base``
+            # imports this module at import time and ``simulation.predicates``
+            # imports base under
             # TYPE_CHECKING, so a module-level edge from here to predicates
             # closes a loop that CodeQL's py/unsafe-cyclic-import walks - it
-            # does not honour the guard (see the #191 note on base.py's import
-            # of this module). No runtime cycle exists either way, and base.py
+            # does not honour the guard (see the #191 note on the import
+            # of this module in ``simulation.base``). No runtime cycle exists
+            # either way, and ``simulation.base``
             # reaches into predicates the same way from
             # ``_stop_when_unresolved_error``.
             from strands_robots.simulation.predicates import make_predicate

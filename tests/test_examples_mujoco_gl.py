@@ -24,14 +24,14 @@ guarded example already use -- is::
 so a windowed backend is only selected where one exists, an offscreen backend
 is used everywhere else, and a user-exported ``MUJOCO_GL`` always wins.
 
-Two rules are enforced over the notebooks' code cells plus every tracked
+Three rules are enforced over the notebooks' code cells plus every tracked
 ``.py`` under ``tests/``, ``tests_integ/`` and ``examples/``:
 
 1. **No unguarded** ``"cgl"`` **on any line** (:func:`test_no_unguarded_cgl_default`).
    Line-scoped and deliberately blunt: ``cgl`` cannot be a working default off
    macOS in any scope.
 2. **No unguarded windowed backend in a module-scope default**
-   (:func:`test_no_module_scope_windowed_gl_default`). Scope matters because
+   (:func:`test_no_module_scope_platform_bound_gl_default`). Scope matters because
    ``MUJOCO_GL`` is read once, at ``import mujoco``: a module-scope
    ``setdefault`` runs at import and therefore selects the backend for the
    whole file, while one inside a test function usually runs *after* the module
@@ -49,14 +49,30 @@ mirror image of an unguarded ``"cgl"`` -- each is one platform's backend named
 unconditionally -- so both are reported and the guarded form fixes both. The
 platform-independent spellings MuJoCo also accepts (``disable``, ``off``,
 ``1``, ...) name no backend and are left alone.
+
+3. **No unguarded offscreen backend in an example, in any scope**
+   (:func:`test_no_unguarded_offscreen_gl_default_in_examples`). Rule 2 is
+   scoped to module level because that is the only scope that selects the
+   backend for a *test* file. An example is different: it puts the default at
+   module scope *and* at the top of ``main()``, before the lazy simulation
+   import, and both run before mujoco is imported -- so on macOS a bare ``egl``
+   in ``main()`` is the same ``RuntimeError`` as one at module scope, and Rule 2
+   cannot see it. Rule 3 walks every scope of every tracked example for the
+   Linux-only pair. Measured at 6a8a8ea23 on macOS:
+   ``examples/04_mesh_peer_discovery.py`` died at import, and the six ``main()``
+   sites would die the same way on first run.
 """
 
 from __future__ import annotations
 
 import ast
 import json
+import platform
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _NOTEBOOKS_DIR = _REPO_ROOT / "examples" / "notebooks"
@@ -68,8 +84,21 @@ _NOTEBOOKS_DIR = _REPO_ROOT / "examples" / "notebooks"
 _CGL_VALUE_RE = re.compile(r'MUJOCO_GL"[^\n]*?"cgl"')
 
 
-def _is_guarded(line: str) -> bool:
-    return "darwin" in line or "sys.platform" in line
+def _is_guarded(text: str) -> bool:
+    """Does this MUJOCO_GL value choose per platform, so a one-platform name is fine?
+
+    Takes either a whole source line or an unparsed value expression: the rules
+    below apply this one test to both, and the notebook fallback grades a raw
+    line with it when a cell will not parse.
+
+    Python names macOS three ways and only ``sys.platform`` spells it in
+    lowercase -- ``platform.system()`` and ``os.uname().sysname`` both return
+    ``"Darwin"`` -- so the match is case-insensitive. A case-sensitive one
+    reported the two capitalised spellings as having *no* platform guard, which
+    is both a refusal of a correct line and a wrong reason: the reported cause
+    ("breaks headless Linux") is what those lines already avoid.
+    """
+    return "darwin" in text.casefold() or "sys.platform" in text
 
 
 def _lines_of(text: str) -> list[str]:
@@ -158,11 +187,15 @@ def test_scanner_sees_cgl_usage():
 #: window server, so neither is a working unconditional default.
 _WINDOWED_BACKENDS = ("cgl", "glfw")
 
+#: MuJoCo's *offscreen* GL backends. Both are Linux-only: MuJoCo rejects them
+#: at import on macOS, so neither is a working unconditional default either.
+_OFFSCREEN_BACKENDS = ("egl", "osmesa")
+
 #: Every GL backend MuJoCo names, each of which some platform cannot use: the
 #: windowed pair needs a window server, and ``egl``/``osmesa`` are refused
 #: outright on macOS. So none of them is a correct unconditional default, and a
 #: module-scope default naming one has to choose per platform.
-_PLATFORM_BOUND_BACKENDS = (*_WINDOWED_BACKENDS, "egl", "osmesa")
+_PLATFORM_BOUND_BACKENDS = (*_WINDOWED_BACKENDS, *_OFFSCREEN_BACKENDS)
 
 # Fallback for a notebook cell that does not parse (a ``%``/``!`` magic makes the
 # cell invalid Python on its own): report any line naming a GL backend as a
@@ -217,11 +250,6 @@ def _module_scope_gl_defaults(source: str) -> list[tuple[int, str]]:
     return found
 
 
-def _is_guarded_expr(expr_src: str) -> bool:
-    """Does this value expression choose per platform, so a windowed name is fine?"""
-    return "darwin" in expr_src or "sys.platform" in expr_src
-
-
 def _names_a_platform_bound_backend(expr_src: str) -> bool:
     return any(f'"{backend}"' in expr_src or f"'{backend}'" in expr_src for backend in _PLATFORM_BOUND_BACKENDS)
 
@@ -231,7 +259,7 @@ def _unguarded_platform_bound_defaults(source: str) -> list[str]:
     return [
         f"line {line}: {expr}"
         for line, expr in _module_scope_gl_defaults(source)
-        if _names_a_platform_bound_backend(expr) and not _is_guarded_expr(expr)
+        if _names_a_platform_bound_backend(expr) and not _is_guarded(expr)
     ]
 
 
@@ -246,7 +274,7 @@ def _unguarded_platform_bound_in_notebook(path: Path) -> list[str]:
         try:
             bad = _unguarded_platform_bound_defaults(source)
         except SyntaxError:
-            bad = [ln.strip() for ln in _lines_of(source) if _BACKEND_VALUE_RE.search(ln) and not _is_guarded_expr(ln)]
+            bad = [ln.strip() for ln in _lines_of(source) if _BACKEND_VALUE_RE.search(ln) and not _is_guarded(ln)]
         offending.extend(f"cell {index} {entry}" for entry in bad)
     return offending
 
@@ -282,11 +310,83 @@ def test_scan_reaches_the_module_scope_defaults():
     Without this a path/glob regression, or a walker that descended into nothing,
     would make the rule above pass by reaching no source at all.
     """
+    # tests/ carries exactly one default now (tests/conftest.py, set for the whole
+    # session before any test module is imported); the rest live in examples/
+    # (11) and tests_integ/ (5), which have no shared conftest to lean on.
     total = sum(len(_module_scope_gl_defaults(p.read_text(encoding="utf-8"))) for p in _tracked_py())
-    assert total >= 20, (
+    assert total >= 10, (
         f"the AST scan found only {total} module-scope MUJOCO_GL defaults across {_tracked_py()[:1]}...; "
         "the tree has far more, so the scan is not reaching the sources."
     )
+
+
+def _all_scope_gl_defaults(source: str) -> list[tuple[int, str]]:
+    """``(line, value-expression)`` for every ``MUJOCO_GL`` default in any scope."""
+    return [
+        (getattr(node, "lineno", 0), ast.unparse(value))
+        for node in ast.walk(ast.parse(source))
+        if (value := _gl_default_value(node)) is not None
+    ]
+
+
+def _names_offscreen(expr_src: str) -> bool:
+    return any(f'"{backend}"' in expr_src or f"'{backend}'" in expr_src for backend in _OFFSCREEN_BACKENDS)
+
+
+def _unguarded_offscreen_defaults(source: str) -> list[str]:
+    """``MUJOCO_GL`` defaults naming a Linux-only backend without a platform guard, any scope."""
+    return [
+        f"line {line}: {expr}"
+        for line, expr in _all_scope_gl_defaults(source)
+        if _names_offscreen(expr) and not _is_guarded(expr)
+    ]
+
+
+def _example_py() -> list[Path]:
+    root = _REPO_ROOT / "examples"
+    return sorted(root.rglob("*.py")) if root.is_dir() else []
+
+
+def test_no_unguarded_offscreen_gl_default_in_examples():
+    """An example must not default MUJOCO_GL to a Linux-only backend, in any scope.
+
+    A reader runs an example on the machine in front of them; on macOS a bare
+    ``egl`` is a RuntimeError at ``import mujoco`` whether the line sits at
+    module scope or at the top of ``main()``.
+    """
+    offenders = {
+        str(path.relative_to(_REPO_ROOT)): bad
+        for path in _example_py()
+        if (bad := _unguarded_offscreen_defaults(path.read_text(encoding="utf-8")))
+    }
+    assert not offenders, (
+        "an example defaults MUJOCO_GL to a Linux-only GL backend "
+        f"({', '.join(_OFFSCREEN_BACKENDS)}), which MuJoCo rejects at import on macOS. "
+        'Use \'os.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")\'. '
+        f"Offending sites: {offenders}"
+    )
+
+
+class TestTheOffscreenRuleGradesEveryScope:
+    """Planted sources for Rule 3: any scope, offscreen names only, the guard clears it."""
+
+    def test_a_module_scope_egl_default_is_reported(self):
+        source = 'import os\nos.environ.setdefault("MUJOCO_GL", "egl")\n'
+        assert _unguarded_offscreen_defaults(source) == ["line 2: 'egl'"]
+
+    def test_an_egl_default_inside_main_is_reported_too(self):
+        source = 'import os\n\n\ndef main():\n    os.environ.setdefault("MUJOCO_GL", "osmesa")\n'
+        assert _unguarded_offscreen_defaults(source) == ["line 5: 'osmesa'"]
+
+    def test_the_guarded_form_is_accepted(self):
+        source = (
+            'import os\nimport sys\nos.environ.setdefault("MUJOCO_GL", "cgl" if sys.platform == "darwin" else "egl")\n'
+        )
+        assert _unguarded_offscreen_defaults(source) == []
+
+    def test_a_windowed_default_is_rule_two_business_not_rule_three(self):
+        source = 'import os\nos.environ.setdefault("MUJOCO_GL", "glfw")\n'
+        assert _unguarded_offscreen_defaults(source) == []
 
 
 class TestTheRuleIsScopedToWhatSelectsTheBackend:
@@ -338,3 +438,46 @@ class TestTheRuleIsScopedToWhatSelectsTheBackend:
             'import os\nimport sys\nif sys.version_info >= (3, 12):\n    os.environ.setdefault("MUJOCO_GL", "glfw")\n'
         )
         assert _unguarded_platform_bound_defaults(source) == ["line 4: 'glfw'"]
+
+
+class TestAGuardIsRecognisedHoweverTheLineNamesMacOS:
+    """Every rule accepts each of the three ways Python names macOS.
+
+    The three rules and the fleet-example rule share one guard test, so a
+    spelling one of them misses, all four miss. ``sys.platform`` is the only
+    API of the three that answers in lowercase, so a case-sensitive match read
+    the other two as no guard at all -- refusing a line that does pick per
+    platform, and blaming it for the headless-Linux breakage it avoids.
+    """
+
+    #: The three stdlib ways to ask whether this host is macOS. Each is a
+    #: correct guard: on headless Linux every one of them yields ``egl``.
+    _DARWIN_TESTS = (
+        'sys.platform == "darwin"',
+        'platform.system() == "Darwin"',
+        'os.uname().sysname == "Darwin"',
+    )
+
+    def test_only_sys_platform_answers_in_lowercase(self):
+        """The premise, measured on this host: one API capitalises, the other does not."""
+        assert sys.platform == sys.platform.lower()
+        assert platform.system() != platform.system().lower()
+
+    @pytest.mark.parametrize("darwin_test", _DARWIN_TESTS, ids=lambda t: t.split()[0])
+    def test_a_cgl_default_guarded_by_any_of_them_is_accepted(self, darwin_test, tmp_path):
+        source = f'import os\nos.environ.setdefault("MUJOCO_GL", "cgl" if {darwin_test} else "egl")\n'
+        path = tmp_path / "guarded.py"
+        path.write_text(source, encoding="utf-8")
+        assert _scan_py(path) == []  # rule 1, line-scoped
+        assert _unguarded_platform_bound_defaults(source) == []  # rule 2, module scope
+        assert _unguarded_offscreen_defaults(source) == []  # rule 3, any scope
+        assert _is_guarded(ast.unparse(ast.parse(source).body[1].value.args[1]))  # fleet rule
+
+    def test_an_unguarded_cgl_default_is_still_reported_by_every_rule(self, tmp_path):
+        """The control: recognising more guards must not stop reporting a line with none."""
+        source = 'import os\nos.environ.setdefault("MUJOCO_GL", "cgl")\n'
+        path = tmp_path / "unguarded.py"
+        path.write_text(source, encoding="utf-8")
+        assert _scan_py(path) == ['os.environ.setdefault("MUJOCO_GL", "cgl")']
+        assert _unguarded_platform_bound_defaults(source) == ["line 2: 'cgl'"]
+        assert not _is_guarded('"cgl"')

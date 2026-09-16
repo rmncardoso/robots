@@ -1,8 +1,12 @@
 """Rendering mixin - render, render_depth, get_contacts, observation helpers."""
 
+import atexit
 import io
 import logging
 import os
+import threading
+import weakref
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -11,7 +15,7 @@ if TYPE_CHECKING:
 
     from strands_robots.rendering import CameraParams
 
-from strands_robots.simulation.models import registry_entry
+from strands_robots.simulation.models import registered, registry_entry
 from strands_robots.simulation.mujoco.backend import (
     _NO_WORLD_MSG,
     _can_render,
@@ -21,9 +25,12 @@ from strands_robots.simulation.mujoco.backend import (
 )
 from strands_robots.simulation.mujoco.scene_ops import (
     actuator_target_body_ids,
+    geom_label,
+    mj_contact_is_active,
     robot_owned_actuator_ids,
     tendon_joint_ids,
 )
+from strands_robots.simulation.recording import camera_clip_name_collision_error
 from strands_robots.simulation.safe_output import (
     atomic_write_bytes,
     env_flag,
@@ -32,9 +39,61 @@ from strands_robots.simulation.safe_output import (
     validate_output_path,
     video_sandbox_args,
 )
-from strands_robots.utils import FREE_CAMERA_TOKENS, name_list_error
+from strands_robots.utils import FREE_CAMERA_TOKENS, camera_schema_key, name_list_error, refusal_repr
 
 logger = logging.getLogger(__name__)
+
+# Every ``mujoco.Renderer`` this module builds, weakly, with the ident of the
+# thread that built it. Read by :func:`_close_renderers_at_exit`.
+_LIVE_RENDERERS: weakref.WeakKeyDictionary[Any, int] = weakref.WeakKeyDictionary()
+_LIVE_RENDERERS_LOCK = threading.Lock()
+_EXIT_HOOK_REGISTERED = False
+
+
+def _close_renderers_at_exit() -> None:
+    """Close the renderers the exiting thread built, while their display is alive.
+
+    ``mujoco.Renderer`` frees its GL context in ``__del__``. Under EGL the
+    display those contexts belong to is torn down by an ``atexit`` hook mujoco
+    registers when it first opens the display, so a renderer that is still
+    alive at interpreter exit - the main-thread cache of a script that never
+    called ``cleanup()``, which is every ``Robot(...).run_policy(video=...)``
+    script - is finalised *after* ``eglTerminate`` and its ``free()`` raises
+    ``EGLError: EGL_NOT_INITIALIZED`` from ``eglMakeCurrent``; the context
+    object's own ``__del__`` then raises the same, so a successful rollout ends
+    in some thirty lines of ignored traceback.
+
+    ``atexit`` runs hooks last-registered first, and this one is registered by
+    :meth:`RenderingMixin._get_renderer` right after the first renderer is
+    built - by which point mujoco's own hook exists - so it runs before the
+    display goes away. Only renderers built on the thread that is running the
+    hooks are closed: a renderer's GL context is bound to its creating thread,
+    and closing one cross-thread SIGSEGVs in ``cgl.free()`` on macOS. Renderers
+    on worker threads need no help - a worker's thread-local cache is dropped
+    when the thread ends, which happens before the hooks run.
+    """
+    ident = threading.get_ident()
+    with _LIVE_RENDERERS_LOCK:
+        mine = [renderer for renderer, owner in list(_LIVE_RENDERERS.items()) if owner == ident]
+    for renderer in mine:
+        try:
+            renderer.close()
+        except Exception:  # noqa: BLE001 - exit path; a driver that refuses to free is not our error
+            logger.debug("renderer close at exit failed", exc_info=True)
+
+
+def _track_renderer(renderer: Any) -> None:
+    """Record ``renderer`` for :func:`_close_renderers_at_exit`, registering the hook once."""
+    global _EXIT_HOOK_REGISTERED
+    with _LIVE_RENDERERS_LOCK:
+        try:
+            _LIVE_RENDERERS[renderer] = threading.get_ident()
+        except TypeError:  # pragma: no cover - a renderer that cannot be weakly referenced (test stub)
+            return
+        if not _EXIT_HOOK_REGISTERED:
+            atexit.register(_close_renderers_at_exit)
+            _EXIT_HOOK_REGISTERED = True
+
 
 # render(output_path=...) is an LLM-callable tool: the path is attacker-influenced.
 # Confine writes to a sandbox root, reject shell metacharacters / traversal /
@@ -126,7 +185,41 @@ _RENDER_ALLOW_ABS_ENV = "STRANDS_ROBOTS_RENDER_ALLOW_ABS"
 _CAMS_REC_JOIN_TIMEOUT_S = 5.0
 
 
-def _validate_render_output_path(output_path: str) -> Path:
+def render_dir_error(value: Any) -> str | None:
+    """Return why ``value`` cannot be a Simulation's render sandbox root, else ``None``.
+
+    The constructor's ``render_dir`` is set by the developer, not the model, so
+    the only things refused are the ones that cannot name a directory at all:
+    a non-path type (``True``, ``0``, a list) and an empty or blank string. A
+    directory that does not exist yet is fine - the first ``render`` creates it,
+    the same way the default sandbox is created on first use.
+
+    The refused value is rendered through
+    :func:`~strands_robots.utils.refusal_repr`, like every other guard in the
+    package: a third-party type's ``__repr__`` may raise anything at all, and
+    the message describing an unusable argument must not be the thing that
+    fails to build.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, os.PathLike)):
+        return (
+            f"render_dir must be a directory path (str or PathLike), got {type(value).__name__} {refusal_repr(value)}"
+        )
+    if not os.fspath(value).strip():
+        return "render_dir must name a directory, got an empty path"
+    return None
+
+
+def resolve_render_dir(value: str | os.PathLike[str]) -> Path:
+    """Resolve a constructor ``render_dir`` the way the default sandbox root is resolved.
+
+    ``~`` expanded, ``..`` normalized, symlinks followed - so confinement
+    compares true on-disk locations, matching
+    :func:`strands_robots.simulation.safe_output.resolve_sandbox_root`.
+    """
+    return Path(os.fspath(value)).expanduser().resolve(strict=False)
+
+
+def _validate_render_output_path(output_path: str, sandbox_root: Path | None = None) -> Path:
     """Validate an LLM-supplied render path, confined to the render sandbox.
 
     Thin render-specific binding over
@@ -135,26 +228,34 @@ def _validate_render_output_path(output_path: str) -> Path:
     opts in. That variable's name is passed down as well as read, so a
     confinement refusal quotes the spelling the caller must set.
 
+    Args:
+        output_path: The model-supplied destination.
+        sandbox_root: The Simulation's own sandbox (its ``render_dir``), or
+            ``None`` for the process default (``STRANDS_ROBOTS_RENDER_ROOT`` /
+            ``~/.strands_robots/renders``).
+
     Raises:
         ValueError: If the path is unsafe (the caller maps this to a tool error).
     """
     return validate_output_path(
         output_path,
-        sandbox_root=_render_sandbox_root(),
+        sandbox_root=sandbox_root if sandbox_root is not None else _render_sandbox_root(),
         allow_abs=env_flag(_RENDER_ALLOW_ABS_ENV),
         allow_abs_env=_RENDER_ALLOW_ABS_ENV,
     )
 
 
-def _save_render_png(output_path: str, png_bytes: bytes) -> str:
+def _save_render_png(output_path: str, png_bytes: bytes, sandbox_root: Path | None = None) -> str:
     """Validate ``output_path``, enforce the size cap, and atomically persist ``png_bytes``.
 
-    Returns the resolved saved path as a string.
+    Returns the resolved saved path as a string. ``sandbox_root`` is the
+    Simulation's own render sandbox when its constructor set one, else ``None``
+    for the process default.
 
     Raises:
         ValueError: On an unsafe path or an oversized payload.
     """
-    safe = _validate_render_output_path(output_path)
+    safe = _validate_render_output_path(output_path, sandbox_root)
     max_bytes = _max_render_bytes()
     if len(png_bytes) > max_bytes:
         raise ValueError(f"png is {len(png_bytes)} bytes, exceeds limit {max_bytes}")
@@ -233,8 +334,8 @@ class RenderingMixin:
     the low-level ``_apply_sim_action`` (MuJoCo ``ctrl[]`` write + mj_step).
 
     **Coupling** (see the :mod:`simulation` top-level docstring): mixin reaches
-    into ``self._world``, ``self._renderer_tls``, ``self._renderer_model``,
-    ``self.default_width`` / ``self.default_height``, ``self._lock`` and
+    into ``self._world``, ``self._renderer_tls``, ``self.default_width`` /
+    ``self.default_height``, ``self._lock`` and
     ``self._viewer_handle``. ``TYPE_CHECKING`` stubs below exist so mypy
     accepts those lookups; they are a documentary contract, not an
     enforceable protocol.
@@ -249,7 +350,6 @@ class RenderingMixin:
 
         _world: "SimWorld | None"
 
-        _renderer_model: Any
         _renderer_tls: Any  # threading.local() - per-thread renderer dict
         default_width: int
         default_height: int
@@ -361,9 +461,6 @@ class RenderingMixin:
         if self._renderer_tls.model is not self._world._model:
             renderers.clear()
             self._renderer_tls.model = self._world._model
-            # Keep the per-instance marker for compatibility with any remaining
-            # read paths that checked self._renderer_model.
-            self._renderer_model = self._world._model
 
         key = (width, height)
         if key not in renderers:
@@ -377,7 +474,11 @@ class RenderingMixin:
                 except Exception:
                     pass
                 del renderers[oldest_key]
-            renderers[key] = mj.Renderer(self._world._model, height=height, width=width)
+            renderer = mj.Renderer(self._world._model, height=height, width=width)
+            # Registered after the build: mujoco's EGL display hook exists by
+            # now, so the close hook this registers runs before it (LIFO).
+            _track_renderer(renderer)
+            renderers[key] = renderer
         return renderers[key]
 
     def _get_viz_option(self) -> Any:
@@ -663,15 +764,9 @@ class RenderingMixin:
                 continue
             cam_info = registry_entry(self._world.cameras, cname)
             # Resolve the MODEL camera this observation key names. The key alone
-            # is not always that name: ``add_robot`` registers a robot's own
-            # MJCF cameras under their SHORT name - the stable, config-level
-            # schema this method documents for joints as well - while the
-            # compiled model holds them namespaced (``arm0/wrist``). The
-            # registered entry carries that namespaced name, so it answers for
-            # the keys the bare lookup cannot.
-            cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, cname)
-            if cam_id < 0:
-                cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, getattr(cam_info, "name", None))
+            # is not always that name - see :meth:`_camera_id`, which owns that
+            # rule for every camera surface on this backend.
+            cam_id = self._camera_id(cname)
             if cam_id < 0:
                 # Nothing in the compiled model answers for this key, so there
                 # is no view to report under it. Rendering the FREE camera here
@@ -741,6 +836,16 @@ class RenderingMixin:
         is true the outer ``mj_step`` loop here is skipped to avoid
         double-stepping. The default (flag absent / False) preserves
         the original 1-substep-per-apply contract.
+
+        Kinematic attachments are re-pinned on BOTH branches. Skipping the
+        outer loop skips its per-substep re-pin, so a body attached with
+        ``attach_bodies(mode="kinematic")`` would be left where it was while
+        this method, the controller and the policy loop all reported success -
+        the promise on ``attach_bodies`` is not conditional on who calls
+        ``mj_step``. A stepping-owning controller gets one re-pin per control
+        step instead of per substep, so the carried body is back on its
+        recorded offset before any observation, render, recorded frame or
+        predicate reads the scene.
         """
         mj = _ensure_mujoco()
         assert self._world is not None  # callers must check
@@ -775,9 +880,9 @@ class RenderingMixin:
                     "name-lookup path (action may be dropped)",
                     e,
                 )
-                self._unresolved_action_keys = self._apply_action_by_name(model, data, action_dict, pfx, mj)
+                self._unresolved_action_keys = self._apply_action_by_name(model, data, action_dict, pfx, mj, robot_name)
         else:
-            self._unresolved_action_keys = self._apply_action_by_name(model, data, action_dict, pfx, mj)
+            self._unresolved_action_keys = self._apply_action_by_name(model, data, action_dict, pfx, mj, robot_name)
 
         if not controller_handled_stepping:
             for _ in range(max(1, n_substeps)):
@@ -786,6 +891,24 @@ class RenderingMixin:
                 # follow their parent every physics step, including the
                 # policy-driven path. Fast no-op when none are registered.
                 self._apply_kinematic_attachments()
+        else:
+            # The controller ran its own ``mj_step`` burst, which the loop
+            # above -- and its per-step re-pin -- never saw. ``attach_bodies``
+            # promises a ``mode="kinematic"`` child follows its parent, and
+            # nothing on that promise is conditional on who steps, so re-pin
+            # here too: without this the carried body free-falls for the whole
+            # episode while ``attach_bodies``, the controller and
+            # ``run_policy`` all report success, and the recorded frames show
+            # the arm working over an object lying on the floor. One re-pin per
+            # control step rather than per substep is the latency a
+            # stepping-owning controller imposes -- the child drifts for at
+            # most the controller's own decimation and is placed back before
+            # anything reads the scene -- and the alternative, silently dropping
+            # the carry, is not a weaker guarantee but a wrong scene. No
+            # ``mj_forward`` here: the teleport writes ``qpos``, and every
+            # reader of derived state (``get_body_state``, ``get_frame``,
+            # ``get_contacts``) runs one itself before reading.
+            self._apply_kinematic_attachments()
 
         assert self._world is not None
         self._world.sim_time = data.time
@@ -831,12 +954,25 @@ class RenderingMixin:
         action_dict: dict[str, Any],
         pfx: str,
         mj: Any,
+        robot_name: str,
     ) -> list[str]:
         """Default action-application: look up actuator / joint by name.
 
         Extracted from :meth:`_apply_sim_action` so the
         ``action_controller`` fast path can fall back to it on
         controller failure (the same path non-LIBERO callers use).
+
+        Args:
+            model: The compiled ``MjModel``.
+            data: Its ``MjData``.
+            action_dict: Action keys (short or raw names) to values.
+            pfx: The robot's namespace prefix, tried ahead of the raw name.
+            mj: The ``mujoco`` module.
+            robot_name: The robot being commanded, used to scope the
+                dropped-key warning to the keys THIS robot accepts. The
+                shipped action-controller contract already carries it (see
+                :meth:`_get_action_controller`). Pass ``""`` when no robot is
+                registered, which reports no keys rather than another robot's.
 
         Returns:
             List of action keys that could not be resolved to any
@@ -873,13 +1009,13 @@ class RenderingMixin:
                 # a joint is silently dropped today. Silent gripper drops are
                 # exactly the failure mode #318 was filed to fix, so surface it
                 # -- once per (prefix, key) to avoid per-step log spam at 50Hz.
-                self._warn_unresolved_action_key(pfx, key, "no actuator or joint")
+                self._warn_unresolved_action_key(robot_name, pfx, key, "no actuator or joint")
                 unresolved.append(key)
                 continue
 
             ai = self._actuator_for_joint(model, jnt_id, mj)
             if ai < 0:
-                self._warn_unresolved_action_key(pfx, key, "joint has no driving actuator")
+                self._warn_unresolved_action_key(robot_name, pfx, key, "joint has no driving actuator")
                 unresolved.append(key)
                 continue
 
@@ -929,7 +1065,7 @@ class RenderingMixin:
             self._warn_ctrl_clamp(model, act_id, pfx, key, ctrl_value, mj)
         data.ctrl[act_id] = ctrl_value
 
-    def _warn_unresolved_action_key(self, pfx: str, key: str, reason: str) -> None:
+    def _warn_unresolved_action_key(self, robot_name: str, pfx: str, key: str, reason: str) -> None:
         """Warn once per (prefix, key) that an action key could not be applied.
 
         #367: replaces the prior silent ``continue`` on unresolved action keys.
@@ -943,13 +1079,17 @@ class RenderingMixin:
         if warned is None:
             warned = set()
             self._warned_unresolved_keys = warned
-        dedup = (pfx, key)
+        # Robot-scoped, because the key list below is: two robots that each
+        # carry no namespace share ``pfx=""``, so a (pfx, key) de-dup would
+        # suppress the second robot's warning and leave the operator reading
+        # the FIRST robot's valid keys for a key dropped on the second.
+        dedup = (robot_name, key)
         if dedup in warned:
             return
         warned.add(dedup)
         # Surface the valid actuator/joint names from the loaded model so
         # users can self-correct without inspecting the MJCF by hand.
-        valid_names = self._get_valid_action_keys(pfx)
+        valid_names = self._get_valid_action_keys(robot_name)
         hint = f" Valid keys for this robot: {valid_names}" if valid_names else ""
         logger.warning(
             "[sim] action key %r (prefix=%r) could not be applied: %s. The value was dropped.%s",
@@ -1012,27 +1152,49 @@ class RenderingMixin:
             hi,
         )
 
-    def _get_valid_action_keys(self, pfx: str) -> list[str]:
-        """Return actuator names available under the given namespace prefix.
+    def _get_valid_action_keys(self, robot_name: str) -> list[str]:
+        """Return the action keys :meth:`send_action` resolves for ``robot_name``.
 
-        When ``pfx`` is set (multi-robot), strips the prefix from returned
-        names so the caller sees the short form that ``send_action`` expects.
+        Membership is the robot's RESOLVED actuator ownership -
+        ``SimRobot.actuator_ids``, produced by
+        :func:`~strands_robots.simulation.mujoco.scene_ops.robot_owned_actuator_ids`
+        - and not a namespace-prefix scan of the whole model. The two disagree
+        on the position actuators
+        :func:`~strands_robots.simulation.mujoco.scene_ops.actuate_robot_in_scene`
+        injects: those are named ``"<robot>_act_<joint>"`` and deliberately
+        carry no namespace prefix, so a prefix scan reports none of them. That
+        is why ``robot_owned_actuator_ids`` recognizes them by the joint they
+        drive, and why this reads its answer instead of re-deriving one: an
+        actuated URDF arm advertised zero drivable keys while ``send_action``
+        drove all of them, so a policy keyed by ``robot_action_keys`` could
+        only ever emit an empty action.
+
+        The key FORM mirrors :meth:`_apply_action_by_name`'s lookup, which
+        tries the namespaced name and then the raw one: an actuator carrying
+        the robot's namespace is reported in the short form a multi-robot scene
+        shares across same-config robots, and one that carries no prefix is
+        reported verbatim. Both spellings resolve.
+
+        Unnamed actuators are omitted: they have no addressable key. Returns
+        ``[]`` when there is no compiled world or no such robot.
         """
         world = getattr(self, "_world", None)
         if world is None or getattr(world, "_model", None) is None:
             return []
+        robots = getattr(world, "robots", None) or {}
+        if not registered(robots, robot_name):
+            return []
+        robot = robots[robot_name]
         mj = _ensure_mujoco()
         model = world._model
-        names: list[str] = []
-        for i in range(model.nu):
-            raw = mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, i)
+        pfx = robot.namespace or ""
+        keys: list[str] = []
+        for act_id in robot.actuator_ids:
+            raw = mj.mj_id2name(model, mj.mjtObj.mjOBJ_ACTUATOR, act_id)
             if not raw:
                 continue
-            if pfx and raw.startswith(pfx):
-                names.append(raw[len(pfx) :])
-            elif not pfx:
-                names.append(raw)
-        return names
+            keys.append(raw[len(pfx) :] if pfx and raw.startswith(pfx) else raw)
+        return keys
 
     @staticmethod
     def _actuator_for_joint(model: Any, jnt_id: int, mj: Any) -> int:
@@ -1125,8 +1287,9 @@ class RenderingMixin:
         for independent verification instead of only receiving the bytes inline.
 
         ``output_path`` is treated as untrusted (LLM-callable tool): writes are
-        confined to the render sandbox (``STRANDS_ROBOTS_RENDER_ROOT``, default
-        ``~/.strands_robots/renders``); paths with shell metacharacters,
+        confined to the render sandbox - this Simulation's ``render_dir`` when
+        its constructor set one, else ``STRANDS_ROBOTS_RENDER_ROOT``, default
+        ``~/.strands_robots/renders``; paths with shell metacharacters,
         backslash separators, ``..`` escapes, or a symlinked target, and PNGs
         larger than ``STRANDS_ROBOTS_RENDER_MAX_BYTES`` (default 50 MB) are
         rejected with ``status=error``. A bare filename (``"frame.png"``) is
@@ -1151,7 +1314,7 @@ class RenderingMixin:
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
 
-        mj = _ensure_mujoco()
+        _ensure_mujoco()  # import guard; the camera lookup lives in _camera_id
         # treat `None` as "use default", but `0` / negative values must
         # still hit the validator (bool coercion would swallow them silently).
         # When the caller omits a dimension, honor the named camera's CONFIGURED
@@ -1180,7 +1343,7 @@ class RenderingMixin:
                 cam_id = -1
                 label = "free (default)"
             else:
-                cam_id = mj_name_to_id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = self._camera_id(camera_name)
                 if cam_id < 0:
                     return {
                         "status": "error",
@@ -1233,7 +1396,7 @@ class RenderingMixin:
                 # output_path is LLM-supplied: validate against traversal /
                 # symlink / oversize and write atomically (see _save_render_png).
                 try:
-                    saved_path = _save_render_png(output_path, png_bytes)
+                    saved_path = _save_render_png(output_path, png_bytes, getattr(self, "render_dir", None))
                 except ValueError as e:
                     return {"status": "error", "content": [{"text": f"render: {e}"}]}
 
@@ -1281,7 +1444,7 @@ class RenderingMixin:
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
 
-        mj = _ensure_mujoco()
+        _ensure_mujoco()  # import guard; the camera lookup lives in _camera_id
         # see note in render() re: None vs 0/negative. Honor the named camera's
         # CONFIGURED resolution (add_camera(width=, height=)) when the caller
         # omits a dimension, so the depth map is pixel-aligned with the RGB
@@ -1300,7 +1463,7 @@ class RenderingMixin:
                 cam_id = -1
                 label = "free (default)"
             else:
-                cam_id = mj_name_to_id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = self._camera_id(camera_name)
                 if cam_id < 0:
                     return {
                         "status": "error",
@@ -1493,7 +1656,7 @@ class RenderingMixin:
         if self._world is None or self._world._model is None or self._world._data is None:
             raise RuntimeError(_NO_WORLD_MSG)
 
-        mj = _ensure_mujoco()
+        _ensure_mujoco()  # import guard; the camera lookup lives in _camera_id
         cam_cfg = registry_entry(self._world.cameras, camera_name) if camera_name not in FREE_CAMERA_TOKENS else None
         w = (cam_cfg.width if cam_cfg is not None else self.default_width) if width is None else width
         h = (cam_cfg.height if cam_cfg is not None else self.default_height) if height is None else height
@@ -1509,7 +1672,7 @@ class RenderingMixin:
             if camera_name in FREE_CAMERA_TOKENS:
                 cam_id = -1
             else:
-                cam_id = mj_name_to_id(self._world._model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = self._camera_id(camera_name)
                 if cam_id < 0:
                     raise KeyError(f"Camera '{camera_name}' not found. Available: {self._list_camera_names()}")
 
@@ -1626,7 +1789,7 @@ class RenderingMixin:
                 K_explicit = None
             else:
                 R, t, fovy_deg = self._named_camera_pose(mj, model, self._world._data, camera_name)
-                cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+                cam_id = self._camera_id(camera_name)
                 K_explicit = self._explicit_intrinsics_K(mj, _np, model, self._world._data, cam_id, w, h)
 
         if K_explicit is not None:
@@ -1746,7 +1909,7 @@ class RenderingMixin:
         Raises:
             KeyError: no camera of that name exists in the model.
         """
-        cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+        cam_id = self._camera_id(camera_name)
         if cam_id < 0:
             raise KeyError(f"Camera '{camera_name}' not found. Available: {self._list_camera_names()}")
         mj.mj_forward(model, data)
@@ -1805,6 +1968,103 @@ class RenderingMixin:
         x_axis = np_mod.cross(up, z_axis)
         R = np_mod.column_stack([x_axis, up, z_axis])
         return R, t, float(model.vis.global_.fovy)
+
+    def _camera_id(self, camera_name: str | None) -> int:
+        """Resolve a caller-supplied camera name to its compiled-model camera id.
+
+        The counterpart to :meth:`_list_camera_names`: that method says which
+        names this backend offers, and this one turns any of them into the
+        ``mjOBJ_CAMERA`` id every render path needs. A bare model lookup is not
+        enough, because two spellings answer for one camera: ``add_robot``
+        registers a robot's own MJCF cameras under their SHORT name (``wrist``)
+        -- the config-level schema :meth:`get_observation` publishes and
+        ``add_robot`` reports -- while the compiled model holds them namespaced
+        (``arm0/wrist``). The registered ``SimCamera`` carries the namespaced
+        name, so it answers for the short keys the bare lookup cannot.
+
+        Resolving both spellings in ONE place is what makes
+        :meth:`list_cameras` honest. Each surface used to do its own lookup, so
+        the short alias rendered through :meth:`get_observation` and was refused
+        by :meth:`render`, :meth:`render_depth`, :meth:`get_frame` and
+        :meth:`get_camera_params` -- while the refusal listed the very name it
+        was refusing as available, and ``start_cameras_recording`` accepted it
+        and wrote a clip of zero frames.
+
+        Args:
+            camera_name: A camera name as the caller supplied it, short or
+                namespaced. Free-camera tokens are not handled here: every
+                render path routes :data:`FREE_CAMERA_TOKENS` to the free view
+                before asking for an id.
+
+        Returns:
+            The model camera id, or ``-1`` when nothing in the compiled model
+            answers for the name -- which each caller reports beside
+            :meth:`_list_camera_names`.
+        """
+        world = getattr(self, "_world", None)
+        if world is None or getattr(world, "_model", None) is None:
+            return -1
+        model = world._model
+        mj = _ensure_mujoco()
+        cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, camera_name)
+        if cam_id < 0:
+            registered = registry_entry(world.cameras, camera_name)
+            cam_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_CAMERA, getattr(registered, "name", None))
+        return int(cam_id)
+
+    def _one_name_per_camera(self, names: Iterable[str]) -> list[str]:
+        """Drop each name that repeats a camera an earlier name already named.
+
+        A camera answers to more than one name: ``add_robot`` registers a
+        robot's MJCF cameras under their short alias (``wrist``) while the
+        compiled model holds them namespaced (``arm0/wrist``), and
+        :meth:`_camera_id` -- which owns that rule for every camera surface on
+        this backend -- resolves both spellings to one ``mjOBJ_CAMERA`` id.
+        Enumerating a scene by name therefore yields the same camera twice, so
+        the surfaces that capture "every camera" captured it twice:
+        :meth:`render_all` returned two pixel-identical frames under two
+        labels, and :meth:`start_cameras_recording` ran a second encoder to
+        write a second MP4 of one view.
+
+        That is the outcome two sibling guards already refuse --
+        :func:`~strands_robots.simulation.recording.camera_clip_name_collision_error`
+        for two cameras naming one clip, and
+        :func:`~strands_robots.utils.name_list_error` for a caller who names
+        one camera twice, because "a repeated name opened a second encoder on
+        the one output path". Neither could see this one: two spellings of one
+        camera are two distinct names, and they name two distinct clips.
+
+        The first spelling wins, which keeps a caller's own ordering and, for
+        the scene-wide list, prefers the namespaced model name -- unique per
+        robot by construction, and the spelling these surfaces have always
+        captured under.
+
+        Args:
+            names: Camera names, in the order they were resolved.
+
+        Returns:
+            ``names`` without any repeat of an already-named camera. A name no
+            camera in the compiled model answers for cannot be shown to repeat
+            another, so every such name is kept for its caller to report.
+        """
+        first_named_by: dict[int, str] = {}
+        kept: list[str] = []
+        for name in names:
+            cam_id = self._camera_id(name)
+            if cam_id < 0:
+                kept.append(name)
+                continue
+            if (already := first_named_by.get(cam_id)) is not None:
+                logger.debug(
+                    "Camera %r is camera id %d, already listed as %r; not capturing it twice",
+                    name,
+                    cam_id,
+                    already,
+                )
+                continue
+            first_named_by[cam_id] = name
+            kept.append(name)
+        return kept
 
     def _list_camera_names(self) -> list[str]:
         """helper to list all camera names (model-defined + SimCamera aliases)
@@ -1882,34 +2142,18 @@ class RenderingMixin:
                     "geom2": int(data.contact[i].geom2),
                     "dist": float(data.contact[i].dist),
                     "pos": data.contact[i].pos.tolist(),
-                    # ``exclude == 0`` is MuJoCo's own decision to hand the
-                    # pair to the constraint solver, i.e. the pair is close
-                    # enough to push back. Anything else is in the gap and
-                    # carries no force.
-                    "active": int(data.contact[i].exclude) == 0,
+                    # MuJoCo's own decision to hand the pair to the
+                    # constraint solver, i.e. the pair is close enough to push
+                    # back. Anything else is in the gap and carries no force.
+                    "active": mj_contact_is_active(data.contact[i]),
                 }
                 for i in range(ncon)
             ]
 
-        def _resolve_geom(gid: int) -> str:
-            """Prefer the geom name; fall back to its parent body name; then id."""
-            gn = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, gid)
-            if gn:
-                return gn
-            # Walk to the parent body name.
-            try:
-                bid = int(model.geom_bodyid[gid])
-                bn = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, bid)
-                if bn:
-                    return f"{bn}/geom_{gid}"
-            except (IndexError, AttributeError):
-                pass
-            return f"geom_{gid}"
-
         contacts = []
         for c in contact_snapshot:
-            g1 = _resolve_geom(c["geom1"])
-            g2 = _resolve_geom(c["geom2"])
+            g1 = geom_label(model, c["geom1"], mj)
+            g2 = geom_label(model, c["geom2"], mj)
             contacts.append({"geom1": g1, "geom2": g2, "dist": c["dist"], "pos": c["pos"], "active": c["active"]})
 
         if contacts:
@@ -2031,10 +2275,17 @@ class RenderingMixin:
         Handles namespaced camera names (e.g. 'arm0/wrist_cam') by also
         checking the short suffix form ('wrist_cam').
 
+        Each camera is named once: a scene holds a robot camera under both its
+        namespaced and its short spelling, and the callers of this method
+        capture one frame or open one encoder per name returned, so
+        :meth:`_one_name_per_camera` drops a name that repeats a camera an
+        earlier name already named.
+
         Returns
         -------
         resolved : list[str]
-            Camera names that resolved to real model cameras.
+            Camera names that resolved to real model cameras, each camera
+            appearing once.
         unresolved_inputs : list[str]
             User-supplied camera names that could NOT be resolved (empty
             list when cameras is None or when every input matched).
@@ -2048,7 +2299,7 @@ class RenderingMixin:
         py_side = list(self._world.cameras.keys()) if self._world else []
         all_cams = list(dict.fromkeys(from_model + py_side))
         if cameras is None:
-            return all_cams, []
+            return self._one_name_per_camera(all_cams), []
         # Try to resolve unknown names via namespace prefix matching.
         resolved: list[str] = []
         unresolved: list[str] = []
@@ -2068,7 +2319,7 @@ class RenderingMixin:
                         c,
                         ", ".join(all_cams) or "(none)",
                     )
-        return resolved, unresolved
+        return self._one_name_per_camera(resolved), unresolved
 
     def render_all(self, cameras=None, width=None, height=None):
         """Render every (or a subset of) camera in one call.
@@ -2154,14 +2405,19 @@ class RenderingMixin:
     ):
         """Start background capture of one ndarray buffer per camera.
 
-        Strategy: the background thread collects raw RGB frames in memory
-        (one list per camera). ``stop_cameras_recording`` then flushes each
-        list to an MP4 on the main thread. This avoids a long-lived ffmpeg
-        subprocess pipe that would break under concurrent imageio writes +
-        policy-loop timing jitter.
+        Locking: this verb is dispatched OUTSIDE the blanket action lock
+        (``Simulation._SELF_LOCKING_ACTIONS``) and takes ``self._lock`` itself
+        around the validation + registration in
+        :meth:`_start_cameras_recording_under_lock`, then waits for the
+        recorder thread's readiness with the lock released. The thread's
+        warmup ``render`` needs that lock; waiting for it while holding it
+        spent the whole readiness timeout on nothing and returned success over
+        a recorder that had not captured a frame.
 
-        Memory cost: H*W*3 bytes * fps * duration * n_cams. For a 2s / 4-cam /
-        320x240 / 15fps rollout: ~27 MB. Bounded by ``max_frames_per_camera``.
+        The recorder samples WALL time: one frame per ``1 / fps`` seconds of
+        real time while it runs, not one per sim step. A ``step()`` burst that
+        returns in milliseconds records ~0 frames; for one frame per control
+        step record with ``start_recording`` (LeRobotDataset) instead.
 
         Args:
             cameras: list of camera names; None = every camera.
@@ -2180,6 +2436,90 @@ class RenderingMixin:
                 component - separators / traversal / metacharacters rejected.
             max_frames_per_camera: safety cap on in-memory buffers. Must be a
                 positive whole number; ``0``/negative would drop every frame.
+
+        Returns:
+            The success envelope naming the tag, cameras and capture clock, or
+            the error envelope from the ``cameras`` domain below or from
+            :meth:`_start_cameras_recording_under_lock` on refusal.
+        """
+        # ``cameras`` names an ordered list of DISTINCT camera names. Its shape
+        # is the caller's own argument - no world state answers it - so it is
+        # refused here, before ``self._lock`` is even contended for, let alone
+        # any filesystem or capture-thread work. Neither mistake it catches
+        # could be honored as written: a single name passed as a bare string is
+        # iterable per character, so it was read as one camera per letter, and a
+        # repeated name opened a second encoder on the one output path, so the
+        # artifact ledger reported two files where one exists.
+        if cameras and (text := name_list_error(cameras, "cameras", "start_cameras_recording")):
+            return {"status": "error", "content": [{"text": text}]}
+        with self._lock:
+            prepared = self._start_cameras_recording_under_lock(
+                cameras=cameras,
+                output_dir=output_dir,
+                fps=fps,
+                width=width,
+                height=height,
+                name=name,
+                max_frames_per_camera=max_frames_per_camera,
+            )
+        if prepared.get("status") == "error":
+            return prepared
+        state = prepared["state"]
+        names = state["cameras"]
+        tag = state["name"]
+        out_dir = state["output_dir"]
+
+        # Wait for the recorder thread to warm its GL context and enter the
+        # capture loop before reporting success. Worst case is the 30-attempt
+        # warmup cap (~1s/cam at 64x48, more for larger frames) plus a small
+        # margin; the common case is ~0.5s. If warmup somehow stalls we still
+        # return after the timeout rather than blocking forever - the thread
+        # keeps trying and ``get_cameras_recording_status`` exposes errors.
+        _ready_timeout = 5.0 + 1.0 * len(names)
+        if not state["ready"].wait(timeout=_ready_timeout):
+            logger.warning(
+                "camera recorder '%s' not ready after %.1fs; returning anyway (first frames may be delayed)",
+                tag,
+                _ready_timeout,
+            )
+
+        # The clock the recorder samples is the one thing a caller cannot see
+        # from the frame counts: it is wall time. A ``step(n_steps=500)`` that
+        # finishes in 10 ms advances the world 1 s and yields no frame.
+        msg = (
+            f"Recording {len(names)} camera(s) @ {fps} FPS -> {out_dir}\n   tag: {tag}\n   cameras: {', '.join(names)}\n"
+            f"   clock: wall time - one frame every {1.0 / fps:.3f}s of real time while the recorder runs, "
+            f"not one per sim step; a step() burst that returns in milliseconds records ~0 frames. "
+            f"For one frame per control step record with start_recording (dataset) instead."
+        )
+        return {"status": "success", "content": [{"text": msg}]}
+
+    def _start_cameras_recording_under_lock(
+        self,
+        cameras=None,
+        output_dir=None,
+        fps=30,
+        width=None,
+        height=None,
+        name=None,
+        max_frames_per_camera=3000,
+    ):
+        """Validate, register and start the recorder thread; caller holds ``self._lock``.
+
+        Returns the error envelope on refusal, else ``{"state": state}`` for
+        :meth:`start_cameras_recording` to wait on and report.
+
+        Strategy: the background thread collects raw RGB frames in memory
+        (one list per camera). ``stop_cameras_recording`` then flushes each
+        list to an MP4 on the main thread. This avoids a long-lived ffmpeg
+        subprocess pipe that would break under concurrent imageio writes +
+        policy-loop timing jitter.
+
+        Memory cost: H*W*3 bytes * fps * duration * n_cams. For a 2s / 4-cam /
+        320x240 / 15fps rollout: ~27 MB. Bounded by ``max_frames_per_camera``.
+
+        Takes the same arguments as :meth:`start_cameras_recording`, which
+        documents them.
         """
         import os as _os
         import tempfile as _tempfile
@@ -2197,15 +2537,6 @@ class RenderingMixin:
             "start_cameras_recording", fps, width, height, max_frames_per_camera
         ):
             return error
-        # ``cameras`` names an ordered list of DISTINCT camera names, so it is
-        # refused on the shared name-list domain before any filesystem or capture-thread work. Neither
-        # mistake this catches could be honored as written: a single name passed
-        # as a bare string is iterable per character, so it was read as one
-        # camera per letter, and a repeated name opened a second encoder on the one output
-        # path, so the artifact ledger reported two files where one exists.
-        if cameras and (text := name_list_error(cameras, "cameras", "start_cameras_recording")):
-            return {"status": "error", "content": [{"text": text}]}
-
         # The guard above accepts any real scalar with an integral value, so a
         # ``640.0`` read from a config float and an ``np.int64`` probed from a
         # camera are both usable pixel counts - honor that by normalizing them
@@ -2240,6 +2571,14 @@ class RenderingMixin:
         if not names:
             return {"status": "error", "content": [{"text": "No cameras to record."}]}
 
+        # A namespaced camera ("arm0/wrist") is ONE camera, and the clip names
+        # below write its separator as "__" so the clip stays a file inside
+        # output_dir. That collapse is not injective, so two cameras naming one
+        # clip are refused before a frame is captured rather than one silently
+        # overwriting the other.
+        if collision := camera_clip_name_collision_error("start_cameras_recording", names):
+            return collision
+
         # output_dir and name are LLM-supplied: reject traversal / symlink /
         # metacharacters (and a name carrying path separators) before we
         # makedirs and interpolate name into the per-camera filename.
@@ -2266,7 +2605,7 @@ class RenderingMixin:
         tag = name or f"rec_{_uuid.uuid4().hex[:8]}"
 
         buffers = {cam: [] for cam in names}
-        paths = {cam: _os.path.join(out_dir, f"{tag}__{cam}.mp4") for cam in names}
+        paths = {cam: _os.path.join(out_dir, f"{tag}__{camera_schema_key(cam)}.mp4") for cam in names}
 
         # ``ready`` is set by the recorder thread once its GL context is warm
         # and it has entered the capture loop. ``start`` blocks on it below so
@@ -2441,28 +2780,45 @@ class RenderingMixin:
                 if lag < interval:
                     _time.sleep(interval - lag)
 
-        state["thread"] = _threading.Thread(target=_loop, daemon=True)
-        state["thread"].start()
+        # Register BEFORE the thread exists. The registration is the only route
+        # every other recorder verb has to this recording -
+        # ``get_cameras_recording_status``, ``stop_cameras_recording`` and the
+        # guard both start verbs ask (:meth:`_refuse_replacing_cams_recording`)
+        # all read ``_cams_rec_state`` - so a thread that is capturing before it
+        # is published is a recorder nothing can see: a concurrent status read
+        # answered ``[idle]`` about a live capture, a stop reported "Was not
+        # recording cameras" as a success and left that thread rendering to its
+        # ``max_frames`` cap, and a second start was admitted onto the same
+        # cameras and then had its own registration overwritten by the store
+        # below, orphaning its thread and its frames. Publishing first closes
+        # all three, and costs nothing: ``running`` is already set, so the phase
+        # a status read sees is ``[recording]`` with no frames yet, and the
+        # ``thread`` slot stays ``None`` for the same window that the
+        # synchronous recorder - which registers before it builds its closures -
+        # leaves it ``None`` for good, so every reader already tolerates it.
         self._cams_rec_state = state
+        state["thread"] = _threading.Thread(target=_loop, daemon=True)
+        try:
+            state["thread"].start()
+        except RuntimeError as e:
+            # No capture loop will ever run, so the registration this method
+            # just published would refuse every later start for the lifetime of
+            # the world (only a flush deregisters) and hand ``stop`` an
+            # unstarted thread to join. Deregister and report instead.
+            self._cams_rec_state = None
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"start_cameras_recording: could not start the recorder thread for "
+                            f"'{tag}': {e}. Nothing was recorded and no recording is registered."
+                        )
+                    }
+                ],
+            }
 
-        # Wait for the recorder thread to warm its GL context and enter the
-        # capture loop before reporting success. Worst case is the 30-attempt
-        # warmup cap (~1s/cam at 64x48, more for larger frames) plus a small
-        # margin; the common case is ~0.5s. If warmup somehow stalls we still
-        # return after the timeout rather than blocking forever - the thread
-        # keeps trying and ``get_cameras_recording_status`` exposes errors.
-        _ready_timeout = 5.0 + 1.0 * len(names)
-        if not state["ready"].wait(timeout=_ready_timeout):
-            logger.warning(
-                "camera recorder '%s' not ready after %.1fs; returning anyway (first frames may be delayed)",
-                tag,
-                _ready_timeout,
-            )
-
-        msg = (
-            f"Recording {len(names)} camera(s) @ {fps} FPS -> {out_dir}\n   tag: {tag}\n   cameras: {', '.join(names)}"
-        )
-        return {"status": "success", "content": [{"text": msg}]}
+        return {"state": state}
 
     def stop_cameras_recording(self):
         """Stop capture, flush buffers to MP4 on the MAIN thread.
@@ -2470,6 +2826,12 @@ class RenderingMixin:
         Runs ``imageio.get_writer``/``append_data``/``close`` here instead of
         the recording thread so the ffmpeg pipe doesn't race with policy
         timing jitter. Returns per-camera frame counts and paths.
+
+        Locking: dispatched OUTSIDE the blanket action lock
+        (``Simulation._SELF_LOCKING_ACTIONS``) and takes none itself - it
+        touches the recorder registration and the frame buffers, not mjData.
+        The thread it joins renders under ``self._lock``; joining it while
+        holding that lock expired the join every time.
 
         Idempotent and safe whichever ``start_cameras_recording*`` variant
         was used:
@@ -2657,10 +3019,16 @@ class RenderingMixin:
                     )
                 if _os.path.exists(path):
                     size_kb = _os.path.getsize(path) / 1024
-            line = (
-                f"   {cam:20s} {frames_written:>5d} frames  {size_kb:>7.1f} KB  "
-                f"({errors} errors)  -> {_os.path.basename(path)}"
-            )
+            if frames_buffer:
+                line = (
+                    f"   {cam:20s} {frames_written:>5d} frames  {size_kb:>7.1f} KB  "
+                    f"({errors} errors)  -> {_os.path.basename(path)}"
+                )
+            else:
+                # No frame was ever buffered, so no clip exists: say so instead
+                # of naming a file that was never written (a caller fed that
+                # path onward and found nothing there).
+                line = f"   {cam:20s}     0 frames - no clip written ({errors} errors)"
             if frames_skipped:
                 line += f"  [{frames_skipped} skipped: size mismatch]"
             if flush_error:
@@ -2668,7 +3036,7 @@ class RenderingMixin:
             lines.append(line)
             artifact = {
                 "camera": cam,
-                "path": path,
+                "path": path if frames_buffer else None,
                 "frames": frames_written,
                 "errors": errors,
                 "size_kb": size_kb,
@@ -2832,6 +3200,14 @@ class RenderingMixin:
         if not names:
             return {"status": "error", "content": [{"text": "No cameras to record."}]}
 
+        # A namespaced camera ("arm0/wrist") is ONE camera, and the clip names
+        # below write its separator as "__" so the clip stays a file inside
+        # output_dir. That collapse is not injective, so two cameras naming one
+        # clip are refused before a frame is captured rather than one silently
+        # overwriting the other.
+        if collision := camera_clip_name_collision_error("start_cameras_recording_synchronous", names):
+            return collision
+
         # output_dir and name are LLM-supplied: reject traversal / symlink /
         # metacharacters (and a name carrying path separators) before we
         # makedirs and interpolate name into the per-camera filename.
@@ -2858,7 +3234,7 @@ class RenderingMixin:
         tag = name or f"rec_{_uuid.uuid4().hex[:8]}"
 
         buffers: dict[str, list] = {cam: [] for cam in names}
-        paths = {cam: _os.path.join(out_dir, f"{tag}__{cam}.mp4") for cam in names}
+        paths = {cam: _os.path.join(out_dir, f"{tag}__{camera_schema_key(cam)}.mp4") for cam in names}
 
         state: dict[str, Any] = {
             "running": True,

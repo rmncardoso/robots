@@ -5,7 +5,7 @@ description: Strands @tool helpers for hardware bring-up - calibrate, camera, te
 # Hardware tools
 
 ```python
-from strands_robots.tools import (
+from strands_robots import (
     lerobot_camera, lerobot_teleoperate, lerobot_train,
     pose_tool, serial_tool, download_assets,
     gr00t_inference,   # see GR00T page
@@ -32,6 +32,17 @@ from strands_robots.tools import (
 | `use_rtps` | `"types"`, `"advertise"`, `"publish"`, `"subscribe"`, `"echo"` | Join a ROS 2 graph over pure RTPS (no rclpy) - see [Pure-RTPS ROS 2](../rtps-integration.md) |
 
 Parse results via `result["content"][0]["text"]`, not custom keys like `result["ports"]`.
+
+### `pose_tool` and `serial_tool` need pyserial
+
+Both drive the servo bus through pyserial, and no extra of this project declares
+it on its own - it arrives only inside `lerobot[feetech]`. Without it neither
+tool imports, and the refusal names the remedy rather than leaving the
+interpreter's `No module named 'serial'` as the only hint:
+
+```bash
+pip install pyserial
+```
 
 ### Numeric options are checked before the session starts
 
@@ -342,7 +353,7 @@ result = lerobot_teleoperate(
 ```python
 from strands import Agent
 from strands_robots import Robot
-from strands_robots.tools import lerobot_camera, pose_tool, serial_tool
+from strands_robots import lerobot_camera, pose_tool, serial_tool
 
 agent = Agent(tools=[
     Robot("so100"),

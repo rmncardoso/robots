@@ -140,12 +140,38 @@ def _quat_wxyz_to_rotmat(quat: np.ndarray) -> np.ndarray:
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read a small positive int from the environment (fallback to ``default``)."""
-    try:
-        v = int(os.environ.get(name, ""))
-        return v if v > 0 else default
-    except (TypeError, ValueError):
+    """Read a small positive int from the environment (fallback to ``default``).
+
+    Every rejection is reported, for the reason :func:`_env_float` below gives
+    for its own: substituting the default in silence leaves the operator's
+    model of the knob wrong with nothing to correct it against. The three
+    knobs this resolver serves are step counts whose effect is only visible
+    several calls away - ``STRANDS_ISAAC_CAMERA_WARMUP_STEPS`` decides whether
+    a new camera's first frame is real or the pipeline's empty buffer - so a
+    typo (``3O``), a float spelling (``10.0``) or a non-positive count that
+    fell back unreported surfaced as a wrong frame rather than as a
+    misconfigured variable. The accepted domain is unchanged: what ``int()``
+    parses and ``> 0`` admits.
+
+    Args:
+        name: Environment variable to read. Unset, empty or unusable falls back.
+        default: Value applied when the variable names no usable count.
+
+    Returns:
+        The override when it is a positive whole number, else ``default``.
+    """
+    raw = os.environ.get(name, "")
+    if raw.strip() == "":
         return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a whole number; using %r", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Isaac simulation: %s must be > 0, got %r; using %r", name, value, default)
+        return default
+    return value
 
 
 def _env_float(name: str, default: float) -> float:
@@ -2972,7 +2998,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             ``False``, uses the ``Dynamic*`` counterpart and participates in
             physics with ``mass``. ``None`` (the default) means unspecified;
             this backend derives nothing from ``shape``, so it resolves to
-            ``False``.
+            ``False``. A supplied value must be a boolean: it selects a
+            posture, so ``0`` and the truthy ``"false"`` are refused rather
+            than read by truthiness.
         mesh_path : str, optional
             Path to a custom mesh asset; required and only used when
             ``shape="mesh"`` (a ``mesh_path`` on a primitive shape is
@@ -3131,6 +3159,21 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     "status": "error",
                     "content": [{"text": f"Object '{name}' already exists."}],
                 }
+
+            # ``is_static`` selects a posture, so it is checked rather than read by
+            # truthiness - the same domain the MuJoCo backend applies, so a spelling
+            # one backend refuses is refused by all of them. Every read of it here is
+            # a truthiness one, so ``"false"`` fixed a body asked to be dynamic and
+            # ``0`` was stored verbatim. ``None`` is the documented "unspecified"
+            # sentinel, resolved just below, so only a supplied value is graded.
+            if is_static is not None:
+                if err := self._validate_posture_flags("add_object", is_static=is_static):
+                    return err
+                # Normalized to a plain ``bool`` now it is known to be one: the
+                # ``numpy`` boolean this domain accepts would otherwise land on
+                # :class:`SimObject.is_static`, which is annotated ``bool``, and
+                # render as ``np.True_`` in the agent-visible object listing.
+                is_static = bool(is_static)
 
             # ``None`` means the caller did not specify, per
             # :meth:`~strands_robots.simulation.base.SimEngine.add_object`. This
@@ -3537,7 +3580,6 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         the asset is referenced onto the stage rather than constructed
         from a primitive class.
         """
-        import numpy as np  # type: ignore[import-not-found]
 
         if shape == "mesh":
             if not mesh_path:
@@ -3663,7 +3705,6 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         ImportError)``, so a failed conversion / reference / wrap returns a
         structured error envelope and leaves the name reusable.
         """
-        import numpy as np  # type: ignore[import-not-found]
 
         from strands_robots.simulation.isaac.mesh_assets import (
             MESH_EXTENSIONS,
@@ -4593,8 +4634,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
 
                 # Floating base: the four entries the ``SimEngine.get_observation``
                 # schema requires of a robot whose root is free. MuJoCo emits them
-                # (``mujoco/rendering.py``) and Newton emits them
-                # (``newton/simulation.py``); this backend emitted none, so a
+                # (:mod:`strands_robots.simulation.mujoco.rendering`) and Newton
+                # emits them (:mod:`strands_robots.simulation.newton.simulation`);
+                # this backend emitted none, so a
                 # locomotion policy reading ``base_lin_vel`` - the base twist every
                 # walking controller is conditioned on - got nothing here, while
                 # the same policy on the other two backends got a value. That is
@@ -6798,8 +6840,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
 
-            # Refuse a name that cannot address the camera this call creates, on
-            # the shared ``camera_name_error`` rule every backend's
+            # Refuse a name that cannot address the camera this call creates, or
+            # cannot key its frames at the consumers that read the name as
+            # structure, on the shared ``camera_name_error`` rule every backend's
             # ``add_camera`` reads, so a name one backend refuses is refused by
             # all three - the same invariant this method already honours for
             # ``position`` / ``target`` / ``fov`` / ``width`` / ``height``
@@ -7400,8 +7443,6 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         """
         import math
 
-        import numpy as np  # type: ignore[import-not-found]
-
         try:
             from isaacsim.sensors.camera import Camera  # type: ignore[import-not-found]
         except ImportError:
@@ -7840,7 +7881,6 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         ImportError)`` so any Isaac-side surface drift returns a
         structured error envelope rather than blowing up the agent.
         """
-        import numpy as np  # type: ignore[import-not-found]
 
         # Isaac Sim 6.0 renamed the single-articulation wrapper. The 4.x
         # path was ``omni.isaac.core.articulations.Articulation``; on 6.0
@@ -7946,7 +7986,6 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         ``(RuntimeError, ValueError, OSError, AttributeError,
         TypeError, ImportError)``.
         """
-        import numpy as np  # type: ignore[import-not-found]
 
         # Isaac Sim 6.0 renamed the single-articulation wrapper (see
         # ``_import_articulation_cls`` / ``_load_usd_robot``). Probe the
@@ -7960,7 +7999,6 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         #   ``acquire_urdf_interface().parse_urdf()/import_robot()``.
         # * pre-4.5 used ``omni.importer.urdf._urdf``.
         # Try the modern 6.0 class API first, then the legacy ``_urdf`` ifaces.
-        import os
 
         urdf_root, urdf_filename = os.path.split(os.path.abspath(urdf_path))
         imported_prim_path = None

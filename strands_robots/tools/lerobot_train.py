@@ -35,6 +35,7 @@ from strands_robots.tools._process_stop import (
     SIGTERM_GRACE_S,
     SessionManager,
     confirm_exit,
+    generate_session_name,
     process_started_since_boot,
     recorded_pid,
     reused_pid_result,
@@ -790,7 +791,7 @@ def build_train_command(
 
 @tool(context=True)
 def lerobot_train(
-    dataset_root: str,
+    dataset_root: str | None = None,
     tool_context: ToolContext | None = None,
     policy_type: str = "act",
     pretrained_path: str | None = None,
@@ -865,6 +866,8 @@ def lerobot_train(
 
     Args:
         dataset_root: Local LeRobot v3 dataset directory (must contain meta/info.json).
+            Read by ``start`` only, which refuses to launch without it; ``status``,
+            ``stop`` and ``list`` look a session up by name and never read it.
         policy_type: Policy architecture (act, diffusion, vqbet, tdmpc, smolvla,
             pi0, pi05, pi0_fast, groot, xvla, ...).
         pretrained_path: HF id or local path to initialize weights from (gated
@@ -958,6 +961,11 @@ def lerobot_train(
                 return {"status": "error", "content": [{"text": flag_error}]}
 
             # Preflight: lerobot must be importable and the dataset must exist.
+            if not dataset_root:
+                return {
+                    "status": "error",
+                    "content": [{"text": "dataset_root required for start action"}],
+                }
             try:
                 import lerobot  # noqa: F401
             except ImportError as e:
@@ -979,7 +987,7 @@ def lerobot_train(
                 }
 
             if not session_name:
-                session_name = f"train_{int(time.time())}"
+                session_name = generate_session_name("train")
             if session_manager.get_session(session_name):
                 return {
                     "status": "error",

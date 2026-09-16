@@ -34,7 +34,7 @@ def _ensure_policy_configs_registered() -> None:
     (``ACTConfig``, ``MolmoAct2Config``, ...) calls
     ``@PreTrainedConfig.register_subclass(...)`` at module import time.
     The previous strategy here was to import ONE known config (``act``)
-    on the assumption that lerobot's eager ``policies/__init__.py`` would
+    on the assumption that lerobot's eager ``lerobot.policies`` package would
     pull in every other policy as a side effect.
 
     That assumption is fragile:
@@ -116,8 +116,8 @@ def _ensure_policy_configs_registered() -> None:
     #
     # 1. ``pkgutil.iter_modules`` -- yields regular packages (those with
     #    ``__init__.py``). We filter with ``is_pkg=True`` so non-package
-    #    siblings (``factory.py``, ``utils.py``, ``pretrained.py``,
-    #    ``pi_gemma.py``) are excluded. Importing those as a package-level
+    #    siblings (``lerobot.policies.factory``, ``lerobot.policies.utils``,
+    #    ``lerobot.policies.pretrained``, ``lerobot.policies.pi_gemma``) are excluded. Importing those as a package-level
     #    fallback would pull in transformers/diffusers -- exactly the heavy
     #    import graph the stub mechanism exists to avoid.
     #
@@ -581,25 +581,65 @@ def _read_policy_type_from_config(pretrained_name_or_path: str, revision: str | 
     Returns:
         Policy type string or None if not found.
     """
-    # Try local path first
+    config = _read_config_json(pretrained_name_or_path, revision)
+    return None if config is None else _policy_type_from_config(config)
+
+
+def _read_config_json(pretrained_name_or_path: str, revision: str | None = None) -> dict[str, Any] | None:
+    """Read a checkpoint's ``config.json`` from a local directory or the Hub.
+
+    Args:
+        pretrained_name_or_path: Local path or HF model ID.
+        revision: Optional Hub revision (branch, tag, or commit SHA) to pin the
+            downloaded config.json to. ``None`` uses the default branch.
+
+    Returns:
+        The parsed config, or ``None`` when it cannot be read.
+    """
     local_path = Path(pretrained_name_or_path)
     if local_path.is_dir() and (local_path / "config.json").exists():
         with open(local_path / "config.json", encoding="utf-8") as config_file:
-            config = json.load(config_file)
-        return _policy_type_from_config(config)
+            return json.load(config_file)
 
-    # Try downloading from HuggingFace Hub
     try:
         from huggingface_hub import hf_hub_download
 
         config_path = hf_hub_download(pretrained_name_or_path, "config.json", revision=revision)
         with open(config_path, encoding="utf-8") as config_file:
-            config = json.load(config_file)
-        return _policy_type_from_config(config)
+            return json.load(config_file)
     except (ImportError, OSError, ValueError, KeyError) as exc:
         logger.warning("Could not download config.json: %s", exc)
 
     return None
 
 
-__all__ = ["resolve_policy_class_from_hub", "resolve_policy_class_by_name"]
+def declared_image_features(pretrained_name_or_path: str, revision: str | None = None) -> set[str] | None:
+    """The image features a checkpoint declares, read before its weights are.
+
+    A LeRobot checkpoint records its own ``input_features`` in ``config.json``,
+    so which images it consumes is knowable without the multi-minute weight
+    download. The camera pre-flight check reads it to compare an embodiment's
+    rename targets against the features the model will really declare, rather
+    than assuming the two agree.
+
+    Args:
+        pretrained_name_or_path: Local path or HF model ID.
+        revision: Optional Hub revision to pin the read to.
+
+    Returns:
+        The declared ``VISUAL`` feature names, or ``None`` when the checkpoint
+        records no ``input_features`` (a transformers-native checkpoint builds
+        its feature set at load time) or cannot be read. ``None`` means
+        "unknown" and must not be read as "declares no images"; an empty set is
+        the latter.
+    """
+    config = _read_config_json(pretrained_name_or_path, revision)
+    if config is None:
+        return None
+    features = config.get("input_features")
+    if not isinstance(features, dict):
+        return None
+    return {name for name, spec in features.items() if isinstance(spec, dict) and spec.get("type") == "VISUAL"}
+
+
+__all__ = ["declared_image_features", "resolve_policy_class_by_name", "resolve_policy_class_from_hub"]

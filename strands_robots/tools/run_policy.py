@@ -40,7 +40,10 @@ Design notes (the contract this tool pins):
   invokes the ``PolicyRunner._finalize_recorder_episode`` helper between
   rollouts so each episode lands in its own parquet
   row. The trailing ``stop_recording`` flushes the final episode and
-  closes the dataset.
+  closes the dataset. A boundary that FAILS stops the loop and is reported
+  as ``recording_save_error``: the recorder closes itself on a failed flush,
+  so the remaining episodes would record nothing and count no drops, and a
+  count over them would be the very self-report this tool exists to replace.
 * Recording is OPTIONAL. When ``dataset_root`` is provided we drive a full
   ``start_recording`` -> ``stop_recording`` cycle and report parquet-truth
   (``total_episodes``, ``total_frames``). When ``dataset_root`` is omitted
@@ -299,7 +302,18 @@ def run_policy(
             unknown predicate name is rejected with the valid list while
             nothing has been set up yet. Each rollout's ``stopped_reason``
             (``'predicate'`` | ``'budget'`` | ``'cancelled'`` | ``'error'``)
-            is reported per episode.
+            is reported per episode, as is ``stop_when_true_at_reset``: a
+            clause the scene's initial state already satisfies is evaluated
+            only AFTER an applied action, so it fires on the episode's first
+            step whatever the policy commands - one recorded frame for that
+            episode, tagged ``stopped_reason='predicate'`` and
+            indistinguishable from an episode that reached the condition.
+            Usually a threshold on the wrong side of the initial state (a
+            ``body_above_z`` below where the object already rests). The
+            payload aggregates ``episodes_stop_when_true_at_reset`` with
+            ``stop_when_reset_warning``; it is deliberately not a ``warnings``
+            entry, which would flip ``status`` to ``"error"``, because domain
+            randomisation legitimately satisfies a clause on some draws.
 
     Returns:
         Standard ``{status, content}`` payload. On success the payload
@@ -310,7 +324,10 @@ def run_policy(
                 "n_episodes_actual": int,      # parquet-truth, -1 if unread
                 "n_frames_actual": int,        # parquet-truth, -1 if unread
                 "dataset_root": str | None,
+                "recording_save_error": str | None,   # None on a healthy run
                 "warnings": [str, ...],        # mismatch flags
+            "episodes_stop_when_true_at_reset": int,
+            "stop_when_reset_warning": str | None,
                 "episodes": [
                     {"index": int, "status": "success" | "error", ...},
                     ...
@@ -505,6 +522,7 @@ def run_policy(
     # ---- 3. Episode loop ------------------------------------------------
     episodes: list[dict[str, Any]] = []
     requested_video_paths: list[str] = []
+    recording_save_error: str | None = None
     try:
         for ep in range(n_episodes):
             ep_seed = None if seed is None else seed + ep
@@ -549,6 +567,13 @@ def run_policy(
             if isinstance(rollout_json, dict) and "stopped_reason" in rollout_json:
                 ep_record["stopped_reason"] = rollout_json["stopped_reason"]
                 ep_record["steps_used"] = rollout_json.get("steps_used")
+                # A clause that already held at this episode's reset makes the
+                # episode end after one step with stopped_reason="predicate" -
+                # a one-frame episode tagged as having reached the condition.
+                # Carried through per episode because a randomised initial state
+                # makes it an EPISODE-level fact, not a run-level one.
+                ep_record["stop_when_true_at_reset"] = bool(rollout_json.get("stop_when_true_at_reset", False))
+                ep_record["stop_when_reset_warning"] = rollout_json.get("stop_when_reset_warning")
             episodes.append(ep_record)
 
             # Per-episode parquet boundary. This helper is wired inside
@@ -564,7 +589,17 @@ def run_policy(
             # the existing API surface: build a transient PolicyRunner just
             # for the finalize call. It's stateless w.r.t. the recorder.
             if recording_started:
-                _finalize_episode(simulation)
+                recording_save_error = _finalize_episode(simulation)
+                if recording_save_error is not None:
+                    # This episode's frames did not reach the dataset and the
+                    # recorder closed itself, so every later episode would run
+                    # into a recorder that drops frames without counting them -
+                    # burning the remaining budget to record nothing. Stop and
+                    # report the reason, which is the posture every sibling
+                    # flush takes (PolicyRunner.evaluate breaks here too).
+                    recording_save_error = f"episode {ep}: {recording_save_error}"
+                    logger.error("run_policy: stopping the rollout - %s", recording_save_error)
+                    break
 
     finally:
         # ---- 4. Stop recording (always, on success or failure) ----------
@@ -583,6 +618,15 @@ def run_policy(
     n_actual_frames = _NO_COUNT
     warnings_: list[str] = []
     truth: dict[str, Any] = {}
+
+    # First, so it reads as the cause of the episode-count mismatch below
+    # rather than as another symptom of it.
+    if recording_save_error is not None:
+        warnings_.append(
+            f"the recorder could not flush an episode - {recording_save_error}. "
+            f"The remaining episodes of {n_episodes} were not run: a closed recorder "
+            "drops their frames without counting them."
+        )
 
     if dataset_root is not None:
         truth = _read_parquet_truth(dataset_root)
@@ -609,18 +653,40 @@ def run_policy(
             elif n_actual_eps != n_episodes:
                 warnings_.append(
                     f"FABRICATION GUARD: requested {n_episodes} episodes, "
-                    f"meta/info.json:total_episodes={n_actual_eps}. The "
-                    "per-episode save_episode boundary did not fire as "
-                    "expected. See #708."
+                    f"meta/info.json:total_episodes={n_actual_eps}. "
+                    + (
+                        # It DID fire, and said why it failed. Reporting it as
+                        # absent would send a reader after the tool's wiring
+                        # instead of after the reason above.
+                        f"The per-episode save_episode boundary failed: {recording_save_error}."
+                        if recording_save_error is not None
+                        else "The per-episode save_episode boundary did not fire as expected."
+                    )
+                    + " See #708."
                 )
 
     # ---- 6. Build payload ----------------------------------------------
     n_ok = sum(1 for e in episodes if e["status"] == "success")
+    # Episodes whose stop_when clause already held at reset, so they ended after
+    # one step whatever the policy commanded. Reported beside the counts rather
+    # than appended to ``warnings_``, which flips ``status`` to "error": a
+    # randomised initial state legitimately satisfies a clause on some draws, so
+    # this qualifies the episodes it names without failing the collection. Same
+    # posture as PolicyRunner.evaluate's episodes_successful_at_reset.
+    n_reset_true = sum(1 for e in episodes if e.get("stop_when_true_at_reset"))
+    # Carried up from the rollout that reported it rather than re-derived here:
+    # one source of truth for the text, and no import of the simulation
+    # package - which this tool must keep working without.
+    stop_when_reset_warning = next(
+        (e["stop_when_reset_warning"] for e in episodes if e.get("stop_when_reset_warning")), None
+    )
     summary_line = f"run_policy: {n_ok}/{n_episodes} episodes ok" + (
         f" | parquet-truth: total_episodes={n_actual_eps}, total_frames={n_actual_frames}"
         if dataset_root is not None
         else ""
     )
+    if n_reset_true:
+        summary_line += f" | stop_when_true_at_reset={n_reset_true}/{n_episodes}"
     if warnings_:
         summary_line += f" | warnings={len(warnings_)}"
 
@@ -629,7 +695,10 @@ def run_policy(
         "n_episodes_actual": n_actual_eps,
         "n_frames_actual": n_actual_frames,
         "n_episodes_ok": n_ok,
+        "episodes_stop_when_true_at_reset": n_reset_true,
+        "stop_when_reset_warning": stop_when_reset_warning,
         "dataset_root": dataset_root,
+        "recording_save_error": recording_save_error,
         "warnings": warnings_,
         "episodes": episodes,
     }
@@ -686,7 +755,7 @@ def _episode_video_config(
     return cfg, cfg["path"]
 
 
-def _finalize_episode(simulation: Any) -> None:
+def _finalize_episode(simulation: Any) -> str | None:
     """Invoke ``PolicyRunner._finalize_recorder_episode`` for ``simulation``.
 
     This helper is the canonical per-episode boundary on
@@ -695,21 +764,38 @@ def _finalize_episode(simulation: Any) -> None:
     ``save_episode``). Bare ``run_policy`` does not invoke it - it assumes
     the caller owns episode framing. Since this tool *is* the caller, we
     delegate to the same helper to keep the boundary logic in one place
-    and to inherit its tolerance for absent/empty buffers and save errors.
+    and to inherit its tolerance for absent/empty buffers.
+
+    Returns:
+        ``None`` when the episode was flushed, when there was nothing to
+        flush, or when the boundary could not be attempted at all. The
+        helper's reason string when the flush FAILED.
+
+        A failed flush is not tolerable the way an absent boundary is, and
+        :meth:`~strands_robots.simulation.policy_runner.PolicyRunner._finalize_recorder_episode`
+        reports it by *returning* the reason rather than raising: the recorder
+        marks itself closed, so every later episode's frames reach no dataset
+        and are not counted as drops either. The reason is handed back for the
+        episode loop to stop on, exactly as
+        :meth:`~strands_robots.simulation.policy_runner.PolicyRunner.evaluate`
+        stops on it. Being unable to *reach* the boundary is different and stays
+        tolerated: no episode was flushed, so no recorder is poisoned, and the
+        parquet-truth gate below reports the count that results.
     """
     try:
         from strands_robots.simulation.policy_runner import PolicyRunner
     except ImportError:
         logger.debug("PolicyRunner unavailable; skipping per-episode finalize")
-        return
+        return None
 
     try:
         runner = PolicyRunner(simulation)
     except Exception as e:  # noqa: BLE001
         logger.warning("Could not construct PolicyRunner for finalize: %s", e)
-        return
+        return None
 
     try:
-        runner._finalize_recorder_episode()  # noqa: SLF001 - this is the contract surface
-    except Exception as e:  # noqa: BLE001
+        return runner._finalize_recorder_episode()  # noqa: SLF001 - this is the contract surface
+    except Exception as e:  # noqa: BLE001 - documented not to raise; tolerated if it does
         logger.warning("Per-episode finalize raised: %s", e)
+        return None

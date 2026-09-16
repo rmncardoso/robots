@@ -679,9 +679,25 @@ class BoosterDriver:
             )
 
     def cleanup(self) -> None:
-        """Release the SDK channels. Idempotent, and stops first."""
-        if self._connected:
-            self.stop_task()
+        """Release the SDK channels. Idempotent, and stops first.
+
+        Annotated ``-> None``, so - like :meth:`stop` - it carries no verdict,
+        which makes the log the only place a halt this teardown could not
+        complete can be recorded. It is the more urgent of the two: the channels
+        released below are what a retry would need, so a refused halt here
+        leaves the T1 walking at its last commanded twist, or the host holding
+        the upper body, with nothing left in the process able to reach it. The
+        release still happens either way - a teardown that stopped half-way
+        would leak the channels *and* leave the robot moving.
+        """
+        if self._connected and (detail := halt_failure_detail(self.stop_task())) is not None:
+            logger.error(
+                "%s.cleanup(): the halt did not complete and the SDK channels are being released, "
+                "so the T1 may still be walking or holding the upper body with nothing left to "
+                "reach it: %s",
+                self._tool_name,
+                detail,
+            )
         for channel in (self._subscriber, self._publisher, self._battery_subscriber, self._fall_subscriber):
             if channel is None:
                 continue
@@ -1056,18 +1072,28 @@ class BoosterDriver:
             self._battery = reading
 
     def _on_fall_state(self, msg: Any) -> None:
-        """Absorb one ``FallDownState``, resolving it to a name.
+        """Absorb one ``FallDownState``, resolving it to a name. Never raises.
 
         The gate reads on *evidence of a fall*, not on the absence of a reading:
         a T1 whose fall topic is silent leaves :attr:`_fall_state` ``None`` and
         keeps writing, because refusing on absence would refuse every frame on a
         robot that simply does not publish it.
+
+        Both reads sit inside the guard, for the reason :meth:`_on_low_state`
+        states: the SDK owns this thread, so an exception here kills the
+        subscription rather than reaching a caller. Reading
+        ``fall_down_state`` off the sample is itself a read that can fail - the
+        member is decoded by the compiled binding, and the guarded ``int()``
+        below already anticipates that a decoded member raises - and it is the
+        read that decides the gate, so an escape leaves :attr:`_fall_state`
+        frozen at whatever the last delivered frame said while
+        :meth:`send_action` keeps consulting it.
         """
-        state = getattr(msg, "fall_down_state", None)
-        if state is None:
-            logger.debug("%s: FallDownState frame carried no state", self._tool_name)
-            return
         try:
+            state = getattr(msg, "fall_down_state", None)
+            if state is None:
+                logger.debug("%s: FallDownState frame carried no state", self._tool_name)
+                return
             code = int(getattr(state, "value", state))
         except (AttributeError, TypeError, ValueError):
             logger.debug("%s: unreadable FallDownState frame", self._tool_name, exc_info=True)

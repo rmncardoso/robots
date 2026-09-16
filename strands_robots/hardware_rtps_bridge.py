@@ -21,11 +21,13 @@ instead of a sourced ROS 2 distro:
 
 Why this exists alongside ``HardwareRosBridge``: ``rclpy`` needs a *sourced ROS 2
 distro* (apt / RoboStack / docker), which is heavy and version-pinned (Humble vs
-Jazzy vs Rolling). ``cyclonedds`` is a single self-contained pip wheel that
-speaks the RTPS wire protocol every ROS 2 distro shares, so this bridge runs on
-a bare dev laptop or a minimal robot image with ``pip install
-'strands-robots[ros2]'`` and nothing else. The trade-off is type coverage: RTPS
-publishing needs a *local* IDL definition, so only the messages in
+Jazzy vs Rolling). ``cyclonedds`` is a single self-contained pip wheel (macOS,
+Windows, Linux x86_64; Linux aarch64 builds it from source against a Cyclone DDS
+C install - ``docs/rtps-integration.md#linux-aarch64-jetson``) that speaks the
+RTPS wire protocol every ROS 2 distro shares, so this bridge runs on a bare dev
+laptop or a minimal robot image with ``pip install 'strands-robots[ros2]'`` and
+nothing else. The trade-off is type coverage: RTPS publishing needs a *local*
+IDL definition, so only the messages in
 :mod:`strands_robots.rtps.idl` work (now ``geometry_msgs`` + the ``sensor_msgs``
 ``JointState``/``Image`` chain this bridge needs). The rclpy bridge keeps full
 ``sensor_msgs`` fidelity for anything outside the bundle.
@@ -120,7 +122,13 @@ class HardwareRtpsBridge(RosTelemetryBase):
             ``"false"`` cannot select the surface it asks to close.
         command_robot_name: Topic namespace for the command topic; defaults to
             the bound robot's name (the namespace we publish ``joint_states``
-            under).
+            under). Only a string names a topic segment, so only a string (or
+            ``None`` for the default) is accepted: this is the one
+            caller-supplied name rendered into a topic, and a non-string one
+            reached the sanitiser's ``re.sub`` - raising ``TypeError`` naming no
+            parameter when truthy, and, when falsy, being filtered by the
+            default-selecting ``or`` so the bridge read commands under the
+            robot's own name instead.
         poll_period: Seconds between inbound command reads on the poll thread.
             Only a positive finite number paces a loop. It is the sole pacing
             of ``_poll_loop``, handed to ``Event.wait``, where ``0``, a
@@ -143,7 +151,10 @@ class HardwareRtpsBridge(RosTelemetryBase):
             (``identity_ca``, ``certificate``, ``private_key``, ``governance``,
             ``permissions``; ``permissions_ca`` optional) wire the participant's
             DDS Security plugins so the whole graph is authenticated and
-            access-controlled. When ``enable_commands`` is in effect this (or
+            access-controlled. Each value must be a non-empty string - a path or
+            a ``file:`` / ``data:`` URI - and a supplied key that is not is
+            refused before any participant exists, because a credential this
+            participant would drop or stringify is not one it can present. When ``enable_commands`` is in effect this (or
             the ``STRANDS_ROS2_BRIDGE_I_KNOW_THIS_IS_INSECURE=1`` opt-out) is
             REQUIRED - the bridge refuses to expose an arm-driving command
             surface on an unsecured DDS graph.
@@ -151,8 +162,9 @@ class HardwareRtpsBridge(RosTelemetryBase):
     Raises:
         ImportError: If ``cyclonedds`` (the ``[ros2]`` extra) is not installed.
         ValueError: If ``enable_commands`` is not a boolean, ``domain_id`` is
-            outside ``[0, 232]`` or ``poll_period`` is not a positive finite
-            number (all three checked before the ``cyclonedds`` probe, so the
+            outside ``[0, 232]``, ``poll_period`` is not a positive finite
+            number, or ``command_robot_name`` is neither a string nor ``None``
+            (all four checked before the ``cyclonedds`` probe, so the
             same caller mistake reports identically on an install without the
             extra), if ``joint_limits`` /
             ``dds_security_config`` is malformed, or if commands are enabled
@@ -194,6 +206,17 @@ class HardwareRtpsBridge(RosTelemetryBase):
         if error := boolean_flag_error(enable_commands, "enable_commands", type(self).__name__):
             raise ValueError(error)
 
+        # The command namespace is the one caller-supplied value this bridge
+        # renders into a topic, so it is graded alongside the three guards above
+        # rather than where ``_safe`` consumes it, which is past the
+        # ``DomainParticipant``. A non-string raised ``TypeError`` out of
+        # ``_safe``'s ``re.sub``, naming no parameter, having already built a
+        # participant that the caller - holding no bridge - cannot shut down; a
+        # falsy non-string was filtered by the ``or`` fallback below and read
+        # commands under the bound robot's name instead, silently.
+        if error := self._command_namespace_error(command_robot_name, type(self).__name__):
+            raise ValueError(error)
+
         # cyclonedds is the only dependency - no rclpy, no sourced ROS 2 distro.
         require_optional(
             "cyclonedds",
@@ -229,7 +252,6 @@ class HardwareRtpsBridge(RosTelemetryBase):
             enable_commands=self._enable_commands,
             dds_security_config=dds_security_config,
         )
-        self._dds_security_config = dds_security_config
 
         # Build the participant with DDS Security QoS when a config is supplied,
         # so BOTH the outbound telemetry and the inbound command surface ride a
@@ -242,10 +264,13 @@ class HardwareRtpsBridge(RosTelemetryBase):
             self._participant = DomainParticipant(self._domain_id)
 
         self._robot_name = self._safe(self._resolve_robot_name(robot) if robot is not None else "robot")
-        # One writer per robot, as in ``_image_writers`` below and in the rclpy
+        # One writer per TOPIC, as in ``_image_writers`` below and in the rclpy
         # transport's ``_joint_pubs``: ``robot`` is a per-call argument that
         # selects the topic, so caching a single writer would publish every
-        # later robot's state on the first one's topic.
+        # later robot's state on the first one's topic - and keying on the name
+        # rather than on the topic it selects reintroduces exactly that, because
+        # the name -> topic map is neither injective nor, once ``robot`` and
+        # ``camera`` are joined by ``/``, unambiguous.
         self._joint_writers: dict[str, Any] = {}
         self._image_writers: dict[str, Any] = {}
 
@@ -276,6 +301,13 @@ class HardwareRtpsBridge(RosTelemetryBase):
         with the operator-supplied credentials, mapped to their ``dds.sec.*``
         property names (:data:`_DDS_SECURITY_PROPERTY`). Optional keys absent
         from ``config`` (e.g. ``permissions_ca``) are simply not set.
+
+        A property is set per *truthy* credential and carries ``str(value)``, so
+        this drops what is falsy and would spell a non-string as its ``repr``.
+        Neither can arrive:
+        :meth:`~strands_robots.ros_telemetry.RosTelemetryBase._validate_dds_security_config`
+        accepts only non-empty strings, so every credential ``config`` holds is
+        one this sets verbatim.
         """
         from cyclonedds.qos import Policy, Qos
 
@@ -309,13 +341,21 @@ class HardwareRtpsBridge(RosTelemetryBase):
 
         Signature matches ``RosTelemetryBridge.publish_joint_states`` so the
         hardware ``Robot`` telemetry path is transport-agnostic - including the
-        writer being resolved per ``robot``. The writers are lazy, so a bridge
-        only ever advertises the robots it was actually asked to publish.
+        writer being resolved per topic. The writers are lazy, so a bridge only
+        ever advertises the topics it was actually asked to publish on.
+
+        A ``names``/``positions`` pair of differing length is dropped whole with
+        a warning rather than published misaligned - see
+        :meth:`RosTelemetryBase._joint_state_arrays_error`.
         """
-        writer = self._joint_writers.get(robot)
+        if error := self._joint_state_arrays_error(list(names), list(positions), type(self).__name__):
+            logger.warning("%s Whole JointState dropped, no partial publication.", error)
+            return
+        topic = self.joint_states_topic(robot)
+        writer = self._joint_writers.get(topic)
         if writer is None:
-            writer = self._make_writer(self.joint_states_topic(robot), self._JointState)
-            self._joint_writers[robot] = writer
+            writer = self._make_writer(topic, self._JointState)
+            self._joint_writers[topic] = writer
         msg = self._JointState(
             header=self._header(self._safe(robot)),
             name=list(names),
@@ -329,11 +369,11 @@ class HardwareRtpsBridge(RosTelemetryBase):
         """Publish one RGB ``Image`` on ``/<robot>/<camera>/image_raw``."""
         if image.ndim != 3 or image.shape[2] != 3:
             return
-        key = f"{robot}/{camera}"
-        writer = self._image_writers.get(key)
+        topic = self.image_topic(robot, camera)
+        writer = self._image_writers.get(topic)
         if writer is None:
-            writer = self._make_writer(self.image_topic(robot, camera), self._Image)
-            self._image_writers[key] = writer
+            writer = self._make_writer(topic, self._Image)
+            self._image_writers[topic] = writer
         height, width = int(image.shape[0]), int(image.shape[1])
         msg = self._Image(
             header=self._header(f"{self._safe(robot)}/{self._safe(camera, fallback='camera')}"),

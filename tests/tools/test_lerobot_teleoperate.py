@@ -21,10 +21,12 @@ from typing import Any
 
 import pytest
 
-import strands_robots.tools.lerobot_teleoperate as tele_mod
-from strands_robots.tools import _process_stop
-from strands_robots.tools._process_stop import session_is_running
-from tests.tool_result_contract import tool_json
+pytest.importorskip("psutil")
+
+import strands_robots.tools.lerobot_teleoperate as tele_mod  # noqa: E402
+from strands_robots.tools import _process_stop  # noqa: E402
+from strands_robots.tools._process_stop import session_is_running  # noqa: E402
+from tests.tool_result_contract import tool_json  # noqa: E402
 
 # Bind the public names off the single module handle rather than a second
 # ``from ... import`` of the same module (CodeQL: import + import-from of one
@@ -425,7 +427,9 @@ def test_build_start_command_emits_nested_camera_config() -> None:
         robot_cameras={"front": {"type": "opencv", "index_or_path": 2, "width": 1280, "height": 720, "fps": 60}},
     )
     cam_args = [a for a in cmd if a.startswith("--robot.cameras=")]
-    assert cam_args == ["--robot.cameras={front: {type: opencv, index_or_path: 2, width: 1280, height: 720, fps: 60}}"]
+    assert cam_args == [
+        "--robot.cameras={'front': {type: opencv, index_or_path: 2, width: 1280, height: 720, fps: 60}}"
+    ]
     # The stale flat camera flag must not appear.
     assert not any(a.startswith("--camera-config") for a in cmd)
 

@@ -95,10 +95,18 @@ def test_a_stranger_cannot_seize_the_dashboard_through_a_disk_error(tmp_path):
 
 
 def test_the_person_at_the_machine_can_still_recover(tmp_path):
+    """Recovery needs the token the server wrote beside the store - loopback alone is not the owner."""
     _corrupt_store(tmp_path)
     auth._load()
 
-    opts = auth.begin_registration(FakeRequest(client_host="127.0.0.1"), label="recovery")
+    with pytest.raises(HTTPException) as e:
+        auth.begin_registration(FakeRequest(client_host="127.0.0.1"), label="recovery")
+    assert e.value.status_code == 403
+    assert "unreadable" in e.value.detail and str(auth._enroll_token_path()) in e.value.detail
+
+    opts = auth.begin_registration(
+        FakeRequest(client_host="127.0.0.1"), label="recovery", bootstrap=auth._local_enroll_token()
+    )
     assert opts.get("challenge_id"), "recovery must not be a dead end for the owner"
 
 
@@ -212,12 +220,12 @@ class TestTheLastNineLines:
             return real_stat(self, *a, **k)
 
         monkeypatch.setattr(auth.Path, "stat", stat_fails_once)
-        auth._save({"credentials": [], "note": "written"})
+        auth._save({"jwt_secret": "s" * 32, "credentials": [], "note": "written"})
         path = tmp_path / "auth.json"
         assert failed, "the post-write stat is the one that failed"
         assert json.loads(path.read_text())["note"] == "written", "the write itself still happened"
 
-        path.write_text(json.dumps({"credentials": [], "note": "replaced"}))
+        path.write_text(json.dumps({"jwt_secret": "s" * 32, "credentials": [], "note": "replaced"}))
         assert auth._load()["note"] == "replaced", "an un-keyed store must not be served from memory"
 
     def test_a_request_whose_headers_explode_still_returns_a_status(self, tmp_path):

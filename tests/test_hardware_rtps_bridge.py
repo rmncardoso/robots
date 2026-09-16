@@ -20,6 +20,7 @@ trivial fakes so the tests stay ROS-free.
 
 from __future__ import annotations
 
+import logging
 import sys
 from types import ModuleType
 from typing import Any, cast
@@ -206,6 +207,57 @@ def test_publish_joint_states_uses_mangled_topic_and_fields(fake_cyclonedds: dic
     assert msg.header.frame_id == "test_arm"
 
 
+class TestJointStateArraysAreRefusedWhenTheyDisagree:
+    """A ``JointState`` whose two arrays name different joints never reaches the wire.
+
+    ``name`` and ``position`` are paired by index, so a caller that supplies a
+    different number of each has no pose to publish: a consumer's
+    ``zip(name, position)`` reports every joint after the gap under its
+    neighbour's name and the tail unreported. Dropped whole, with the reason
+    logged, for the reason :meth:`_command_action` refuses a malformed inbound
+    command whole rather than applying part of it.
+    """
+
+    @pytest.mark.parametrize(
+        ("names", "positions"),
+        [
+            (["hip", "knee", "ankle"], [0.1, 0.2]),
+            (["hip", "knee"], [0.1, 0.2, 0.3]),
+            (["hip"], []),
+        ],
+    )
+    def test_a_mismatched_pair_writes_nothing(
+        self,
+        fake_cyclonedds: dict[str, Any],
+        caplog: pytest.LogCaptureFixture,
+        names: list[str],
+        positions: list[float],
+    ) -> None:
+        b = _bridge(enable_commands=False)
+        with caplog.at_level(logging.WARNING):
+            b.publish_joint_states("test_arm", names, positions)
+
+        assert [s for w in fake_cyclonedds["writers"] for s in w.samples] == []
+        assert f"{len(names)} joint name(s) and {len(positions)} position(s)" in caplog.text
+        assert "no partial publication" in caplog.text
+
+    def test_a_refused_pair_advertises_no_writer(self, fake_cyclonedds: dict[str, Any]) -> None:
+        # The refusal is before the lazy writer, so a topic nothing can be
+        # published on is never advertised either.
+        b = _bridge(enable_commands=False)
+        b.publish_joint_states("test_arm", ["hip", "knee"], [0.1])
+        assert [w.topic for w in fake_cyclonedds["writers"]] == []
+
+    def test_a_matching_pair_still_writes(self, fake_cyclonedds: dict[str, Any]) -> None:
+        # Control: the guard refuses no more than the mismatch.
+        b = _bridge(enable_commands=False)
+        b.publish_joint_states("test_arm", ["hip", "knee"], [0.1, 0.2])
+        writer = next(w for w in fake_cyclonedds["writers"] if w.topic == "rt/test_arm/joint_states")
+        (msg,) = writer.samples
+        assert msg.name == ["hip", "knee"]
+        assert msg.position == [0.1, 0.2]
+
+
 def test_publish_image_fields(fake_cyclonedds: dict[str, Any]) -> None:
     b = _bridge(enable_commands=False)
     frame = np.zeros((4, 6, 3), dtype=np.uint8)
@@ -350,6 +402,41 @@ def test_security_config_missing_required_key_raises(fake_cyclonedds: dict[str, 
     del incomplete["private_key"]
     with pytest.raises(ValueError, match="missing required keys"):
         _bridge(_FakeRobot(), dds_security_config=incomplete)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [None, 0, False, b"file:/etc/dds/participant_key.pem", 1.5],
+    ids=["none", "zero", "false", "bytes", "float"],
+)
+def test_a_non_string_credential_builds_no_participant_at_all(
+    fake_cyclonedds: dict[str, Any], monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    # A credential the participant QoS cannot carry verbatim - it sets a property
+    # per truthy credential, and stringifies what it does set - is refused before
+    # any DDS state exists, rather than reaching DomainParticipant with the auth
+    # plugin wired and no private key (falsy: dropped) or a private key spelled
+    # "b'file:/etc/dds/participant_key.pem'" (truthy non-string: its repr).
+    monkeypatch.delenv("STRANDS_ROS2_BRIDGE_I_KNOW_THIS_IS_INSECURE", raising=False)
+    cfg = dict(_VALID_SECURITY)
+    cfg["private_key"] = bad  # type: ignore[assignment]
+    before = len(fake_cyclonedds["participants"])
+    with pytest.raises(ValueError, match="private_key"):
+        _bridge(_FakeRobot(), dds_security_config=cfg)
+    assert len(fake_cyclonedds["participants"]) == before
+
+
+def test_a_supplied_permissions_ca_reaches_the_participant_qos(
+    fake_cyclonedds: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The optional key's other half: absent it is not set (asserted below), and
+    # supplied it is graded like a required one, so an accepted value lands.
+    monkeypatch.delenv("STRANDS_ROS2_BRIDGE_I_KNOW_THIS_IS_INSECURE", raising=False)
+    cfg = dict(_VALID_SECURITY, permissions_ca="file:/etc/dds/permissions_ca.pem")
+    b = _bridge(_FakeRobot(), dds_security_config=cfg)
+    props = {p.name: p.value for p in fake_cyclonedds["participants"][-1].qos.policies}
+    assert props["dds.sec.access.permissions_ca"] == "file:/etc/dds/permissions_ca.pem"
+    b.shutdown()
 
 
 def test_security_config_wires_plugins_and_credentials_into_participant_qos(
@@ -530,6 +617,149 @@ def test_the_rtps_and_rclpy_transports_advertise_the_same_per_robot_topics(
     assert rtps_topics == sorted(dds_topic_name(topic) for topic in created)
 
 
+#: Call sequences in which the caller-supplied names and the topics they select
+#: do not correspond one-to-one, which is the only place a cache keyed on the
+#: names can disagree with one keyed on the topic. Both are reachable: a scene
+#: may hold cameras named ``arm0/wrist`` and ``arm0__wrist`` (both forms are
+#: documented as legal, and ``camera_schema_key`` names that very pair as the
+#: collision its dataset-side guard exists for), and ``robot``/``camera`` may
+#: each contain the ``/`` the former cache key joined them with.
+_AMBIGUOUS_IMAGE_CALLS = (
+    pytest.param(
+        [("so101", "arm0/wrist"), ("so101", "arm0__wrist"), ("so101", "default")],
+        id="two_camera_spellings_naming_one_topic",
+    ),
+    pytest.param(
+        [("arm", "wrist/rgb"), ("arm/wrist", "rgb")],
+        id="one_slash_joined_key_naming_two_topics",
+    ),
+)
+
+
+def _rclpy_cache_stub() -> Any:
+    """A ``RosTelemetryBridge`` whose publishers record the topic they were made for.
+
+    Subclassed with the rclpy-dependent constructor replaced, so the real
+    ``publish_joint_states`` / ``publish_image`` and their real publisher caches
+    run with no ROS 2 distro installed.
+    """
+    from types import SimpleNamespace
+
+    from strands_robots.ros_telemetry import RosTelemetryBridge
+
+    class _Pub:
+        def __init__(self, topic: str) -> None:
+            self.topic = topic
+            self.samples: list[Any] = []
+
+        def publish(self, msg: Any) -> None:
+            self.samples.append(msg)
+
+    class _Node:
+        def __init__(self) -> None:
+            self.pubs: list[_Pub] = []
+
+        def create_publisher(self, _msg_type: Any, topic: str, _depth: int) -> _Pub:
+            pub = _Pub(topic)
+            self.pubs.append(pub)
+            return pub
+
+    class _StubBridge(RosTelemetryBridge):
+        def __init__(self) -> None:
+            self._node = _Node()
+            self._joint_pubs = {}
+            self._image_pubs = {}
+            self._qos_depth = 10
+            self._JointState = lambda: SimpleNamespace(header=_Header(), name=[], position=[])
+            self._Image = lambda: SimpleNamespace(header=_Header())
+
+        def _now(self) -> Any:
+            return None
+
+    return _StubBridge()
+
+
+def _samples_per_topic(entities: list[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entity in entities:
+        counts[entity.topic] = counts.get(entity.topic, 0) + len(entity.samples)
+    return counts
+
+
+@pytest.mark.parametrize("calls", _AMBIGUOUS_IMAGE_CALLS)
+def test_both_transports_hold_one_image_publisher_per_topic(
+    fake_cyclonedds: dict[str, Any], calls: list[tuple[str, str]]
+) -> None:
+    """A publisher is identified by its topic, so the cache must be keyed on it.
+
+    Keyed on the caller's spelling instead, the name -> topic map's two failures
+    each produced a wrong graph. It is not injective, so two camera spellings of
+    one topic advertised two publishers on it - one bridge appearing twice in
+    ``ros2 topic info`` for one camera. And the key joined ``robot`` and
+    ``camera`` with ``/``, a character both may contain, so two pairs naming two
+    different topics shared one key: the second caller was handed the first's
+    publisher and its frames went out on a topic it never named, silently,
+    because DDS matching is by topic name and the reader it expected never
+    appeared.
+
+    Both claims reduce to one measurement, made on both transports so they
+    cannot come to disagree: every frame lands on the topic its own call names,
+    and there is exactly one publisher per distinct topic named.
+    """
+    from strands_robots.ros_telemetry import RosTelemetryBridge
+    from strands_robots.rtps.mangling import dds_topic_name
+
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    expected = {RosTelemetryBridge.image_topic(robot, camera): 0 for robot, camera in calls}
+    for robot, camera in calls:
+        expected[RosTelemetryBridge.image_topic(robot, camera)] += 1
+    assert len(expected) < len(calls) or len({f"{r}/{c}" for r, c in calls}) < len(calls), (
+        "premise: this sequence must exercise a name/topic mismatch"
+    )
+
+    bridge = _bridge(enable_commands=False)
+    for robot, camera in calls:
+        bridge.publish_image(robot, camera, frame)
+    rtps = _samples_per_topic(fake_cyclonedds["writers"])
+    assert rtps == {dds_topic_name(topic): n for topic, n in expected.items()}
+    assert len(fake_cyclonedds["writers"]) == len(expected)
+
+    stub = _rclpy_cache_stub()
+    for robot, camera in calls:
+        stub.publish_image(robot, camera, frame)
+    assert _samples_per_topic(stub._node.pubs) == expected
+    assert len(stub._node.pubs) == len(expected)
+
+
+def test_both_transports_hold_one_joint_publisher_per_topic(fake_cyclonedds: dict[str, Any]) -> None:
+    """Two robot names selecting one ``joint_states`` topic share its publisher.
+
+    The joint cache has only the non-injectivity half of the problem above - it
+    keys on one name, so there is no join to be ambiguous - but the consequence
+    is the same duplicated advertisement, and the fix is the same key.
+    """
+    from strands_robots.ros_telemetry import RosTelemetryBridge
+    from strands_robots.rtps.mangling import dds_topic_name
+
+    calls = ["front cam", "front-cam"]
+    topic = RosTelemetryBridge.joint_states_topic(calls[0])
+    assert {RosTelemetryBridge.joint_states_topic(r) for r in calls} == {topic}, (
+        "premise: both names must select one topic"
+    )
+
+    bridge = _bridge(enable_commands=False)
+    for robot in calls:
+        bridge.publish_joint_states(robot, ["j0"], [0.0])
+    assert _samples_per_topic(fake_cyclonedds["writers"]) == {dds_topic_name(topic): len(calls)}
+    assert len(fake_cyclonedds["writers"]) == 1
+
+    stub = _rclpy_cache_stub()
+    for robot in calls:
+        stub.publish_joint_states(robot, ["j0"], [0.0])
+    assert _samples_per_topic(stub._node.pubs) == {topic: len(calls)}
+    assert len(stub._node.pubs) == 1
+
+
 def test_shutdown_drops_every_robots_joint_writer(fake_cyclonedds: dict[str, Any]) -> None:
     """Shutdown releases the DDS entities for all robots, not just one.
 
@@ -545,3 +775,63 @@ def test_shutdown_drops_every_robots_joint_writer(fake_cyclonedds: dict[str, Any
     b.shutdown()
     assert b._joint_writers == {}
     assert b._image_writers == {}
+
+
+# --- the command namespace is the one caller-supplied name in a topic --------
+
+#: ``command_robot_name`` values that cannot name a topic segment. A truthy one
+#: reached the sanitiser's ``re.sub`` and raised ``TypeError`` naming no
+#: parameter; a falsy one was filtered by the ``command_robot_name or <derived>``
+#: default and never raised, so the bridge read commands under a namespace the
+#: caller had not asked for. Both happened past the ``DomainParticipant``.
+_UNNAMEABLE_COMMAND_NAMESPACES: list[Any] = [7, ["left_arm"], 0, []]
+
+
+@pytest.mark.parametrize("name", _UNNAMEABLE_COMMAND_NAMESPACES, ids=repr)
+def test_a_command_namespace_that_cannot_name_a_topic_builds_no_participant(
+    fake_cyclonedds: dict[str, Any], name: Any
+) -> None:
+    """The refusal names the parameter and leaves no DDS state behind.
+
+    ``__init__`` raising returns no bridge, so a participant built before the
+    refusal has no ``shutdown`` that can reach it. The namespace is therefore
+    graded where ``domain_id``, ``poll_period`` and ``enable_commands`` are.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        _bridge(_FakeRobot(), command_robot_name=name)
+
+    assert "'command_robot_name'" in str(excinfo.value)
+    assert fake_cyclonedds["participants"] == []
+    assert fake_cyclonedds["readers"] == []
+
+
+def test_a_command_namespace_is_graded_before_the_cyclonedds_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same mistake reports identically on an install without the extra.
+
+    With no ``cyclonedds`` importable, a value that cannot name a topic must
+    still be refused for the value - not reported as a missing dependency - which
+    is what the other three constructor guards already promise.
+    """
+    monkeypatch.setitem(sys.modules, "cyclonedds", None)
+    monkeypatch.setattr(utils_mod, "_lazy_modules", {}, raising=False)
+
+    with pytest.raises(ValueError, match="'command_robot_name'"):
+        _bridge(_FakeRobot(), command_robot_name=7)
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_topic"),
+    [
+        (None, "rt/test_arm/joint_command"),
+        ("", "rt/test_arm/joint_command"),
+        ("left_arm", "rt/left_arm/joint_command"),
+    ],
+    ids=["derive/None", "derive/empty", "override"],
+)
+def test_an_accepted_command_namespace_selects_the_topic_it_names(
+    fake_cyclonedds: dict[str, Any], name: Any, expected_topic: str
+) -> None:
+    """``None`` and ``""`` derive the bound robot's name; a string overrides it."""
+    b = _bridge(_FakeRobot(), command_robot_name=name)
+    assert [r.topic for r in fake_cyclonedds["readers"]] == [expected_topic]
+    b.shutdown()

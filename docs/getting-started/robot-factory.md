@@ -1,5 +1,5 @@
 ---
-description: Robot(name, mode, backend, urdf_path, cameras, position, data_config, mesh, peer_id, orientation, keyframe, **kwargs) - the full signature with every kwarg explained.
+description: Robot(name, mode, backend, urdf_path, cameras, position, data_config, mesh, peer_id, orientation, keyframe, driver, tool_name, **kwargs) - the full signature with every kwarg explained.
 ---
 
 # Robot factory
@@ -22,7 +22,7 @@ robot = Robot("so100", mode="auto")  # probes USB, falls back to sim
 | `mode` | str | `"sim"` | `"sim"` / `"real"` / `"auto"`. Overridden by `STRANDS_ROBOT_MODE`. |
 | `backend` | str | `"mujoco"` | Sim backend. Ignored when `mode="real"`. |
 | `urdf_path` | str | `None` | Explicit MJCF/URDF path - bypasses registry. Ignored when `mode="real"` (reported at debug level). |
-| `cameras` | dict | `None` | Real-hardware camera config. **Rejected in `mode="sim"`** - raises `ValueError`. |
+| `cameras` | dict | `None` | Real-hardware camera config, attached by the lerobot driver. **Rejected in `mode="sim"`**, and rejected for a native driver that does not open cameras - both raise `ValueError`. |
 | `position` | list | `None` | Robot position `[x, y, z]` in sim world. Ignored when `mode="real"` (reported at debug level). |
 | `data_config` | str | `None` | GR00T data_config name. Honoured in both modes: `mode="sim"` defaults it to the canonical robot name, `mode="real"` forwards it to the hardware driver, which carries it into the `policy_config` a policy is built with. |
 | `mesh` | bool \| None | `None` | Join the Zenoh fleet mesh. `None` consults `STRANDS_MESH`, which leaves it **off** unless set to `true`/`1`/`yes` - pass `mesh=True` to opt in per robot. |
@@ -30,6 +30,7 @@ robot = Robot("so100", mode="auto")  # probes USB, falls back to sim
 | `orientation` | list | `None` | Robot base orientation `[w, x, y, z]` in sim world. Ignored when `mode="real"` (reported at debug level). |
 | `keyframe` | str \| int | `None` | Spawn in a model `<keyframe>` pose (name or index) instead of the zero configuration. Ignored when `mode="real"` (reported at debug level). |
 | `driver` | str | `"auto"` | Which implementation drives a real robot: `"auto"` / `"lerobot"` / `"strands"`. `"auto"` honours the robot's registry `hardware.driver` and otherwise builds the lerobot driver. Checked in every mode; only `mode="real"` acts on it (sim reports it as ignored at debug level). See [Choosing a driver](#choosing-a-driver). |
+| `tool_name` | str | `None` | The name the agent sees this robot under. `None` keeps the default - `"<name>_sim"` in sim, the canonical robot name on hardware - which is why two `Robot("so101")` in one `Agent` used to collide at registration. Name each one (`tool_name="left_arm"`) to put a bimanual pair, or a real arm beside its sim twin, in one agent. Letters, digits, `_` or `-`, at most 64 characters; anything else raises `ValueError` before the backend builds. |
 | `**kwargs` | | | Forwarded to the backend or driver constructor as given. A name it does not recognize is ignored, not refused, so check the spelling against the forwardable list below. |
 
 ## Name resolution
@@ -77,6 +78,27 @@ listing the registered ones. `fps`, `width` and `height` are common to every
 backend and default to 30/640/480 when unset - a vendor SDK the backend needs
 (`pyrealsense2` for `intelrealsense`) is required when the device is opened, not
 when the config is built.
+
+Cameras are attached by the **lerobot** driver. A native driver
+(`driver="strands"`) addresses its cameras through its own SDK, so it does not
+take a caller-supplied config - and none of the drivers shipped here does. Rather
+than accept the keyword and hand back a robot with no cameras, the factory
+refuses it by name:
+
+```python
+>>> Robot("unitree_go2", mode="real", cameras={"front": {"type": "opencv", "index_or_path": 0}})
+ValueError: Go2Driver does not open cameras, so cameras= cannot be honored for
+'unitree_go2'. Forwarding it would return a robot with no cameras at all under
+status=success. Use driver='lerobot', which attaches them through lerobot's
+camera backends, or capture the frames outside the driver.
+```
+
+This reaches robots that never mention `driver=`: eight shipped robots declare
+`driver="strands"` in the registry (see [Choosing a
+driver](#choosing-a-driver)). A driver that does open the cameras it is given
+declares `reads_cameras = True` on the class and receives the dict verbatim - the
+opt-in is that one attribute, described with the rest of the constructor contract
+in `strands_robots.drivers.base`.
 
 `control_frequency` (Hz) sets the control loop's per-action period,
 `1 / control_frequency` - the only throttle between two servo commands. It must be a
@@ -269,6 +291,28 @@ arrives from a system package rather than an index.
 The same reason arrives as `connect_error` in `get_status`, so a mesh peer for a Mini
 whose transport will not load is still constructible and still reports why it is not
 connected.
+
+A bring-up that reaches the daemon but whose real-time link never finishes its
+handshake is reported the same way, and the link is not left behind. The driver
+cancels the handshake and asks the link to stop before returning, so nothing stays
+subscribed to a Mini the caller has just been told it is not connected to:
+
+```python
+>>> Robot("reachy_mini", mode="real").connect_eagerly()
+"link to reachy-a.local:8000 did not finish its handshake within 10s"
+```
+
+The reason names the budget that expired rather than the timeout's own message,
+which is empty.
+
+Either way the loop the bring-up opened is closed, not merely stopped. The link runs
+on a background asyncio loop, and `loop.stop()` only asks it to return from
+`run_forever` - the selector and self-pipe it opened are released by `loop.close()`.
+So teardown waits for that thread (up to 5s) and then closes the loop, on the success
+path through `cleanup()` and on both give-up paths, rather than leaving one open loop
+per connect cycle for the garbage collector to complain about later. A thread that
+outlasts the wait keeps its loop, because closing a running loop raises, and that
+outcome is logged instead of reported as a teardown that finished.
 
 `hardware.driver` is optional and validated when the registry loads: a value that is not a
 driver name is refused there, naming the robot, rather than being read as "no preference".

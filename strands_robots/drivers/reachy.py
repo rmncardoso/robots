@@ -69,6 +69,8 @@ from strands_robots.tools.reachy import envelope_error
 from strands_robots.utils import finite_number_error, tcp_port_error
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
+
     from strands.types.tools import ToolSpec, ToolUse
 
     from strands_robots.policies import Policy
@@ -92,7 +94,17 @@ _PATH_MOVE_LIST = "/api/move/recorded-move-datasets/list/{dataset}"
 #: A recorded move's name goes into a URL path, so the admitted alphabet is the
 #: same one :mod:`strands_robots.device_connect.reachy_mini_driver` enforces -
 #: anything else is refused before a request is built from it.
-_MOVE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}\Z")
+#:
+#: The leading character is alphanumeric, which is what makes this a *bare path
+#: segment* rather than only a charset: ``.`` and ``..`` are spelled entirely
+#: from the admitted alphabet, so a charset alone admits the two tokens a URL
+#: path resolves relative to its parent. ``move_name=".."`` builds
+#: ``/api/move/play/recorded-move-dataset/<owner>/<library>/..``, which resolves
+#: to ``/api/move/play/recorded-move-dataset/<owner>`` - a daemon endpoint the
+#: caller did not name. Same shape and same reason as the bare-path-segment
+#: gate :mod:`strands_robots.drivers.feetech.bus` applies to the two names it
+#: interpolates into a calibration file path.
+_MOVE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 #: The two recorded-move libraries the daemon serves, mapped to their
 #: HuggingFace dataset ids. A dict rather than string surgery so a refusal can
@@ -111,6 +123,21 @@ _MOVE_LIBRARIES: dict[str, str] = {
 #: failure that still reaches :func:`_resolve_transport` is a broken install of a
 #: module the core distribution ships rather than a missing optional dependency.
 _TRANSPORT_MODULE = "strands_robots.device_connect.reachy_transport"
+
+#: How long :meth:`ReachyDriver._start_link` waits for a link's handshake before
+#: giving up on it. Read back off the module rather than inlined so a caller that
+#: needs a different budget, and the tests that exercise the give-up path, can set
+#: it - the same shape as ``device_connect``'s ``_INIT_TIMEOUT_S``.
+_LINK_START_TIMEOUT_S: float = 10.0
+
+#: How long :meth:`ReachyDriver._stop_loop` waits for the thread running the
+#: link's loop to return from ``run_forever`` before giving up on closing that
+#: loop. A budget rather than an unbounded wait because the thread is only as
+#: free to return as the callbacks on it: a link callback wedged on a socket read
+#: would otherwise hold teardown open for as long as the read takes. Matches
+#: ``_CAMS_REC_JOIN_TIMEOUT_S`` and ``_TELEOP_JOIN_TIMEOUT_S`` in purpose, and is
+#: read off the module for the same reason as the budget above.
+_LOOP_JOIN_TIMEOUT_S: float = 5.0
 
 
 def _resolve_transport() -> Any:
@@ -155,6 +182,11 @@ def _resolve_transport() -> Any:
 #: topic. Guessing a dedicated ``/api/battery`` endpoint would be a request no
 #: measurement supports.
 _BATTERY_KEYS: tuple[str, ...] = ("battery_level", "battery_pct", "battery", "soc")
+
+#: How much of an unreadable daemon body a refusal quotes. Enough to recognise a
+#: proxy's error page or a bare scalar, short enough that a large array does not
+#: fill the log line the refusal ends up on.
+_BODY_PREVIEW_CHARS = 60
 
 
 class ReachyDriver:
@@ -477,18 +509,110 @@ class ReachyDriver:
             daemon=True,
         )
         thread.start()
+        future = asyncio.run_coroutine_threadsafe(
+            link.start(on_joints=self._on_joints, on_imu=self._on_imu),
+            loop,
+        )
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                link.start(on_joints=self._on_joints, on_imu=self._on_imu),
-                loop,
+            future.result(timeout=_LINK_START_TIMEOUT_S)
+        except TimeoutError:
+            # Named before the general handler because this one carries no
+            # message: ``str(TimeoutError())`` is the empty string, so reporting
+            # it as a cause produced "failed to start: " and told an operator
+            # nothing. The budget is the cause, so the budget is what is named.
+            self._release_link(link, future, loop, thread)
+            return (
+                f"link to {self._host}:{self._api_port} did not finish its handshake within {_LINK_START_TIMEOUT_S:g}s"
             )
-            future.result(timeout=10)
         except Exception as exc:  # noqa: BLE001 - any link failure is a connect failure
-            loop.call_soon_threadsafe(loop.stop)
+            self._release_link(link, future, loop, thread)
             return f"link to {self._host}:{self._api_port} failed to start: {exc}"
         self._loop = loop
         self._loop_thread = thread
         return None
+
+    def _stop_loop(self, loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
+        """Stop the loop running *thread*, wait for it, and close the loop.
+
+        ``asyncio.new_event_loop`` is what :meth:`_start_link` calls to get this
+        loop, and ``loop.close()`` is that call's documented
+        counterpart: it releases the selector and the self-pipe the loop opened.
+        ``loop.stop()`` is not that counterpart - it only asks ``run_forever`` to
+        return. So a teardown that stops without closing abandons an open loop,
+        and Python says so: every connect/teardown cycle raised one
+        ``ResourceWarning: unclosed event loop``, reported not here but wherever
+        the collector happened to reclaim it, which is code that has nothing to
+        do with this driver.
+
+        The wait is not politeness, it is what makes the close legal: closing a
+        loop that is still running raises ``RuntimeError``, and ``stop()`` is
+        asynchronous - it schedules the stop and returns, so the thread is still
+        inside ``run_forever`` when it does. Waiting for the thread is therefore
+        the only way to know the loop has stopped, and it is why the thread
+        handle is kept at all.
+
+        Bounded by :data:`_LOOP_JOIN_TIMEOUT_S`, and a thread that outlasts it
+        keeps its loop: the loop is by definition still running, so closing it
+        would raise, and reporting a teardown that did not happen is worse than
+        one open loop. That outcome is logged rather than raised, because
+        teardown is a caller's last action and has no error to return to.
+
+        Args:
+            loop: The loop to stop and close.
+            thread: The thread running that loop, waited for here.
+        """
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=_LOOP_JOIN_TIMEOUT_S)
+        if thread.is_alive():
+            logger.warning(
+                "%s: the link loop did not stop within %.1fs, so its loop is left open; "
+                "a link callback is still running on it.",
+                self._tool_name,
+                _LOOP_JOIN_TIMEOUT_S,
+            )
+            return
+        loop.close()
+
+    def _release_link(
+        self,
+        link: Any,
+        future: Future[None],
+        loop: asyncio.AbstractEventLoop,
+        thread: threading.Thread,
+    ) -> None:
+        """Close whatever a bring-up that will not be adopted already opened.
+
+        A ``start`` that raised, or that outran
+        :data:`_LINK_START_TIMEOUT_S`, can still have put the link on the wire:
+        :meth:`~strands_robots.device_connect.reachy_transport.WebSocketLink.start`
+        assigns the connected socket before it spawns its read task, and the
+        Zenoh link subscribes to its first topic before its second. The link is
+        not adopted after such a failure - ``_link`` stays ``None`` so the driver
+        reports itself disconnected - which means :meth:`cleanup` has nothing to
+        stop and no verb can ever reach that socket again. Every later
+        :meth:`connect_eagerly` builds a fresh link, so the stranded reader stays
+        subscribed for the life of the process, writing sensor frames nobody
+        reads: exactly the outcome :meth:`connect_eagerly` refuses a second link
+        in order to avoid.
+
+        So the handshake is cancelled and the link is asked to stop, on the loop
+        it was started on, before that loop is stopped. Both concrete links
+        tolerate a ``stop`` after a partial ``start``: the WebSocket link guards
+        each handle it clears, and the Zenoh link's stop is a no-op.
+
+        Args:
+            link: The link whose bring-up failed.
+            future: The pending handshake, cancelled here.
+            loop: The loop the handshake was submitted to; stopped last.
+            thread: The thread running that loop, so the loop this bring-up
+                opened is closed rather than left for the collector.
+        """
+        future.cancel()
+        try:
+            asyncio.run_coroutine_threadsafe(link.stop(), loop).result(timeout=_LINK_START_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - teardown of a failed bring-up must not raise
+            logger.debug("%s: stopping the failed link raised: %s", self._tool_name, exc)
+        self._stop_loop(loop, thread)
 
     async def get_status(self) -> dict[str, Any]:
         """Report reachability, hardware variant and the latest battery read.
@@ -532,14 +656,21 @@ class ReachyDriver:
         self._stopped = True
 
     def cleanup(self) -> None:
-        """Stop the link and its loop. Idempotent."""
+        """Stop the link, then stop and close the loop it ran on. Idempotent.
+
+        The loop is closed and not merely stopped - see :meth:`_stop_loop` for
+        why the two are different and why closing it means waiting for the
+        thread first. ``_loop`` and ``_loop_thread`` are adopted together by
+        :meth:`_start_link` and cleared together here, so one being set is the
+        same condition as both.
+        """
         if self._link is not None and self._loop is not None:
             try:
                 asyncio.run_coroutine_threadsafe(self._link.stop(), self._loop).result(timeout=5)
             except Exception as exc:  # noqa: BLE001 - teardown must not raise
                 logger.debug("%s: link stop failed during cleanup: %s", self._tool_name, exc)
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._loop is not None and self._loop_thread is not None:
+            self._stop_loop(self._loop, self._loop_thread)
         self._link = None
         self._loop = None
         self._loop_thread = None
@@ -571,9 +702,11 @@ class ReachyDriver:
            the head pose and turns the body no further than the limit, so a
            lone body yaw beyond it would report success and stop short. The
            limit is skipped, not guessed, while that target is unknown.
-        3. The action names at least one thing this driver can send. An action
-           dict of unknown keys is refused rather than reported as a successful
-           no-op.
+        3. Every key names something this driver can send. An action naming no
+           axis at all is refused rather than reported as a successful no-op,
+           and so is one that names a real axis alongside a key this driver has
+           no actuator for: a dropped head axis is not left alone but commanded
+           to zero, because the daemon's head command is a whole pose.
 
         Degrees in, radians and pose matrices out. The caller-facing unit is
         degrees because the envelope is expressed in degrees and because the
@@ -617,6 +750,15 @@ class ReachyDriver:
             return _refuse(
                 f"send_action: nothing to send - none of {sorted(action)} names a Reachy Mini axis; "
                 f"expected any of {sorted(_ACTION_KEYS)}"
+            )
+        # Checked after the gate above rather than before it, so each refusal
+        # diagnoses one fault: an action naming no axis at all is told what to
+        # send, and an action that mostly parsed is told which key was dropped.
+        if unknown := sorted(set(action) - _ACTION_KEYS):
+            return _refuse(
+                f"send_action: {unknown} names no Reachy Mini axis; expected any of {sorted(_ACTION_KEYS)}. "
+                "A dropped head axis is commanded to zero rather than left alone, because the daemon's "
+                "head command is a whole pose"
             )
 
         for command in commands:
@@ -726,7 +868,9 @@ class ReachyDriver:
         The Mini's expressive behaviour is a recorded head+antenna+body
         choreography served by the daemon from a HuggingFace library - the same
         rail :meth:`stop_task` halts. Three gates: connected, ``library`` in the
-        admitted set, ``move_name`` in the URL-safe alphabet.
+        admitted set, ``move_name`` a bare URL path segment - the alphabet plus
+        an alphanumeric first character, so a dot segment cannot re-point the
+        request at the daemon's parent path.
 
         Args:
             move_name: The move's name in the library, e.g. ``'happy'``.
@@ -743,7 +887,8 @@ class ReachyDriver:
             return _refuse(f"play_move: unknown library {library!r}; expected one of {sorted(_MOVE_LIBRARIES)}")
         if not _MOVE_NAME_RE.fullmatch(move_name or ""):
             return _refuse(
-                f"play_move: invalid move_name {move_name!r}; expected 1-128 chars of [A-Za-z0-9._-] - "
+                f"play_move: invalid move_name {move_name!r}; expected 1-128 chars of [A-Za-z0-9._-] "
+                "starting with a letter or digit (one bare path segment, so no '.' or '..') - "
                 "list_moves() names the library's catalogue"
             )
         result = self._daemon_post(_PATH_MOVE_PLAY.format(dataset=dataset, move=move_name))
@@ -956,12 +1101,25 @@ class ReachyDriver:
             The decoded body, or ``{"error": ...}`` - the shape
             :func:`~strands_robots.device_connect.reachy_transport.api` returns
             for every failure, which is why no call here needs a ``try``.
+
+            A body that decodes to something other than a JSON object is
+            reported as that same shape. ``api`` hands the decoded body back
+            unreshaped, so a daemon - or an interposed proxy - answering with an
+            array, a string or ``null`` reached every caller here typed as a
+            mapping, and the ``result.get("error")`` each one opens with raised
+            ``AttributeError`` out of a driver whose contract is to report a
+            reason and stay usable. Judging the shape here is the rule
+            :meth:`~strands_robots.device_connect.reachy_mini_driver.ReachyMiniDriver._transport_failure`
+            states for this transport: the callers that require an object are
+            the ones that judge it.
         """
         transport = _resolve_transport()
         if isinstance(transport, str):
             return {"error": transport}
 
-        result: dict[str, Any] = transport.api(self._host, self._api_port, path)
+        result = transport.api(self._host, self._api_port, path)
+        if not isinstance(result, dict):
+            return _body_shape_error("GET", path, "an object", result)
         return result
 
     def _daemon_get_list(self, path: str) -> list[Any] | dict[str, Any]:
@@ -983,14 +1141,24 @@ class ReachyDriver:
             path: Request path, one of this module's ``_PATH_*`` constants.
 
         Returns:
-            The decoded array on success, or ``{"error": ...}``.
+            The decoded array on success, or ``{"error": ...}``. A body that is
+            neither - a scalar, or an object that is not the transport's failure
+            envelope - is reported as the shape it arrived as, which is what
+            makes ":meth:`list_moves`' only dict is the transport's error
+            envelope" true by construction rather than by assumption. Left
+            unjudged, a scalar body was returned to the caller as the
+            catalogue.
         """
         transport = _resolve_transport()
         if isinstance(transport, str):
             return {"error": transport}
 
-        result: list[Any] | dict[str, Any] = transport.api(self._host, self._api_port, path)
-        return result
+        result = transport.api(self._host, self._api_port, path)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "error" in result:
+            return result
+        return _body_shape_error("GET", path, "an array", result)
 
     def _daemon_post(self, path: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         """Call the daemon's REST API with POST.
@@ -1000,13 +1168,17 @@ class ReachyDriver:
             data: JSON body, or ``None``.
 
         Returns:
-            The decoded body, or ``{"error": ...}``.
+            The decoded body, or ``{"error": ...}`` - including for a body that
+            decodes to something other than a JSON object, on the reasoning
+            :meth:`_daemon_get` gives.
         """
         transport = _resolve_transport()
         if isinstance(transport, str):
             return {"error": transport}
 
-        result: dict[str, Any] = transport.api(self._host, self._api_port, path, method="POST", data=data)
+        result = transport.api(self._host, self._api_port, path, method="POST", data=data)
+        if not isinstance(result, dict):
+            return _body_shape_error("POST", path, "an object", result)
         return result
 
     def _send_cmd(self, command: dict[str, Any]) -> str | None:
@@ -1200,6 +1372,58 @@ def _split_host_port(port: str | None, api_port: int) -> tuple[str, int]:
     if (reason := tcp_port_error(resolved, "api_port", "ReachyDriver")) is not None:
         raise ValueError(reason)
     return host, resolved
+
+
+def _json_kind(body: Any) -> str:
+    """Name the JSON type a decoded daemon body arrived as.
+
+    Args:
+        body: A value :func:`~strands_robots.device_connect.reachy_transport.api`
+            handed back.
+
+    Returns:
+        The JSON type name - ``"object"``, ``"array"``, ``"string"``,
+        ``"number"``, ``"boolean"`` or ``"null"`` - so a refusal names the shape
+        in the daemon's own vocabulary rather than Python's. ``bool`` is tested
+        before ``int`` because it is a subclass of it, and a stray non-JSON value
+        falls back to its Python type name rather than being mislabelled.
+    """
+    if body is None:
+        return "null"
+    if isinstance(body, bool):
+        return "boolean"
+    if isinstance(body, int | float):
+        return "number"
+    if isinstance(body, str):
+        return "string"
+    if isinstance(body, list):
+        return "array"
+    if isinstance(body, dict):
+        return "object"
+    return type(body).__name__
+
+
+def _body_shape_error(method: str, path: str, expected: str, body: Any) -> dict[str, Any]:
+    """Report a daemon body that decoded to the wrong JSON shape.
+
+    Args:
+        method: HTTP method, so a reason names the call.
+        path: Request path, one of this module's ``_PATH_*`` constants.
+        expected: The shape the caller needs, worded for the message - e.g.
+            ``"an object"``.
+        body: What the daemon answered with instead.
+
+    Returns:
+        The ``{"error": ...}`` envelope every caller here already branches on,
+        so a body of the wrong shape refuses by the same path as an unreachable
+        daemon. The value is previewed rather than named by type alone: an
+        interposed proxy's JSON error page and a daemon answering ``null`` are
+        both "not an object", and only the preview tells them apart.
+    """
+    preview = repr(body)
+    if len(preview) > _BODY_PREVIEW_CHARS:
+        preview = preview[:_BODY_PREVIEW_CHARS] + "..."
+    return {"error": f"{method} {path}: daemon answered a JSON {_json_kind(body)}, not {expected}: {preview}"}
 
 
 def _refuse(reason: str) -> dict[str, Any]:

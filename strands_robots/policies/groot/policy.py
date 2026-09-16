@@ -30,6 +30,7 @@ import numpy as np
 from strands_robots.policies.base import Policy
 from strands_robots.utils import (
     SUPPORTED_GROOT_VERSIONS,
+    boolean_flag_error,
     groot_version_error,
     name_list_error,
     tcp_port_error,
@@ -593,6 +594,11 @@ class Gr00tPolicy(Policy):
             if auto-inferred observation/action keys cannot be matched to the
             model by exact name. Defaults to False (positional fallback). Ignored
             when explicit ``observation_mapping``/``action_mapping`` are provided.
+        timeout_ms: Service mode only - how long each request to the server may
+            wait for its reply (send and receive), default 15000. A request that
+            expires raises ``ConnectionError`` naming the server URI, the
+            endpoint, this budget and whether anything is listening there. Raise
+            it for a slow model; lower it to fail fast on a wrong host/port.
 
     Examples::
 
@@ -628,6 +634,7 @@ class Gr00tPolicy(Policy):
         action_mapping: dict[str, str] | None = None,
         language_key: str | None = None,
         strict_keys: bool = False,
+        timeout_ms: int = 15000,
         **kwargs,
     ):
         self.data_config = load_data_config(data_config)
@@ -636,6 +643,18 @@ class Gr00tPolicy(Policy):
         self._local_policy: Any = None
         self._client: Gr00tInferenceClient | None = None
         self._groot_version = groot_version or _detect_groot_version()
+        # ``strict`` and ``strict_keys`` below each select one of two postures,
+        # so both are checked rather than read by truthiness: every non-empty
+        # string is truthy, and ``strict_keys="false"`` used to select the
+        # strict posture and report it as ``strict_keys=True`` to the caller who
+        # spelled the opposite. Unlike ``groot_version`` and ``port``, which are
+        # consumed inside the mode branch that reads them and are validated
+        # there, these are stored for a reader that runs later - and only in
+        # local mode, which needs NVIDIA's Isaac-GR00T installed. A check scoped
+        # to that branch would therefore never run for the caller who most needs
+        # it, so the domain is applied at the door in both modes.
+        if (strict_error := boolean_flag_error(strict, "strict", type(self).__name__)) is not None:
+            raise ValueError(strict_error)
         self._strict = strict
 
         # DOF per model state key - discovered from model at load time
@@ -645,6 +664,8 @@ class Gr00tPolicy(Policy):
         self._raw_obs_mapping = observation_mapping
         self._raw_action_mapping = action_mapping
         self._language_key_override = language_key
+        if (strict_keys_error := boolean_flag_error(strict_keys, "strict_keys", type(self).__name__)) is not None:
+            raise ValueError(strict_keys_error)
         self._strict_keys = strict_keys
 
         # Resolved mappings
@@ -690,7 +711,11 @@ class Gr00tPolicy(Policy):
             logger.info("GR00T service mode, %s:%s", host, port)
             # Resolve api_token from env var if not provided as parameter
             resolved_token = api_token or os.environ.get("GROOT_API_TOKEN")
-            self._client = Gr00tInferenceClient(host=host, port=port, api_token=resolved_token)
+            # ``timeout_ms`` is the service-mode wait budget per request, so it
+            # reaches the socket here; pre-fix it fell into ``**kwargs`` and
+            # was dropped, so ``policy_config={"timeout_ms": 500}`` still
+            # waited the 15 s default on a port nothing listens on.
+            self._client = Gr00tInferenceClient(host=host, port=port, timeout_ms=timeout_ms, api_token=resolved_token)
 
         # Runs in BOTH modes: a caller-supplied mapping needs no model
         # metadata, so service mode must reach it too (#2265).

@@ -112,8 +112,8 @@ have performed. Construct a new `Robot` to run another task.
 
 | Action | Blocking? | Needs |
 |--------|-----------|-------|
-| `execute` | Yes | `instruction` + `policy_port` |
-| `start` | No | `instruction` + `policy_port` |
+| `execute` | Yes | `instruction`; `policy_port` as the provider demands (see above) |
+| `start` | No | `instruction`; `policy_port` as the provider demands (see above) |
 | `status` | - | - |
 | `stop` | - | - |
 
@@ -139,6 +139,12 @@ robot.start_teleop_receive(source_peer_id="leader-abc123", device_name="follower
 robot.get_teleop_status()
 robot.stop_teleop()   # stop all sessions
 ```
+
+`teleoperator` must expose a callable `get_action()` - the same contract
+`attach_teleop()` grades - because the publish loop polls it every tick. A device
+that does not is refused here, before the publisher already registered under that
+`device_name` is torn down, so a device that could never be polled cannot cost you
+a working stream.
 
 ## Sim vs real
 

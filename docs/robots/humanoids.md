@@ -16,48 +16,13 @@ sim = Robot("reachy_mini")      # Pollen Reachy Mini (expressive)
 
 ## Catalog
 
-| Name | Description | Joints | Aliases |
-|------|-------------|-------:|---------|
-| `adam_lite` | PNDbotics Adam Lite Humanoid (26-DOF) | 26 | `pndbotics_adam_lite` |
-| `apollo` | Apptronik Apollo Humanoid (34-DOF) | 34 | `apptronik_apollo` |
-| `asimov_v0` | Asimov V0 Bipedal Legs (12-DOF + 2 passive toes) | 15 | `asimov` |
-| `booster_t1` | Booster T1 Humanoid (24-DOF) | 24 | - |
-| `cassie` | Agility Cassie Bipedal Robot | 28 | `agility_cassie` |
-| `elf2` | BXI Elf2 Humanoid (25-DOF) | 26 | `bxi_elf2` |
-| `fourier_n1` | Fourier N1 / GR-1 Humanoid (26-DOF) | 26 | `fourier_gr1`, `fourier_gr1_arms_only`, `fourier_gr1_arms_waist`, `fourier_gr1_full_upper_body`, `gr1` |
-| `jvrc` | JVRC-1 Humanoid (HRP-based, 45-DOF) | 45 | `jvrc1` |
-| `microduck` | Pollen Microduck (14-DOF open-source biped, Dynamixel XL330) | 15 | `micro_duck`, `pollen_microduck` |
-| `op3` | ROBOTIS OP3 Humanoid (20-DOF) | 21 | `robotis_op3` |
-| `open_duck_mini` | Open Duck Mini V2 (16-DOF expressive biped, Feetech servos) | 16 | `bdx`, `mini_bdx`, `open_duck`, `open_duck_mini_v2`, `open_duck_v2` |
-| `rby1` | Rainbow Robotics RB-Y1A Mobile Manipulator (31-DOF) | 31 | `rby1a`, `rainbow_rby1` |
-| `reachy2` | Pollen Reachy 2 _(hardware-only, no sim asset)_ | ? | - |
-| `reachy_mini` | Pollen Reachy Mini (6-DOF Stewart head + antennas, 9 actuators) | 21 | `pollen_reachy_mini`, `reachy`, `reachy-mini`, `reachymini` |
-| `talos` | PAL Robotics TALOS Humanoid (32-DOF) | 45 | `pal_talos` |
-| `toddlerbot_2xc` | Toddlerbot 2xC Humanoid (45-DOF) | 45 | - |
-| `toddlerbot_2xm` | Toddlerbot 2xM Humanoid (45-DOF) | 45 | - |
-| `unitree_g1` | Unitree G1 Humanoid (29-DOF + dexterous hands) | 46 | `g1`, `g1_wbc`, `real_g1_relative_eef_relative_joints`, `unitree_g1_full_body`, `unitree_g1_locomanip`, `unitree_g1_real`, `unitree_g1_sonic`, `unitree_g1_wbc` |
-| `unitree_h1` | Unitree H1 Humanoid (19-DOF) | 20 | `h1` |
-| `unitree_h1_2` | Unitree H1-2 Humanoid (52-DOF, with hands) | 52 | `h1_2` |
+Every robot in this family, generated from `robots.json` at build time. Renders are MuJoCo sim renders, never hardware photos.
 
-## Featured renders
+{{robot_cards:humanoid, expressive}}
 
-### `apollo`
+## Real hardware: the Booster T1 native driver
 
-![apollo](../assets/sim_render_apollo.png){ width=400 }
-
-_Apptronik Apollo Humanoid (34-DOF)_
-
-### `asimov_v0`
-
-![asimov_v0](../assets/sim_render_asimov_v0.png){ width=400 }
-
-_Asimov V0 Bipedal Legs (12-DOF + 2 passive toes)_
-
-### `booster_t1`
-
-_Booster T1 Humanoid (24-DOF)_
-
-**Real hardware.** The T1 is driven natively through its own SDK
+The T1 is driven natively through its own SDK
 (`booster_robotics_sdk_python`, a pybind11 wrapper over the robot's DDS
 transport) — lerobot has no robot type for it, so `driver="strands"` is the only
 way to reach it and the registry declares it as the default:
@@ -110,7 +75,7 @@ their own timer (the vendor's reference client runs 100 Hz).
 
 The SDK is a vendor wheel rather than a declared dependency of this project
 (`pip install booster_robotics_sdk_python`, linux wheels only) — the same footing
-as the G1's `unitree-sdk2`. Without it the driver still imports, builds and
+as the G1's `unitree_sdk2py` ([recipe](#installing-the-unitree-sdk)). Without it the driver still imports, builds and
 answers `get_status`; `connect_eagerly()` returns a reason naming the module and
 the install line. Because the wheel is pinned to the robot's firmware
 rather than resolved by this project, the *installed* build's vocabulary is an
@@ -119,29 +84,78 @@ spells so a caller sees them without the SDK, and a build that declares a
 different set is refused by name — naming the enum, the member and the modes
 that build does have — rather than raising out of the verb.
 
-### `cassie`
+## Real hardware: the Unitree G1 native driver
 
-![cassie](../assets/sim_render_cassie.png){ width=400 }
+The G1 has no lerobot robot type either, so `mode="real"` builds the native
+CycloneDDS driver in `strands_robots.drivers.g1` (the registry declares
+`hardware.driver = "strands"`):
 
-_Agility Cassie Bipedal Robot_
+```python
+from strands_robots import Robot
 
-### `fourier_n1`
+g1 = Robot("g1", mode="real", port="192.168.123.161")   # network_interface="eth0" by default
+g1.connect_eagerly()      # subscribes rt/lowstate, bms, lidar, mainboard; None when the bus is up
+await g1.get_status()     # connection, FSM, battery
+```
 
-![fourier_n1](../assets/sim_render_fourier_n1.png){ width=400 }
+The driver-as-tool is deliberately small - `sensors`, `status`, `stop` - so an
+agent can introspect the robot the day it is built. Motion goes through the
+FSM-gated `g1_tools` bundle (`g1_send_action`, `g1_run_policy`, `g1_start_task`,
+the `g1_safe_*` posture verbs) and, for the raw SDK, `use_unitree`; see the
+[hardware tools](../hardware/tools.md) and [security](../security.md) pages.
 
-_Fourier N1 / GR-1 Humanoid (26-DOF)_
+### Installing the Unitree SDK
 
-### `microduck`
+`unitree_sdk2py` is Unitree's vendor SDK and is **not** an extra of this
+project. It cannot honestly be one: the PyPI `unitree-sdk2` 1.0.1 wheel ships no
+`g1` or `comm` package (its `__init__` imports a `b2` it does not contain, so
+`import unitree_sdk2py` fails) and pins `cyclonedds==0.10.2`, whose wheels stop
+at Python 3.10 - under this project's `requires-python = ">=3.12"` that is a
+source build that wants the CycloneDDS C library. Without the SDK the driver
+still imports and builds; `connect_eagerly()` and every write verb return a
+refusal that names this recipe.
 
-![microduck](../assets/sim_render_microduck.png){ width=400 }
+A *partial* install fails elsewhere, and that is the shape the PyPI wheel
+produces. With the bus bindings and the IDL types present but no `comm`
+package, `connect_eagerly()` **succeeds** and the only thing that fails is the
+motion-switcher open - reported as `motion_switcher_open_error` by the G1's
+`get_status()`, and as the refusal from the Go2's `release_sport_mode()`. Both
+name the same recipe and keep the SDK's own exception, so the module that is
+actually missing is in the text.
 
-_Pollen Microduck (14-DOF open-source biped, Dynamixel XL330)_
+The upstream checkout installed beside a `cyclonedds` wheel is what works. On
+macOS arm64 and x86_64 Linux (Python 3.12):
 
-![Microduck walking in MuJoCo](../assets/microduck/microduck_walk.gif){ width=400 }
+```bash
+pip install 'cyclonedds>=0.10.2,<12'
+git clone https://github.com/unitreerobotics/unitree_sdk2_python
+pip install --no-deps -e ./unitree_sdk2_python     # --no-deps skips the ==0.10.2 pin
+python -c "from unitree_sdk2py.core.channel import ChannelFactoryInitialize; print('ok')"
+```
 
-_`alpha_walking.onnx` in a MuJoCo rollout — see [Microduck policies](../policies/microduck.md#walking-in-mujoco)._
+On Linux aarch64 - the Jetson the robot ships with - `cyclonedds` publishes no
+wheel at any version, so the C library comes first and the binding is built
+against it:
 
-**Real hardware.** The Microduck is driven natively through its on-robot
+```bash
+git clone --branch 0.10.2 --depth 1 https://github.com/eclipse-cyclonedds/cyclonedds /tmp/cdds
+cmake -S /tmp/cdds -B /tmp/cdds/build -DCMAKE_BUILD_TYPE=Release && sudo cmake --build /tmp/cdds/build --target install
+export CYCLONEDDS_HOME=/usr/local
+pip install 'cyclonedds==0.10.2'
+git clone https://github.com/unitreerobotics/unitree_sdk2_python
+pip install --no-deps -e ./unitree_sdk2_python
+```
+
+0.10.2 is the CycloneDDS release Unitree's own images and SDK pin, and the one
+the `g1_tools` bundle was developed against. The 11.x wheel imports, builds the
+IDL types and binds a `ChannelFactory`, but it has not been proven against a
+live G1 bus; if the robot's topics stay silent under 11.x, build 0.10.2 as
+above. Point `CYCLONEDDS_URI` at the robot's `cyclonedds.xml` when the default
+multicast discovery does not find it.
+
+## Real hardware: the Microduck robotd driver
+
+The Microduck is driven natively through its on-robot
 `robotd` daemon (Pollen's `duck-ipc-proto` JSON-RPC over a Unix socket) — the
 same policy code that runs in sim drives the physical robot:
 
@@ -158,22 +172,29 @@ duck.send_action({"skill": "kick_left"})  # a named skill (robot.do)
 duck.emergency_stop()                  # robot.stop
 ```
 
+Every intent frame carries its whole group -- `robot.move` always carries
+`vx`/`vy`/`vyaw`, `robot.pose` always `z`/`roll`/`pitch`/`active` -- so an
+absent key is the resting value (`{"vx": 0.15}` walks straight ahead) and a key
+this driver does not know is refused, even with a known key beside it. That
+distinction matters because the two are indistinguishable on the wire:
+`{"vx": 0.15, "yaw": 0.6}` -- `yaw` being the spelling the `get_status` pose
+block uses for the heading -- would otherwise send `vyaw: 0`, walk straight past
+the turn and report success. The same refusal catches a 14-joint
+`MICRODUCK_JOINT_NAMES` action: four of its keys are head axes, so it would
+arrive as a `robot.head` frame with the other ten joints dropped, which is the
+per-joint stream `run_policy` refuses by name.
+
+All three halt paths - `stop()`, `stop_task()` and `emergency_stop()` - send the
+same `robot.stop`, and an accepted one is recorded in
+`get_status()["motion_stopped"]`, the field an operator reads to decide whether
+the robot is safe to approach. Only an accepted halt sets it: a stop robotd
+declines leaves it false. `relax()` and `enable_torque(False)` de-energise rather
+than halt a commanded motion, so they leave the flag alone.
+
 `robotd` owns the walking/skill ONNX on-device, so `run_policy`/`start_task`
 refuse and point back at the intent path; use `mode="sim"` for a host-driven
-`MicroduckPolicy` rollout. For a remote robot, forward its socket to a local
+[`MicroduckPolicy` rollout](../policies/microduck.md#walking-in-mujoco). For a remote robot, forward its socket to a local
 path (`ssh -L`/`socat`) and pass that path as `port=`.
-
-### `open_duck_mini`
-
-![open_duck_mini](../assets/sim_render_open_duck_mini.png){ width=400 }
-
-_Open Duck Mini V2 (16-DOF expressive biped, Feetech servos)_
-
-### `reachy_mini`
-
-![reachy_mini](../assets/sim_render_reachy_mini.png){ width=400 }
-
-_Pollen Reachy Mini (6-DOF Stewart head + antennas, 9 actuators)_
 
 ## Mounting a camera on a humanoid
 

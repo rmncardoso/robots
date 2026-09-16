@@ -117,6 +117,13 @@ def _quat_angle_error(target_wxyz: Any, actual_wxyz: Any) -> float:
     return float(2.0 * math.acos(min(1.0, dot)))
 
 
+OBSTRUCTION_MAX_CONTACTS = 3
+"""Contacts named in a not-reached ``move_to`` refusal; the total is still reported."""
+
+JOINT_LIMIT_MARGIN_FRACTION = 0.01
+"""A commanded joint within this fraction of its range (floor 1e-3) of a bound counts as at the limit."""
+
+
 def _err(text: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Structured error tool-result, optionally with a json details block."""
     content: list[dict[str, Any]] = [{"text": text}]
@@ -529,6 +536,7 @@ class MotionPrimitivesCore:
         orientation_error: float | None = None,
         orientation_tol: float | None = None,
         ik_orientation_residual: float | None = None,
+        obstruction: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Success / not-reached envelope for ``move_to``, shared across backends.
 
@@ -537,6 +545,15 @@ class MotionPrimitivesCore:
         and are ``None`` for a position-only call, which has no orientation to
         report. When they are present ``reached`` must already account for
         them - this builder reports the measurement, it does not decide it.
+
+        ``obstruction`` is what the engine saw at the final servo tick, in the
+        shape :meth:`_obstruction_text` reads (``contacts`` on the robot and
+        ``joints_at_limit`` among the commanded joints). It is only read on
+        the not-reached path, where it turns "the pose fights joint
+        limits/contacts" into the name of the contact or the joint that
+        stopped the servo. ``None`` means the engine did not look; an empty
+        report means it looked and found nothing, which is itself an answer
+        (the servo just needs more steps).
         """
         payload: dict[str, Any] = {
             "reached": reached,
@@ -574,14 +591,145 @@ class MotionPrimitivesCore:
         residuals = f"residual {position_error:.4f} m"
         if orientation_error is not None and orientation_tol is not None:
             residuals += f", orientation residual {orientation_error:.4f} rad (tol {float(orientation_tol)} rad)"
+        if obstruction is not None:
+            payload["obstruction"] = obstruction
         return _err(
             f"move_to: '{robot_name}' EE ({frame_type} '{frame_name}') did not reach "
             f"{target.tolist()} within tol={float(tol)} m "
             f"after max_steps={max_steps} ({residuals}; IK residual was "
-            f"{ik_residual:.4f} m). The servo may need more steps, or the pose fights joint "
-            "limits/contacts.",
+            f"{ik_residual:.4f} m). " + MotionPrimitivesCore._obstruction_text(obstruction),
             payload,
         )
+
+    @staticmethod
+    def _joint_limit_record(name: str, pos: float, lo: float, hi: float) -> dict[str, Any] | None:
+        """One joint's at-a-bound record, or ``None`` when it sits clear of both bounds.
+
+        The single owner of "at a bound": a joint counts when its position is
+        within :data:`JOINT_LIMIT_MARGIN_FRACTION` of its range (floor
+        ``1e-3``) of either end. Backends reach it by different routes - the
+        MuJoCo servo through :meth:`_joints_at_limit` (``jnt_range`` against a
+        ``qpos`` vector), the Isaac wrist servo from the articulation DOF
+        limits it already read - so keeping the threshold here is what makes
+        "this joint stopped you" mean the same thing on both.
+
+        Args:
+            name: Joint name as the caller will read it.
+            pos: The joint's position at the final servo tick.
+            lo: Lower bound of its range.
+            hi: Upper bound of its range.
+
+        Returns:
+            ``{"joint", "pos", "limit", "side"}`` naming the bound it sits on,
+            or ``None`` when it is clear of both.
+        """
+        margin = max((hi - lo) * JOINT_LIMIT_MARGIN_FRACTION, 1e-3)
+        side = "lower" if pos <= lo + margin else "upper" if pos >= hi - margin else None
+        if side is None:
+            return None
+        return {"joint": name, "pos": pos, "limit": lo if side == "lower" else hi, "side": side}
+
+    @staticmethod
+    def _joints_at_limit(mj: Any, model: Any, qpos: Any, joint_ids: Iterable[int]) -> list[dict[str, Any]]:
+        """The commanded joints sitting at a bound of their range, by name.
+
+        Engine-agnostic: reads a full ``qpos`` vector against the MuJoCo model
+        every backend already holds for IK, so the MuJoCo servo (live
+        ``data.qpos``) and the Isaac servo (its FK readback ``q_fk``) answer
+        the same question the same way. A joint counts when it has limits and
+        :meth:`_joint_limit_record` - the single owner of "at a bound" - says
+        it sits at one.
+
+        Args:
+            mj: The ``mujoco`` module.
+            model: The ``mujoco.MjModel`` the joints live in.
+            qpos: Full generalized position vector indexed by ``jnt_qposadr``.
+            joint_ids: The joints the primitive commanded.
+
+        Returns:
+            ``[{"joint", "pos", "limit", "side"}]`` ascending by joint id.
+        """
+        out: list[dict[str, Any]] = []
+        for jnt_id in sorted(int(j) for j in joint_ids):
+            if not bool(model.jnt_limited[jnt_id]):
+                continue
+            record = MotionPrimitivesCore._joint_limit_record(
+                mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, jnt_id) or f"joint_{jnt_id}",
+                float(qpos[int(model.jnt_qposadr[jnt_id])]),
+                float(model.jnt_range[jnt_id][0]),
+                float(model.jnt_range[jnt_id][1]),
+            )
+            if record is not None:
+                out.append(record)
+        return out
+
+    @staticmethod
+    def _obstruction_text(obstruction: dict[str, Any] | None) -> str:
+        """Say what stopped the servo, by name, or that nothing visible did.
+
+        Measured with an agent on the bundled so100 (v0.5.2 devx replay, s09):
+        three ``move_to`` calls in a row ended in "the pose fights joint
+        limits/contacts" and only a separate ``get_contacts`` call named the
+        cause. On that robot a low target near the base
+        (``position=[0.0, -0.10, 0.03]``) drives the jaw into the floor:
+        ``the robot is in contact: 'ground' <-> 'so100/Fixed_Jaw/geom_18'
+        (d=-0.0002 m)``. The agent needed an extra tool call per failure to
+        learn that, and the generic line named neither of the two things it
+        could have. ``rotate_wrist`` servos to a set-point the same way and
+        reported only its residual: on the same robot the wrist turned 0.003
+        of 2.500 rad while contacts held the gripper inside its own base.
+
+        Shared across primitives, so the remedy names the commanded VALUE
+        rather than a target position - ``rotate_wrist`` commands an angle,
+        and "move the target away" is not an instruction its caller can
+        follow.
+
+        Args:
+            obstruction: ``{"contacts": [{"geom1", "geom2", "dist"}],
+                "joints_at_limit": [{"joint", "pos", "limit", "side"}]}`` as the
+                engine read it at the final tick, at most
+                :data:`OBSTRUCTION_MAX_CONTACTS` contacts. The contact records
+                are spelled the way :meth:`get_contacts` spells them, so the
+                two reports read as one. ``None`` when the engine did not look.
+
+        Returns:
+            One clause naming the obstruction and the remedy it implies; the
+            legacy generic clause when the engine did not look.
+        """
+        if obstruction is None:
+            return "The servo may need more steps, or the pose fights joint limits/contacts."
+        contacts = list(obstruction.get("contacts") or [])
+        limits = list(obstruction.get("joints_at_limit") or [])
+        parts: list[str] = []
+        if contacts:
+            named = "; ".join(f"'{c['geom1']}' <-> '{c['geom2']}' (d={float(c['dist']):.4f} m)" for c in contacts)
+            more = obstruction.get("contacts_total")
+            suffix = f" and {int(more) - len(contacts)} more" if more and int(more) > len(contacts) else ""
+            parts.append(f"the robot is in contact: {named}{suffix}")
+        if limits:
+            named = "; ".join(
+                f"'{j['joint']}' at its {j['side']} limit ({float(j['pos']):.4f} vs {float(j['limit']):.4f})"
+                for j in limits
+            )
+            parts.append(f"commanded joint(s) at a limit: {named}")
+        if not parts:
+            if obstruction.get("contacts_total") is None:
+                return (
+                    "At the final step no commanded joint was at a limit (contacts were not read on "
+                    "this backend): the servo may need more steps (raise max_steps), or the pose "
+                    "fights a contact."
+                )
+            return (
+                "At the final step no contact involved the robot and no commanded joint was at a "
+                "limit, so nothing visible is blocking it: the servo most likely needs more steps "
+                "(raise max_steps) or a slightly looser tol."
+            )
+        remedy = (
+            " Clear what it touches, or command a value that avoids it - or loosen tol."
+            if contacts
+            else " Command a value that joint can reach inside its range, or loosen tol."
+        )
+        return "The servo was stopped: " + "; ".join(parts) + "." + remedy
 
     @staticmethod
     def _commanded_dof_indices(model: Any, commanded_joint_ids: Iterable[int]) -> list[int]:
@@ -656,28 +804,43 @@ class MotionPrimitivesCore:
         targets: dict[str, float],
         setpoint_sources: dict[str, str],
         gripper_joint_positions: dict[str, float],
+        *,
+        held: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Success envelope for ``set_gripper``, shared across backends.
 
         All mappings are keyed by the (namespace-stripped) actuator / joint
         name, so the payload is meaningful to the agent whichever backend
         resolved the ids.
+
+        ``held`` is what the fingers touch after a close, body name to contact
+        count, for backends that can read contacts; ``None`` means the backend
+        did not look (or the state was ``"open"``), and the reply stays as it
+        was. An empty dict is a close that touched nothing, and the text says
+        so - a grasp that missed reads exactly like one that landed otherwise.
         """
-        payload = {
+        payload: dict[str, Any] = {
             "state": state,
             "actuators": actuators,
             "targets": targets,
             "setpoint_sources": setpoint_sources,
             "gripper_joint_positions": gripper_joint_positions,
         }
+        text = f"set_gripper: '{robot_name}' gripper commanded {state} ({steps} ticks, actuators {actuators})."
+        if held is not None:
+            payload["holding"] = sorted(held)
+            payload["finger_contacts"] = dict(sorted(held.items()))
+            if held:
+                what = ", ".join(f"'{name}' ({n} contact{'s' if n != 1 else ''})" for name, n in sorted(held.items()))
+                text += f" Closed on {what}."
+            else:
+                text += (
+                    " Closed on nothing: no object is touching the fingers, so a lift now carries nothing - "
+                    "move_to the object first (get_body_state gives its position)."
+                )
         return {
             "status": "success",
-            "content": [
-                {
-                    "text": f"set_gripper: '{robot_name}' gripper commanded {state} ({steps} ticks, actuators {actuators})."
-                },
-                {"json": payload},
-            ],
+            "content": [{"text": text}, {"json": payload}],
         }
 
     @staticmethod
@@ -693,6 +856,7 @@ class MotionPrimitivesCore:
         final_yaw: float,
         yaw_error: float,
         uncommanded_drives: list[str] | None = None,
+        obstruction: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Success / not-reached envelope for ``rotate_wrist``, shared across backends.
 
@@ -702,6 +866,14 @@ class MotionPrimitivesCore:
         other joint" is reported for the joints it can hold rather than claimed
         for all of them. Omitted from the payload when there are none, which
         keeps the envelope byte-identical for a fully position-servo robot.
+
+        ``obstruction`` is what the engine saw at the final servo tick, in the
+        shape :meth:`_obstruction_text` reads, and is only read on the
+        not-reached path - where it turns a bare residual into the name of the
+        contact or the joint bound that stopped the wrist. ``None`` means the
+        engine did not look, and then the reply stays byte-identical to what
+        it was: a null obstruction would read as "looked, found nothing",
+        which is a different answer.
         """
         payload: dict[str, Any] = {
             "reached": reached,
@@ -728,8 +900,11 @@ class MotionPrimitivesCore:
                 "status": "success",
                 "content": [{"text": text}, {"json": payload}],
             }
-        return _err(
+        text = (
             f"rotate_wrist: '{robot_name}' joint '{wrist_name}' did not reach {target_yaw:.3f} rad "
-            f"within tol={float(tol)} rad after max_steps={max_steps} (residual {yaw_error:.4f} rad).",
-            payload,
+            f"within tol={float(tol)} rad after max_steps={max_steps} (residual {yaw_error:.4f} rad)."
         )
+        if obstruction is not None:
+            payload["obstruction"] = obstruction
+            text += " " + MotionPrimitivesCore._obstruction_text(obstruction)
+        return _err(text, payload)

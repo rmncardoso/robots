@@ -258,6 +258,32 @@ class Trainer(ABC):
 
         return rl_replay_problems(spec, context=self.provider_name)
 
+    def _rl_warmup_batch_problems(self, spec: TrainSpec) -> list[str]:
+        """Report ``learning_starts``, and a warmup below ``batch_size``.
+
+        The first half of the off-policy warmup contract: the threshold must be a
+        count, and at least ``batch_size`` or the first gradient step cannot
+        sample a full batch. Both off-policy backends state it identically, so it
+        is owned here rather than inlined in each.
+        :meth:`_rl_warmup_reachability_problems` is the second half - whether the
+        threshold is ever *reached*.
+        """
+        from strands_robots.training._validate import warmup_batch_relation_problems
+
+        return warmup_batch_relation_problems(spec, context=self.provider_name)
+
+    def _rl_warmup_reachability_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight that ``learning_starts`` is a replay fill the run can reach.
+
+        The step budget ``total_timesteps`` collects and the ``buffer_size``
+        capacity each bound the fill a run ever reaches; either below the
+        threshold takes zero gradient steps for the whole run and still reports
+        success with a written checkpoint.
+        """
+        from strands_robots.training._validate import warmup_reachability_problems
+
+        return warmup_reachability_problems(spec, context=self.provider_name)
+
     def _learning_rate_problems(self, spec: TrainSpec) -> list[str]:
         """Preflight ``learning_rate`` when supplied: a positive finite number."""
         from strands_robots.training._validate import learning_rate_problems
@@ -314,6 +340,31 @@ class Trainer(ABC):
         from strands_robots.training._validate import streaming_problems
 
         return streaming_problems(spec, context=self.provider_name)
+
+    def _observation_normalization_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight ``normalize_obs``: a ``bool``."""
+        from strands_robots.training._validate import observation_normalization_problems
+
+        return observation_normalization_problems(spec, context=self.provider_name)
+
+    def _advantage_normalization_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight ``normalize_advantage``: a ``bool``."""
+        from strands_robots.training._validate import advantage_normalization_problems
+
+        return advantage_normalization_problems(spec, context=self.provider_name)
+
+    def _temperature_autotune_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight ``autotune_alpha``: a ``bool``.
+
+        A backend whose ``validate`` consults
+        :meth:`_temperature_learning_rate_problems` MUST consult this one first,
+        since that gate reads ``alpha_lr`` only on the branch this flag selects
+        - so a misread posture is refused by the flag's own name rather than as
+        the rate it would have selected.
+        """
+        from strands_robots.training._validate import temperature_autotune_problems
+
+        return temperature_autotune_problems(spec, context=self.provider_name)
 
     def _lora_hyperparameter_problems(self, spec: TrainSpec) -> list[str]:
         """Preflight ``lora_r`` and ``lora_alpha``, each a positive ``int`` or ``None``.

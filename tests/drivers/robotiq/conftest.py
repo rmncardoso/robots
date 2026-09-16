@@ -43,6 +43,16 @@ class FakeGripper:
             exception carrying this code. Writable after construction so a test
             can make a connected controller *start* refusing, which is how the
             wire fails in the field - a driver reaches it once and then does not.
+        stall: While set, requests are read and never answered, so the driver's
+            socket times out. The other way a live controller fails: it holds
+            the connection open and stops replying, which a driver must report
+            rather than block on.
+        raw_reply: While set, every request is answered with these exact bytes
+            and the connection is then held open. Not a 2F-85 behaviour: this is
+            what is listening when the driver has the wrong address - a
+            controller's web endpoint, another service on port 502 - and it
+            answers a frame whose MBAP header this codec has to refuse rather
+            than read by.
     """
 
     def __init__(
@@ -77,6 +87,8 @@ class FakeGripper:
         self._fault = fault
         self._current = current
         self.exception_code = exception_code
+        self.stall = False
+        self.raw_reply: bytes | None = None
         self._never_activates = never_activates
 
         self.activated = starts_activated
@@ -96,6 +108,8 @@ class FakeGripper:
         self._server.listen(1)
         self.port: int = self._server.getsockname()[1]
         self._stop = threading.Event()
+        self._conn: socket.socket | None = None
+        self._accepted = threading.Event()
         self._thread = threading.Thread(target=self._serve, name="fake-2f85", daemon=True)
         self._thread.start()
 
@@ -109,6 +123,18 @@ class FakeGripper:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+    def half_close(self) -> None:
+        """Send FIN on the live connection, as a controller closing its side would.
+
+        A shutdown rather than a close, so the driver reads end-of-stream on a
+        socket that is still open: that is the reply a hub or a power-cycled
+        controller leaves behind, and it is decoded from a *short* frame rather
+        than from an error the socket reports.
+        """
+        assert self._accepted.wait(timeout=2.0), "no client ever connected"
+        assert self._conn is not None
+        self._conn.shutdown(socket.SHUT_WR)
 
     def close(self) -> None:
         """Stop serving and release the listening socket."""
@@ -128,6 +154,8 @@ class FakeGripper:
             conn, _addr = self._server.accept()
         except OSError:
             return  # closed before a client arrived
+        self._conn = conn
+        self._accepted.set()
         with conn:
             while not self._stop.is_set():
                 header = self._read_exactly(conn, 7)
@@ -138,6 +166,14 @@ class FakeGripper:
                 if body is None:
                     return
                 transaction, _protocol, _length, unit = struct.unpack(">HHHB", header)
+                if self.stall:
+                    continue  # read and dropped: a controller that stopped replying
+                if self.raw_reply is not None:
+                    try:
+                        conn.sendall(self.raw_reply)
+                    except OSError:
+                        return
+                    continue  # answered, and the connection stays open
                 try:
                     conn.sendall(self._answer(transaction, unit, body))
                 except OSError:

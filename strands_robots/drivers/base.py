@@ -49,6 +49,16 @@ data_config=<data_config or None>, **kwargs)``, so a driver must accept those
 three keywords and tolerate the caller's extras. ``port=`` arrives in
 ``**kwargs`` and stays polymorphic - a serial path, an IP address or a URL,
 interpreted by the driver that receives it.
+
+``cameras`` is the one of the three that is *not* forwarded unconditionally. A
+driver that accepts it only for parity - which every driver shipped here does,
+because these robots address their cameras through their own SDK rather than
+through a caller-supplied config - must not be handed one it will never open: a
+dropped camera is invisible until a recording turns out to have no image
+columns. So the factory refuses a non-empty ``cameras=`` unless the class
+declares ``reads_cameras = True``. Declaring it is the whole opt-in; the driver
+then receives the dict verbatim and owns opening, reading and closing the
+devices in it.
 """
 
 from __future__ import annotations
@@ -199,7 +209,17 @@ class HardwareDriver(Protocol):
         """
 
     def cleanup(self) -> None:
-        """Release the device and every background resource held for it."""
+        """Release the device and every background resource held for it.
+
+        Annotated ``-> None``, so like :meth:`stop` it carries no verdict, and
+        the same obligation follows: an implementation that delegates to a halt
+        verb must read that verb's envelope and log a non-success, naming what
+        may still be moving. Here it is the more urgent of the two, because this
+        hook goes on to release the channel a retry would need - a refused halt
+        it did not report leaves a robot moving with nothing left in the process
+        able to reach it. The release is owed either way: stopping half-way
+        leaks the resource *and* leaves the robot moving.
+        """
 
 
 #: The driver a robot gets when nothing says otherwise. Every robot in the

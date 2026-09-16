@@ -24,7 +24,7 @@ uv pip install strands-agents "strands-robots[sim-mujoco]"
 ## Add more tools
 
 ```python
-from strands_robots.tools import gr00t_inference, pose_tool
+from strands_robots import gr00t_inference, pose_tool
 
 agent = Agent(tools=[robot, gr00t_inference, pose_tool])
 agent("Start a GR00T server on port 5555 with so100_dualcam, "
@@ -63,7 +63,7 @@ The agent sees the same tool spec in both modes; only the implementation changes
 | "Run the policy" | `run_policy(robot_name='so100', ...)` |
 | "What's in the scene?" | `list_objects` + `get_state` |
 | "Try 10 episodes, report success" | `eval_policy(robot_name='so100', n_episodes=10)` |
-| "Record a session" | `start_recording` → `run_policy` → `stop_recording` |
+| "Record a session" | `start_recording` → `run_policy` (or a scripted `set_joint_positions(hold=True)` + `step` motion) → `stop_recording` |
 
 Inspect the full spec: `print(robot.tool_spec)` - JSON schema with all 60+ actions.
 

@@ -18,6 +18,7 @@ Exposes the deep MuJoCo C API through clean Python methods:
 import logging
 import math
 import numbers
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -29,16 +30,18 @@ from strands_robots.simulation.mujoco.backend import (
     _ensure_mujoco,
     filter_mujoco_attach_noise,
     mj_name_to_id,
+    qpos_ceiling_error,
 )
 from strands_robots.simulation.mujoco.scene_ops import (
     fromto_fixed_size_components,
     joint_drive_map,
+    joint_position_unit,
     joint_rate_drive_map,
     persist_body_mass,
     persist_geom_properties,
     refresh_body_inertial_from_geometry,
 )
-from strands_robots.simulation.safe_output import atomic_write_bytes, validate_output_path
+from strands_robots.simulation.safe_output import atomic_write_bytes, resolve_sandbox_root, validate_output_path
 from strands_robots.utils import (
     BOOLEAN_VECTOR_REASON,
     boolean_flag_error,
@@ -521,6 +524,60 @@ def _geom_type_name(mj: Any, geom_type: int) -> str:
         return f"type_{int(geom_type)}"
 
 
+def scene_root() -> Path:
+    """The directory a relative scene path names, for both writing and reading.
+
+    Defaults to ``~/.strands_robots/scenes``; override with the
+    ``STRANDS_ROBOTS_SCENE_ROOT`` env var (read at call time). The sibling of
+    the render sandbox (``STRANDS_ROBOTS_RENDER_ROOT``), resolved the same way.
+
+    One owner for the location, read by the sink that writes there
+    (:meth:`PhysicsMixin.export_xml`) and by the source that reads it back
+    (:meth:`~strands_robots.simulation.mujoco.simulation.Simulation.load_scene`),
+    so an exported scene and the reload of it cannot disagree about where the
+    file is.
+    """
+    return resolve_sandbox_root("STRANDS_ROBOTS_SCENE_ROOT", "scenes")
+
+
+def anchor_relative_scene_path(scene_path: str) -> str:
+    """Anchor a relative scene path to :func:`scene_root`.
+
+    An absolute path (after ``~`` expansion) is returned unchanged - the
+    historic contract that ``export_xml`` writes to any absolute destination,
+    and ``load_scene`` reads any absolute source, holds. A relative one, bare
+    (``"scene.xml"``) or with directories (``"handoff/scene.xml"``), is joined
+    under the scenes directory instead of resolving against the process CWD.
+
+    Nothing is validated here. On the write path the result still goes through
+    :func:`~strands_robots.simulation.safe_output.validate_output_path`, whose
+    traversal check scans every part of the joined path, so ``".."`` cannot
+    climb back out of the anchor.
+    """
+    raw = Path(scene_path).expanduser()
+    if raw.is_absolute() or not scene_path.strip():
+        return scene_path
+    return str(scene_root() / raw)
+
+
+def scene_not_found_error(scene_path: str) -> str:
+    """Say a scene file is missing, naming every directory that was searched.
+
+    A relative source is looked for as given (against the process working
+    directory) and then in the scenes directory, so a refusal that named only
+    the caller's spelling left an agent with no way to tell which of the two
+    places to fix. An absolute path has one candidate, so only it is named.
+    """
+    raw = Path(scene_path).expanduser()
+    if raw.is_absolute() or not scene_path.strip():
+        return f"Scene file not found: {scene_path}"
+    return (
+        f"Scene file not found: {scene_path} - looked in the working directory {Path.cwd()} "
+        f"and the scenes directory {scene_root()}, where a relative export_xml destination lands. "
+        "Pass an absolute scene_path, or export with the same relative name first."
+    )
+
+
 class PhysicsMixin:
     """Advanced MuJoCo physics capabilities mixed into ``Simulation``.
 
@@ -815,7 +872,6 @@ class PhysicsMixin:
         # reject the case where the caller forgot both args (handled above).
         f = np.array([0.0, 0.0, 0.0] if force is None else force, dtype=np.float64)
         t = np.array([0.0, 0.0, 0.0] if torque is None else torque, dtype=np.float64)
-        p = np.array(point, dtype=np.float64) if point is not None else data.xipos[body_id].copy()
 
         # Latch the wrench in this body's own row of ``xfrc_applied``.
         #
@@ -836,6 +892,12 @@ class PhysicsMixin:
         # persists on every subsequent step until the next apply_force call
         # for this body (or a reset()).
         with self._lock:
+            # The default point is this body's CoM, read inside the same
+            # critical section that latches the wrench: read outside it, a
+            # concurrent step moved the body in between and the call
+            # reported a point from one configuration for a wrench applied
+            # in another.
+            p = np.array(point, dtype=np.float64) if point is not None else data.xipos[body_id].copy()
             # xfrc_applied's torque acts about the body centre of mass, so a
             # force applied at an offset point contributes (point - com) x
             # force. A caller who named no point asked for the CoM itself,
@@ -895,6 +957,89 @@ class PhysicsMixin:
                 if mid >= 0:
                     return int(mid)
         return -1
+
+    def _robot_joint_labels(self, robot: Any) -> dict[str, str]:
+        """``{asset joint name: label}`` for one attached robot, from the registry.
+
+        Empty when the robot was added from a bare file rather than a registry
+        entry, when its entry declares no ``joint_labels``, or when none of
+        those labels names a joint this model actually carries.
+        """
+        # ``add_robot`` resolves the model from ``data_config`` when it is given
+        # and from the instance ``name`` otherwise - its documented precedence -
+        # so the registry entry a robot came from is ``data_config or name``,
+        # which is how the mesh lookup in that same call already spells it
+        # (``_ensure_meshes(resolved_path, data_config or name)``). Reading only
+        # ``data_config`` left every robot added by the short form the
+        # quickstart teaches - ``add_robot("so101")`` - unlabelled. A label map
+        # is keyed by the asset's joint name, so a ``name`` that collides with
+        # an unrelated registry entry cannot mislabel a joint: its keys simply
+        # match none of the model's joints.
+        source = getattr(robot, "data_config", None) or getattr(robot, "name", None)
+        if not source or self._world is None:
+            return {}
+        from strands_robots.registry import joint_labels
+
+        mj = _ensure_mujoco()
+        ns = robot.namespace or ""
+        # Only labels naming a joint this model actually has, so the three
+        # consumers - the state text, its ``joint_labels`` map and the refusal
+        # hint - cannot advertise a label the write path would then refuse.
+        return {
+            jnt: lbl
+            for jnt, lbl in joint_labels(source).items()
+            if self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, ns + jnt) >= 0
+        }
+
+    def _resolve_joint_label(self, key: object, robot_name: str | None) -> int:
+        """Resolve a joint *label* (``shoulder_pan``) or ``<robot>/<label>`` to a joint id.
+
+        Labels come from the registry entry's ``joint_labels`` block, so an
+        agent can write the joint by what it does rather than by the asset's
+        servo id or CAD term. With ``robot_name`` only that robot's labels are
+        consulted; without it the robots are tried in attachment order and the
+        first carrying the label wins, mirroring the namespace fallback for a
+        bare asset name. ``-1`` when nothing matches.
+        """
+        if not isinstance(key, str) or self._world is None:
+            return -1
+        mj = _ensure_mujoco()
+        label = key
+        candidates = list(self._world.robots.values())
+        if robot_name is not None:
+            robot = registry_entry(self._world.robots, robot_name)
+            candidates = [robot] if robot is not None else []
+        if "/" in key:
+            head, _, label = key.rpartition("/")
+            ns = head + "/"
+            candidates = [r for r in candidates if (r.namespace or "") == ns]
+        for robot in candidates:
+            # Labels are a fixed vocabulary (``shoulder_pan``), so case is not
+            # information: ``Shoulder_Pan`` from a capitalising agent means it.
+            by_label = {lbl.lower(): jnt for jnt, lbl in self._robot_joint_labels(robot).items()}
+            jnt = by_label.get(label.lower())
+            if jnt is None:
+                continue
+            jnt_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, (robot.namespace or "") + jnt)
+            if jnt_id >= 0:
+                return jnt_id
+        return -1
+
+    def _joint_labels_hint(self, robot_name: str | None) -> str:
+        """One sentence naming the labels a joint key may use, or ``""`` when there are none."""
+        if self._world is None:
+            return ""
+        robots = list(self._world.robots.values())
+        if robot_name is not None:
+            robot = registry_entry(self._world.robots, robot_name)
+            robots = [robot] if robot is not None else []
+        parts = []
+        for robot in robots:
+            labels = self._robot_joint_labels(robot)
+            if labels:
+                pairs = ", ".join(f"{jnt}={lbl}" for jnt, lbl in labels.items())
+                parts.append(f"'{robot.name}' joints may also be written by label ({pairs}).")
+        return " ".join(parts)
 
     def _unknown_mj_entity_msg(self, kind: str, requested: object) -> str:
         """Actionable "<kind> not found" message for the physics/introspection
@@ -1483,6 +1628,12 @@ class PhysicsMixin:
                 jnt_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, ns + jnt_name)
             if jnt_id < 0:
                 jnt_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, jnt_name)
+            if jnt_id < 0:
+                # The registry's joint label (``shoulder_pan`` for the SO-101's
+                # joint ``1``), scoped to ``robot_name`` when given, otherwise
+                # the first robot whose labels carry it - the same order the
+                # namespace fallback above uses for a bare asset name.
+                jnt_id = self._resolve_joint_label(jnt_name, robot_name)
             if jnt_id >= 0:
                 resolved[jnt_name] = jnt_id
             else:
@@ -1493,6 +1644,9 @@ class PhysicsMixin:
         detail = self._unknown_mj_entity_msg("Joint", unresolved[0])
         if len(unresolved) > 1:
             detail = f"Unresolved '{name}' keys: {unresolved}. {detail}"
+        labels_hint = self._joint_labels_hint(robot_name)
+        if labels_hint:
+            detail = f"{detail} {labels_hint}"
         return {}, {
             "status": "error",
             "content": [
@@ -1588,7 +1742,13 @@ class PhysicsMixin:
 
         Args:
             positions: The pose to write, as ``{joint_name: value}`` or as an
-                ordered vector (see the two accepted forms above).
+                ordered vector (see the two accepted forms above). Every value is
+                in its joint's own unit -- radians for a hinge, metres for a slide
+                (:func:`~strands_robots.simulation.mujoco.scene_ops.joint_position_unit`)
+                -- so an angle read from a real arm, whose driver reports degrees,
+                must be converted before it is written here. A value the joint's
+                range does not contain is refused naming that unit, and named as a
+                degree reading when converting it would land inside the range.
             robot_name: Which robot the ordered form binds to, and whose
                 namespace resolves an unqualified joint name. Optional when the
                 world holds exactly one robot. When given it must name a robot
@@ -1708,7 +1868,21 @@ class PhysicsMixin:
                 continue
             lo, hi = (float(x) for x in model.jnt_range[jnt_id])
             if not lo <= float(value) <= hi:
-                out_of_range.append(f"{jnt_name}={float(value):.4g} outside [{lo:.4g}, {hi:.4g}]")
+                # Name the unit the bounds are in. Without it the cheapest reading
+                # of "outside [-1.92, 1.92]" is "clamp to the bound", which is the
+                # wrong pose whenever the caller is holding the same angle in
+                # another unit; and a degree reading is how a caller mirroring a
+                # real arm arrives here, because a driver reports degrees while
+                # this write takes radians. The degree sentence is added only when
+                # converting the value actually lands inside the range, so it
+                # states a fact about this call rather than guessing at intent.
+                unit = joint_position_unit(model, jnt_id, mj)
+                detail = f"{jnt_name}={float(value):.4g} outside [{lo:.4g}, {hi:.4g}]"
+                if unit:
+                    detail += f" {unit}"
+                if unit == "rad" and lo <= math.radians(float(value)) <= hi:
+                    detail += f" (radians, not degrees: {float(value):.4g} deg = {math.radians(float(value)):.4g} rad)"
+                out_of_range.append(detail)
         if out_of_range:
             return {
                 "status": "error",
@@ -1722,6 +1896,17 @@ class PhysicsMixin:
                     }
                 ],
             }
+
+        # A range bounds a LIMITED joint, but an unlimited one (a floating
+        # base's free joint, a continuous hinge) is bounded by nothing above,
+        # so a finite value can still exceed the ceiling mj_step's own
+        # mj_checkPos applies to qpos - past it the next step resets every
+        # joint and object. Checked after the range so a limited joint keeps
+        # the more specific message naming its own range.
+        if ceiling_err := qpos_ceiling_error(
+            "set_joint_positions", ((name, float(v)) for name, v in positions.items())
+        ):
+            return {"status": "error", "content": [{"text": ceiling_err}]}
 
         with self._lock:
             servos, other_drives = joint_drive_map(model, mj)
@@ -1777,6 +1962,11 @@ class PhysicsMixin:
 
         Writes to qvel. Useful for initializing dynamics. Accepts dict or list
         (see set_joint_positions for list semantics).
+
+        Every value is in its joint's own unit per second -- rad/s for a hinge,
+        m/s for a slide, the per-second form of the unit
+        :func:`~strands_robots.simulation.mujoco.scene_ops.joint_position_unit`
+        names -- and not degrees per second.
 
         Every value must be a finite real number (Python or NumPy scalar), and
         must not be a boolean. A
@@ -2190,6 +2380,15 @@ class PhysicsMixin:
         rather than silently corrupting the solver or broadphase bounds, or
         applying a shape/appearance the caller never asked for.
 
+        That holds for the call as a whole, not one parameter at a time. A single
+        call can carry ``color``, ``friction`` and ``size`` together, and a resize
+        can be refused on evidence that only appears once the new size is known -
+        a shrink whose body would weigh less than MuJoCo's minimum no longer
+        compiles. Such a refusal leaves NONE of the call applied: a caller told
+        the resize could not be honored does not find the geom wearing the color
+        and contact model from that same call, in either the model or the spec the
+        next recompile restores it from.
+
         Args:
             geom_name: Name of the geom to modify. The owning object's name is
                 accepted as an alias for an ``add_object`` geom (``"<name>"`` for
@@ -2342,11 +2541,47 @@ class PhysicsMixin:
             # geom silently reverts after this call reported the new value.
             # Record it in the spec first, so a scene that cannot carry the
             # change is refused before either representation is touched.
-            # Kept so a refresh that cannot be honored restores the spec to the
-            # size the model is still compiled with, leaving the two in step.
+            #
+            # Every property the caller supplied is captured, not just the size:
+            # a resize can still be refused AFTER the spec write below, and a
+            # caller told its call was refused must not find the geom wearing a
+            # color or a contact model from that same call. These are read from
+            # the model, which a refusal leaves compiled as it was, so restoring
+            # the spec from them leaves the two representations in step.
+            prior_color = None if color is None else model.geom_rgba[gid].tolist()
+            prior_friction = None if friction is None else model.geom_friction[gid].tolist()
             prior_size = None if size is None else model.geom_size[gid, : len(size)].tolist()
             if reason := persist_geom_properties(self._world, gid, color=color, friction=friction, size=size):
                 return {"status": "error", "content": [{"text": f"set_geom_properties: {reason}"}]}
+
+            if size is not None:
+                # A resize changes the shape the owning body's inertial row was
+                # integrated from. Re-derive that row from the spec, which now
+                # carries the new size, BEFORE touching the model: a scene whose
+                # resized geometry cannot be compiled is refused with both
+                # representations restored rather than left describing different
+                # shapes. The reported result is then the one the next recompile
+                # reproduces, so the resize does not depend on what follows it.
+                #
+                # This is the last thing that can refuse the call, so no model
+                # write happens until it has passed. That is what makes a refusal
+                # leave the model untouched however many properties one call
+                # carries, rather than only the resize the refusal names.
+                if reason := refresh_body_inertial_from_geometry(self._world, gid):
+                    # The spec still carries the whole requested change. Undoing
+                    # it can itself fail - on a spec that no longer agrees with
+                    # the compiled model - and that leaves the two describing
+                    # different shapes, which is the outcome this path exists to
+                    # prevent. Report it with the refusal rather than dropping it.
+                    if restore_reason := persist_geom_properties(
+                        self._world, gid, color=prior_color, friction=prior_friction, size=prior_size
+                    ):
+                        reason = (
+                            f"{reason}. The requested change could not be undone in the scene spec"
+                            f" either, so it still carries values the compiled model does not:"
+                            f" {restore_reason}"
+                        )
+                    return {"status": "error", "content": [{"text": f"set_geom_properties: {reason}"}]}
 
             if color is not None:
                 # Already coerced to 4 components (RGB got an opaque alpha).
@@ -2359,17 +2594,6 @@ class PhysicsMixin:
                 changes.append(f"friction -> {friction}")
 
             if size is not None:
-                # A resize changes the shape the owning body's inertial row was
-                # integrated from. Re-derive that row from the spec, which now
-                # carries the new size, BEFORE touching the model: a scene whose
-                # resized geometry cannot be compiled is refused with both
-                # representations restored rather than left describing different
-                # shapes. The reported result is then the one the next recompile
-                # reproduces, so the resize does not depend on what follows it.
-                if reason := refresh_body_inertial_from_geometry(self._world, gid):
-                    persist_geom_properties(self._world, gid, size=prior_size)
-                    return {"status": "error", "content": [{"text": f"set_geom_properties: {reason}"}]}
-
                 # Validated as exactly the component count this geom's type
                 # defines; the unused tail of the 3-wide row stays as compiled.
                 model.geom_size[gid, : len(size)] = size
@@ -2615,6 +2839,12 @@ class PhysicsMixin:
         If ``body_name`` is given, the response is filtered to that
         single body (and errors cleanly if the body doesn't exist).
         Otherwise returns every body as before.
+
+        The name may be bare (``"gripper"``) or namespaced
+        (``"arm0/gripper"``), on the same terms as :meth:`get_body_state`,
+        :meth:`get_jacobian`, :meth:`apply_force` and
+        :meth:`set_body_properties`: ``add_robot`` namespaces every compiled
+        body, and a bare name is retried under each robot's namespace.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
@@ -2628,7 +2858,7 @@ class PhysicsMixin:
             mj.mj_camlight(model, data)
 
             if body_name is not None:
-                bid = mj_name_to_id(model, mj.mjtObj.mjOBJ_BODY, body_name)
+                bid = self._resolve_mj_name(mj.mjtObj.mjOBJ_BODY, body_name)
                 if bid < 0:
                     return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Body", body_name)}]}
                 body_payload = {
@@ -2758,10 +2988,16 @@ class PhysicsMixin:
         ``output_path`` is treated as untrusted (LLM-callable tool): a ``..``
         traversal segment, a symlinked target, shell metacharacters, and
         backslash separators are rejected with ``status=error``. An absolute
-        destination is accepted (the historic contract for this sink). The
-        write is atomic and the success text reports the RESOLVED path. A
-        destination the filesystem cannot accept (a directory, an unwritable
-        parent) is reported the same way; a missing parent is created.
+        destination is accepted (the historic contract for this sink). A
+        RELATIVE destination - a bare name or one with directories - lands
+        under the scenes directory (:func:`scene_root`:
+        ``~/.strands_robots/scenes``, or ``STRANDS_ROBOTS_SCENE_ROOT``), not the
+        process working directory: an agent asked to "save the scene" used to
+        drop ``scene.xml`` into whatever directory the process was started
+        from, the user's git checkout included. The write is atomic and the
+        success text reports the RESOLVED path. A destination the filesystem
+        cannot accept (a directory, an unwritable parent) is reported the same
+        way; a missing parent is created.
         """
         if self._world is None or self._world._model is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
@@ -2793,10 +3029,17 @@ class PhysicsMixin:
             # metacharacters before writing. Guards-only (no sandbox root) keeps
             # the historic contract that an absolute destination is accepted -
             # unlike render(), whose output_path is documented as a newer,
-            # sandboxed-by-design feature. The write is atomic so a crash
-            # mid-export cannot truncate an existing file at the destination.
+            # sandboxed-by-design feature. A relative destination is anchored
+            # to the scenes directory first: resolving it against the CWD made
+            # the most natural agent call ("save it as scene.xml") litter the
+            # directory the process was started from. The anchoring happens
+            # BEFORE the guard so the traversal, symlink and metacharacter
+            # checks inspect the destination actually opened. The write is
+            # atomic so a crash mid-export cannot truncate an existing file at
+            # the destination.
+            destination = anchor_relative_scene_path(output_path)
             try:
-                safe = validate_output_path(output_path, sandbox_root=None, allow_abs=True)
+                safe = validate_output_path(destination, sandbox_root=None, allow_abs=True)
             except ValueError as e:
                 return {"status": "error", "content": [{"text": f"export_xml: {e}"}]}
             try:

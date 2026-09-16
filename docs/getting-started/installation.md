@@ -6,6 +6,13 @@ description: Install strands-robots with uv - extras matrix, platform notes, hea
 
 Requires **Python >= 3.12**. Examples use [`uv`](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`); plain `pip install` works too.
 
+`uv pip install` installs into the active virtual environment and refuses when there is none (`No virtual environment found; run uv venv`), so create and activate one first:
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+```
+
 ## Extras matrix
 
 | Extra | Pulls in | When you need it |
@@ -18,12 +25,14 @@ Requires **Python >= 3.12**. Examples use [`uv`](https://docs.astral.sh/uv/) (`c
 | `[cosmos3-service]` | `msgpack`, `websockets>=17.0` | `Cosmos3Policy` (WebSocket to Cosmos 3 server) |
 | `[earthrover]` | `requests>=2.28.0,<3.0.0` | `Robot("earthrover", mode="real", driver="strands")` - HTTP to the earth-rovers-sdk |
 | `[ur]` | `ur-rtde>=1.6.0,<2.0.0` | `Robot("ur5e", mode="real", driver="strands")` - RTDE to a UR controller |
+| `[rl]` | `sim-mujoco` + `torch>=2.0`, `gymnasium>=0.29,<2.0` | From-scratch RL: `create_trainer("ppo")`, `FastSacTrainer`, `FastTd3Trainer`, `GymSimEnv` |
 | `[mesh]` | `eclipse-zenoh>=1.6.1,<2.0.0`, `json5` | Multi-robot mesh discovery + RPC |
 | `[mesh-iot]` | `mesh` + `awsiotsdk`, `awscrt`, `boto3` | AWS IoT Core transport for mesh |
-| `[all]` | 20 of the 32 extras - **not** a union. `[cosmos3-diffusers]`, `[cosmos3-service]`, `[cosmos3-sim]`, `[crazyflie]` (GPLv3), `[curobo]`, `[microduck]`, `[ros2]`, `[sim-gs]`, `[sim-isaac]`, `[sim-newton]` and `[ur]` (compiled binding) stay opt-in | Demos, CI, exploration |
+| `[all]` | 21 of the 33 extras - **not** a union. `[cosmos3-diffusers]`, `[cosmos3-service]`, `[cosmos3-sim]`, `[crazyflie]` (GPLv3), `[curobo]`, `[microduck]`, `[ros2]`, `[sim-gs]`, `[sim-isaac]`, `[sim-newton]` and `[ur]` (compiled binding) stay opt-in | Demos, CI, exploration |
 | `[dev]` | `pytest`, `pytest-cov`, `ruff`, `mypy`, `pytest-timeout` | Contributing |
 
 ```bash
+# inside the activated venv from above
 uv pip install "strands-robots[sim-mujoco]"                  # sim only
 uv pip install "strands-robots[all]"                         # the 21-extra bundle
 uv pip install "strands-robots[sim-mujoco,cosmos3-service]"  # Cosmos 3
@@ -66,9 +75,14 @@ sudo usermod -aG dialout $USER   # USB serial access; re-login after
 
 **Jetson / aarch64 (JetPack):**
 ```bash
-uv pip install "numpy<2" "pandas==2.1.4"
 uv pip install "strands-robots[sim-mujoco,lerobot]"
 ```
+
+The same line as everywhere else. `lerobot >= 0.6` requires `numpy >= 2`, and
+JetPack's torch (R38.2, torch 2.11 `+cu130`) runs on it - `strands-robots doctor`
+passes on a Thor devkit with numpy 2.2.6. Do not pin `numpy < 2` first: the
+resolver replaces it on this very line, so the pin buys nothing, and a package
+that only works on numpy 1.x cannot share an environment with lerobot at all.
 
 lerobot 0.6 pulls `torchcodec` on aarch64 itself (its dependency marker now
 covers linux aarch64 and pins the torch-ABI-matched torchcodec 0.11), so the
@@ -108,6 +122,16 @@ from strands_robots import Robot
 ```
 
 ## Verify
+
+`doctor` checks this machine the way the runtime will read it - the interpreter
+and package, each extra, the GL backend, the torch/torchcodec pair, the GPU, the
+serial and Hub credentials, and the device-connect and mesh postures - and exits
+non-zero if any row fails:
+
+```bash
+python -m strands_robots doctor           # run every check
+python -m strands_robots doctor --list    # print the check names, probe nothing
+```
 
 ```python
 from strands_robots import Robot

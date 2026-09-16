@@ -41,6 +41,8 @@ from strands_robots.utils import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -146,11 +148,13 @@ def _qos_history_depth_error(value: Any, param: str, context: str) -> str | None
 #: factor so a forgotten config cannot silently expose a drivable arm.
 ROS2_INSECURE_ENV = "STRANDS_ROS2_BRIDGE_I_KNOW_THIS_IS_INSECURE"
 
-#: Keys a ``dds_security_config`` dict must supply (non-empty). Each names a
-#: credential the RTPS bridge wires into its DDS Security participant: the
-#: identity CA, the participant's own certificate and private key (identity is
-#: unprovable without the key), and the signed governance + permissions
-#: documents. ``permissions_ca`` is optional and applied when present.
+#: Keys a ``dds_security_config`` dict must supply, each as a non-empty string.
+#: Each names a credential the RTPS bridge wires into its DDS Security
+#: participant: the identity CA, the participant's own certificate and private
+#: key (identity is unprovable without the key), and the signed governance +
+#: permissions documents. ``permissions_ca`` is optional; supplied, it is held
+#: to the same domain, because a value the participant QoS would drop must not
+#: read as "a permissions CA is configured".
 _DDS_SECURITY_REQUIRED_KEYS = (
     "identity_ca",
     "certificate",
@@ -158,6 +162,34 @@ _DDS_SECURITY_REQUIRED_KEYS = (
     "governance",
     "permissions",
 )
+
+#: Optional ``dds_security_config`` key, graded like a required one when present.
+_DDS_SECURITY_OPTIONAL_KEY = "permissions_ca"
+
+
+def _credential_problem(config: Mapping[str, Any], key: str) -> str | None:
+    """Why ``config[key]`` is not a usable DDS Security credential, else ``None``.
+
+    A credential is a non-empty string: a path, or a ``file:`` / ``data:`` URI
+    per the OMG DDS-Security spec. The value itself is graded rather than its
+    ``str()``, because ``str(None)`` is ``"None"`` - non-empty, and therefore
+    indistinguishable from a real credential to a printed-emptiness check.
+
+    Args:
+        config: The operator-supplied ``dds_security_config``.
+        key: The credential key to grade.
+
+    Returns:
+        ``"absent"``, ``"empty"``, or the received type's name - what the
+        refusal quotes so the operator knows which key to fix and how - or
+        ``None`` when the value is a credential.
+    """
+    if key not in config:
+        return "absent"
+    value = config[key]
+    if not isinstance(value, str):
+        return type(value).__name__
+    return None if value.strip() else "empty"
 
 
 class RosTelemetryBase:
@@ -245,6 +277,93 @@ class RosTelemetryBase:
         """ROS 2 topic inbound ``joint_command`` messages are read from."""
         return f"/{cls._safe(robot)}/joint_command"
 
+    @staticmethod
+    def _command_namespace_error(name: Any, context: str) -> str | None:
+        """Return an error message if ``command_robot_name`` cannot name a topic.
+
+        The hardware bridges let a caller override the namespace their inbound
+        ``joint_command`` topic is read from. That override is the only
+        caller-supplied value this module renders into a topic through
+        :meth:`_safe` - every other name reaching it is derived internally, from
+        the bound robot (:meth:`_resolve_robot_name`) or from an observation key.
+        So it is the one place where a value from outside is handed to a
+        ``re.sub`` that assumes a string, and both non-string outcomes are worse
+        than a refusal:
+
+        * **A truthy non-``str``** raised out of :meth:`_safe` - ``TypeError:
+          expected string or bytes-like object, got 'int'``, or, for ``bytes``,
+          ``cannot use a string pattern on a bytes-like object``. Neither names
+          the parameter. Worse, it raised from *after* the transport was built:
+          on the rclpy bridge the process-wide ``ROS_DOMAIN_ID`` had been
+          rewritten, the context started and the node created; on the RTPS
+          bridge the ``DomainParticipant`` existed. ``__init__`` raising returns
+          no object, so the ``shutdown`` that releases them is unreachable.
+        * **A falsy non-``str``** (``0``, ``[]``, ``False``) was worse still: it
+          is filtered by the ``command_robot_name or <derived>`` fallback, so the
+          bridge reported success and subscribed under the bound robot's own
+          name - a namespace the caller never asked for, silently.
+
+        ``None`` is the documented "derive it from the bound robot" input and is
+        accepted, as is ``""``, which selects the same fallback. A ``str``
+        subclass is accepted: it is a string to every operation that follows.
+
+        Args:
+            name: The caller's ``command_robot_name``.
+            context: Calling context, used in error text (the bridge class name).
+
+        Returns:
+            ``None`` when *name* can name a topic, otherwise the message to
+            raise as :class:`ValueError`.
+        """
+        if name is None or isinstance(name, str):
+            return None
+        return (
+            f"{context}: 'command_robot_name' must be a string or None, got "
+            f"{refusal_repr(name)} ({type(name).__name__}); it is rendered into "
+            "the '/<name>/joint_command' topic this bridge reads commands from, "
+            "which only a string can name. Pass None to read them under the "
+            "bound robot's own name."
+        )
+
+    # -- outbound payload gate (shared by both transports) -----------------
+
+    @staticmethod
+    def _joint_state_arrays_error(names: list[str], positions: list[float], context: str) -> str | None:
+        """Return an error message if a ``JointState``'s arrays name different joints.
+
+        ``sensor_msgs/JointState`` pairs ``name`` and ``position`` BY INDEX, so
+        the two arrays are one table with two columns and only agree on which
+        joint a value belongs to while they are the same length. A consumer
+        reads them with ``zip(msg.name, msg.position)`` - that is what
+        ``robot_state_publisher`` and every plotter do - so an array shorter by
+        one does not drop one joint: it shifts every joint after the gap onto
+        its neighbour's value, and the tail falls off the end unreported. The
+        arm is then published in a pose it is not in, under a well-formed
+        message DDS delivers and no subscriber can tell is wrong.
+
+        Refused whole, for the reason :meth:`_command_action` refuses a
+        malformed inbound command whole rather than applying part of it: a
+        partial state is not a state.
+
+        Args:
+            names: ``JointState.name`` the caller supplied.
+            positions: ``JointState.position`` the caller supplied.
+            context: Class name of the calling bridge, for the message.
+
+        Returns:
+            ``None`` when the two arrays describe the same joints, else the
+            reason they cannot be published together.
+        """
+        if len(names) == len(positions):
+            return None
+        return (
+            f"{context}: publish_joint_states got {len(names)} joint name(s) and "
+            f"{len(positions)} position(s). A JointState pairs the two arrays by index, so "
+            "publishing them would report every joint after the first gap under its "
+            "neighbour's name. Pass one position per name - build the pair together, "
+            "so a joint the observation does not carry drops its name too."
+        )
+
     # -- security / safety gate (shared by both hardware bridges) ---------
 
     @staticmethod
@@ -307,18 +426,37 @@ class RosTelemetryBase:
         spec). Validated at construction so a half-filled config refuses the
         bridge rather than silently degrading wire security.
 
+        The value is graded, not its ``str()``: a printed-emptiness check read
+        ``None`` as the non-empty ``"None"``, so a credential this validator had
+        accepted could still be one
+        :meth:`~strands_robots.hardware_rtps_bridge.HardwareRtpsBridge._build_security_qos`
+        drops (it sets a property per *truthy* credential), putting a
+        participant on the wire with the auth plugin loaded and no private key
+        or governance; a truthy non-string was wired as its ``repr`` instead, so
+        a ``bytes`` path reached cyclonedds as the literal ``"b'file:/key.pem'"``.
+        Every value accepted here is therefore one the QoS keeps verbatim.
+
         Raises:
-            ValueError: If ``config`` is not a dict or a required key is missing
-                or empty.
+            ValueError: If ``config`` is not a dict, or any required key - or a
+                supplied ``permissions_ca`` - is absent, empty, or not a string.
         """
         if not isinstance(config, dict):
             raise ValueError(f"dds_security_config must be a dict, got {type(config).__name__}")
-        missing = [k for k in _DDS_SECURITY_REQUIRED_KEYS if not str(config.get(k, "")).strip()]
-        if missing:
+        unusable = {k: problem for k in _DDS_SECURITY_REQUIRED_KEYS if (problem := _credential_problem(config, k))}
+        if unusable:
             raise ValueError(
-                f"dds_security_config is missing required keys: {missing}. "
-                f"All of {list(_DDS_SECURITY_REQUIRED_KEYS)} must be supplied "
-                "(identity CA, participant certificate + private key, governance, permissions)."
+                f"dds_security_config is missing required keys: {unusable}. "
+                f"All of {list(_DDS_SECURITY_REQUIRED_KEYS)} must be supplied as non-empty "
+                "strings (identity CA, participant certificate + private key, governance, "
+                "permissions)."
+            )
+        if _DDS_SECURITY_OPTIONAL_KEY in config and (
+            problem := _credential_problem(config, _DDS_SECURITY_OPTIONAL_KEY)
+        ):
+            raise ValueError(
+                f"dds_security_config[{_DDS_SECURITY_OPTIONAL_KEY!r}] is {problem}; it must be a "
+                "non-empty string, or omit the key. A value the participant QoS would drop must "
+                "not read as a configured permissions CA."
             )
         return config
 
@@ -583,22 +721,50 @@ class RosTelemetryBridge(RosTelemetryBase):
         return self._node.get_clock().now().to_msg()
 
     def _joint_publisher(self, robot: str) -> Any:
-        pub = self._joint_pubs.get(robot)
+        """The one publisher advertising ``robot``'s ``joint_states`` topic.
+
+        Cached under the topic, not under *robot*: a publisher is identified by
+        the topic it publishes on, and :meth:`_safe` is documented as not
+        injective, so two robot names can select one topic. Keyed on the name
+        instead, each spelling advertised its own publisher on that shared
+        topic - one bridge appearing twice in ``ros2 topic info`` for one robot.
+        """
+        topic = self.joint_states_topic(robot)
+        pub = self._joint_pubs.get(topic)
         if pub is None:
-            pub = self._node.create_publisher(self._JointState, self.joint_states_topic(robot), self._qos_depth)
-            self._joint_pubs[robot] = pub
+            pub = self._node.create_publisher(self._JointState, topic, self._qos_depth)
+            self._joint_pubs[topic] = pub
         return pub
 
     def _image_publisher(self, robot: str, camera: str) -> Any:
-        key = f"{robot}/{camera}"
-        pub = self._image_pubs.get(key)
+        """The one publisher advertising ``robot``/``camera``'s image topic.
+
+        Cached under the topic for the reason in :meth:`_joint_publisher`, and
+        for a second one that is a wrong answer rather than a duplicate: the
+        former key joined the two names with ``/``, which is a character both
+        may contain, so ``("arm", "wrist/rgb")`` and ``("arm/wrist", "rgb")``
+        produced one key for two different topics. The second caller was handed
+        the first's publisher and its frames went out on ``/arm/wrist_rgb`` -
+        a topic it never named, silently, because DDS matching is by topic name
+        and the reader it expected simply never appeared.
+        """
+        topic = self.image_topic(robot, camera)
+        pub = self._image_pubs.get(topic)
         if pub is None:
-            pub = self._node.create_publisher(self._Image, self.image_topic(robot, camera), self._qos_depth)
-            self._image_pubs[key] = pub
+            pub = self._node.create_publisher(self._Image, topic, self._qos_depth)
+            self._image_pubs[topic] = pub
         return pub
 
     def publish_joint_states(self, robot: str, names: list[str], positions: list[float]) -> None:
-        """Publish one ``JointState`` for ``robot`` on ``/<robot>/joint_states``."""
+        """Publish one ``JointState`` for ``robot`` on ``/<robot>/joint_states``.
+
+        A ``names``/``positions`` pair of differing length is dropped whole with
+        a warning rather than published misaligned - see
+        :meth:`RosTelemetryBase._joint_state_arrays_error`.
+        """
+        if error := self._joint_state_arrays_error(list(names), list(positions), type(self).__name__):
+            logger.warning("%s Whole JointState dropped, no partial publication.", error)
+            return
         msg = self._JointState()
         msg.header.stamp = self._now()
         msg.header.frame_id = self._safe(robot)
@@ -629,13 +795,43 @@ class RosTelemetryBridge(RosTelemetryBase):
         self._image_publisher(robot, camera).publish(msg)
 
     def shutdown(self) -> None:
-        """Destroy the node and, if this bridge initialized rclpy, shut it down."""
+        """Destroy the node and, if this bridge initialized rclpy, shut it down.
+
+        Best-effort, and safe to call more than once. The two steps release two
+        independent resources - a node handle and the process-wide rclpy context
+        - so neither failure is allowed to skip the other:
+
+        * A node that will not be destroyed (rclpy raises ``InvalidHandle`` or
+          ``RCLError`` from the C layer) is logged at debug, because the context
+          shutdown below takes the node down with it. Letting it propagate left
+          the context this bridge initialized running for the life of the
+          process: ``_owns_context`` stays set, so the next bridge finds
+          ``rclpy.ok()`` already true, disclaims ownership, and never shuts it
+          down either - and both call sites tear the bridge down inside a
+          suppressing block, so the leaked participant and its discovery
+          threads were never reported to anyone.
+        * A context that will not shut down is logged at *warning*, because
+          nothing after it retries: that failure is the last word on a
+          participant still on the wire.
+        """
         node = getattr(self, "_node", None)
         if node is not None:
             try:
                 node.destroy_node()
+            except Exception:  # noqa: BLE001 - the context release below is what matters
+                logger.debug("%s: destroying the ROS 2 node failed", type(self).__name__, exc_info=True)
             finally:
                 self._node = None
         if getattr(self, "_owns_context", False) and self._rclpy.ok():
-            self._rclpy.shutdown()
-            self._owns_context = False
+            try:
+                self._rclpy.shutdown()
+            except Exception:  # noqa: BLE001 - reported, because nothing else releases the context
+                logger.warning(
+                    "%s: the ROS 2 context this bridge initialized could not be shut down; "
+                    "its participant stays on domain %s until the process exits",
+                    type(self).__name__,
+                    os.environ.get("ROS_DOMAIN_ID", "?"),
+                    exc_info=True,
+                )
+            else:
+                self._owns_context = False

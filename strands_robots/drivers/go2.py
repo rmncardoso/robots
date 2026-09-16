@@ -84,7 +84,7 @@ from strands_robots.drivers.base import (
 )
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.tools.g1._dds_engine import DDSPublisher, DDSSubscriberSet
-from strands_robots.tools.g1._g1_common import _DDS_INIT_LOCK
+from strands_robots.tools.g1._g1_common import _DDS_INIT_LOCK, sdk_missing
 from strands_robots.utils import (
     finite_number_error,
     positive_count_error,
@@ -226,6 +226,8 @@ def _resolve_message_class(cls_path: tuple[str, str]) -> Any:
 
         module = importlib.import_module(module_path)
     except ImportError as exc:
+        if module_path.split(".")[0] == "unitree_sdk2py":
+            return sdk_missing(f"{exc} (resolving {module_path})")
         return f"cannot import {module_path}: {exc}"
     if not hasattr(module, class_name):
         return f"{module_path} has no {class_name}"
@@ -289,7 +291,7 @@ def _new_lowcmd() -> tuple[Any, str | None]:
     try:
         from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_ as _default_lowcmd
     except ImportError as exc:  # pragma: no cover - exercised on hardware
-        return None, f"unitree_sdk2py is not installed: {exc}"
+        return None, sdk_missing(exc)
     cmd = _default_lowcmd()
     # The array length is part of the wire contract, so it is checked rather
     # than assumed: an SDK whose ``motor_cmd`` is shorter than the slots this
@@ -322,7 +324,7 @@ def _seal(cmd: Any) -> str | None:
     try:
         from unitree_sdk2py.utils.crc import CRC as _CRC
     except ImportError as exc:  # pragma: no cover - exercised on hardware
-        return f"unitree_sdk2py is not installed: {exc}"
+        return sdk_missing(exc)
     cmd.crc = _CRC().Crc(cmd)
     return None
 
@@ -868,7 +870,14 @@ class Go2Driver:
                 with _DDS_INIT_LOCK:
                     client = factory(self._network_interface)
         except Exception as exc:  # noqa: BLE001 - any SDK/transport failure is one reason
-            self._sport_mode_client_error = f"cannot open MotionSwitcherClient: {exc}"
+            # The import is indirected through ``_load_motion_switcher_client``,
+            # which lets the ImportError propagate here - so this handler is the
+            # one that answers a missing SDK for :meth:`release_sport_mode`, the
+            # gate that hands the legs over. It owes the remedy, and on the PyPI
+            # wheel (no ``comm`` package) it is the only refusal a user sees.
+            self._sport_mode_client_error = (
+                sdk_missing(exc) if isinstance(exc, ImportError) else f"cannot open MotionSwitcherClient: {exc}"
+            )
             logger.debug("%s: %s", self._tool_name, self._sport_mode_client_error, exc_info=True)
             return None
         self._sport_mode_client_error = None
@@ -890,11 +899,15 @@ class Go2Driver:
 
         Args:
             attempts: How many release-then-verify rounds to try before giving
-                up. Must be a positive count.
+                up. Must be a positive count. Every round's release is followed
+                by the read that confirms it, so ``attempts=1`` really does
+                release once and then look again.
 
         Returns:
             A success envelope naming the released mode when the robot reports no
-            active mode, or an error envelope naming why the gate stays shut.
+            active mode, or an error envelope naming why the gate stays shut. A
+            refusal for a mode that would not clear names what the last read
+            after the last release reported, not what was seen before it.
         """
         if err := positive_count_error(attempts, "attempts", "release_sport_mode"):
             return _refuse(err)
@@ -902,7 +915,15 @@ class Go2Driver:
         if client is None:
             return _refuse(self._sport_mode_client_error or "MotionSwitcherClient is unavailable")
         previous: str | None = None
-        for _ in range(int(attempts)):
+        # A round is a release followed by the read that verifies it, so N rounds
+        # take N + 1 reads: one to see what holds the robot, then one after every
+        # release. Reading only once per round would leave the last release
+        # unverified, and the refusal below would then name a mode as still
+        # active without having asked the robot again since letting go of it -
+        # on a robot that released on its final attempt, a refusal whose reading
+        # was never taken.
+        last_round = int(attempts)
+        for round_index in range(last_round + 1):
             mode_name, refusal = self._read_mode_name(client)
             if refusal is not None:
                 return _refuse(refusal)
@@ -922,6 +943,8 @@ class Go2Driver:
                     ],
                 }
             previous = mode_name
+            if round_index == last_round:
+                break
             try:
                 client.ReleaseMode()
             except Exception as exc:  # noqa: BLE001 - any transport failure is one reason
@@ -939,9 +962,18 @@ class Go2Driver:
             client: An open motion-switcher client.
 
         Returns:
-            :func:`decode_mode_name`'s ``(mode_name, refusal)`` pair. A refusal
-            clears :attr:`_sport_mode_released`, because a reading that cannot be
-            decoded is not evidence that the robot is free.
+            :func:`decode_mode_name`'s ``(mode_name, refusal)`` pair.
+
+            Every reading that is not ``""`` clears
+            :attr:`_sport_mode_released`, because that flag IS the write gate
+            (:meth:`_check_motion_gates` reads it rather than taking a DDS round
+            trip) and only an empty mode name is evidence that the robot is
+            free. Two readings say it is not: one that cannot be decoded, and
+            one that decodes to the name of a mode still holding the legs. The
+            second is the stronger evidence of the two, so a gate opened by an
+            earlier release must shut on it as well - a Go2 that re-entered a
+            motion mode after being released would otherwise keep admitting
+            ``rt/lowcmd`` frames into a fight with the onboard controller.
         """
         try:
             reading = client.CheckMode()
@@ -953,7 +985,7 @@ class Go2Driver:
         mode_name, refusal = decode_mode_name(reading)
         self._sport_mode_name = mode_name
         self._sport_mode_refusal = refusal
-        if refusal is not None:
+        if refusal is not None or mode_name:
             self._sport_mode_released = False
         return mode_name, refusal
 
@@ -1032,7 +1064,7 @@ class Go2Driver:
         try:
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_
         except ImportError as exc:  # pragma: no cover - exercised on hardware
-            return _refuse(f"unitree_sdk2py is not installed: {exc}")
+            return _refuse(sdk_missing(exc))
         pub_err = self._pubs.publish(_TOPIC_LOWCMD, LowCmd_, cmd)
         if pub_err is not None:
             return _refuse(pub_err)
@@ -1264,27 +1296,37 @@ class Go2Driver:
         drops one must cost that field, not the whole callback and with it the
         IMU the mesh publishes.
 
+        Never raises, like the twin :meth:`~strands_robots.drivers.g1.G1Driver._on_lowstate`:
+        the SDK owns this thread, so an escaping decode error kills the
+        subscription instead of reaching a caller, and this is the topic behind
+        both write gates - the battery floor :meth:`send_action` checks and the
+        measured pose it holds uncommanded joints at would then be frozen at the
+        last frame that happened to decode.
+
         Args:
             msg: The decoded ``unitree_go`` ``LowState_``.
         """
-        imu = getattr(msg, "imu_state", None)
-        if imu is not None:
-            self._imu = {
-                "quaternion": telemetry_float_list(getattr(imu, "quaternion", None)),
-                "gyroscope": telemetry_float_list(getattr(imu, "gyroscope", None)),
-                "accelerometer": telemetry_float_list(getattr(imu, "accelerometer", None)),
-                "rpy": telemetry_float_list(getattr(imu, "rpy", None)),
-            }
-        bms = getattr(msg, "bms_state", None)
-        if bms is not None:
-            self._battery = {
-                "pct": telemetry_float(getattr(bms, "soc", None)),
-                "current": telemetry_float(getattr(bms, "current", None)),
-                "cycle": telemetry_int(getattr(bms, "cycle", None)),
-            }
-        joints = decode_motor_state(getattr(msg, "motor_state", None), GO2_JOINT_INDEX)
-        if joints is not None:
-            self._joints = joints
+        try:
+            imu = getattr(msg, "imu_state", None)
+            if imu is not None:
+                self._imu = {
+                    "quaternion": telemetry_float_list(getattr(imu, "quaternion", None)),
+                    "gyroscope": telemetry_float_list(getattr(imu, "gyroscope", None)),
+                    "accelerometer": telemetry_float_list(getattr(imu, "accelerometer", None)),
+                    "rpy": telemetry_float_list(getattr(imu, "rpy", None)),
+                }
+            bms = getattr(msg, "bms_state", None)
+            if bms is not None:
+                self._battery = {
+                    "pct": telemetry_float(getattr(bms, "soc", None)),
+                    "current": telemetry_float(getattr(bms, "current", None)),
+                    "cycle": telemetry_int(getattr(bms, "cycle", None)),
+                }
+            joints = decode_motor_state(getattr(msg, "motor_state", None), GO2_JOINT_INDEX)
+            if joints is not None:
+                self._joints = joints
+        except Exception as exc:  # noqa: BLE001 - IDL message can be anything
+            logger.debug("%s: lowstate decode failed: %s", self._tool_name, exc)
 
     def _on_sportmode(self, msg: Any) -> None:
         """Cache body pose, velocity and gait from ``rt/sportmodestate``.
@@ -1294,18 +1336,24 @@ class Go2Driver:
         rollout: body height and velocity say what the robot actually did with
         the frames this driver sent.
 
+        Never raises, for the reason :meth:`_on_lowstate` states: a decode error
+        on the SDK's own thread must cost this frame, not the subscription.
+
         Args:
             msg: The decoded ``unitree_go`` ``SportModeState_``.
         """
-        self._sport = {
-            "mode": telemetry_int(getattr(msg, "mode", None)),
-            "gait_type": telemetry_int(getattr(msg, "gait_type", None)),
-            "body_height": telemetry_float(getattr(msg, "body_height", None)),
-            "position": telemetry_float_list(getattr(msg, "position", None)),
-            "velocity": telemetry_float_list(getattr(msg, "velocity", None)),
-            "yaw_speed": telemetry_float(getattr(msg, "yaw_speed", None)),
-            "foot_force": telemetry_int_list(getattr(msg, "foot_force", None)),
-        }
+        try:
+            self._sport = {
+                "mode": telemetry_int(getattr(msg, "mode", None)),
+                "gait_type": telemetry_int(getattr(msg, "gait_type", None)),
+                "body_height": telemetry_float(getattr(msg, "body_height", None)),
+                "position": telemetry_float_list(getattr(msg, "position", None)),
+                "velocity": telemetry_float_list(getattr(msg, "velocity", None)),
+                "yaw_speed": telemetry_float(getattr(msg, "yaw_speed", None)),
+                "foot_force": telemetry_int_list(getattr(msg, "foot_force", None)),
+            }
+        except Exception as exc:  # noqa: BLE001 - IDL message can be anything
+            logger.debug("%s: sportmodestate decode failed: %s", self._tool_name, exc)
 
 
 class _ControlLoop:
@@ -1476,7 +1524,7 @@ class _ControlLoop:
         try:
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_
         except ImportError as exc:  # pragma: no cover - exercised on hardware
-            logger.error("go2 control loop: cannot publish the zero-torque frame: %s", exc)
+            logger.error("go2 control loop: cannot publish the zero-torque frame: %s", sdk_missing(exc))
             return
         pub_err = pubs.publish(_TOPIC_LOWCMD, LowCmd_, cmd)
         if pub_err is not None:
@@ -1555,7 +1603,7 @@ class _ControlLoop:
         try:
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_
         except ImportError as exc:  # pragma: no cover - exercised on hardware
-            return f"unitree_sdk2py is not installed: {exc}"
+            return sdk_missing(exc)
         return pubs.publish(_TOPIC_LOWCMD, LowCmd_, cmd)
 
 

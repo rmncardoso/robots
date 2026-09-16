@@ -96,6 +96,13 @@ WBCPolicy(
 A missing `onnxruntime` or a missing checkpoint raises `RuntimeError` at
 construction - WBC never falls back to silent zero torques.
 
+`walk` and `allow_missing_models` each select a posture, so both are checked
+rather than read by truthiness: a non-boolean raises `ValueError` naming the
+parameter. A string such as `"false"` - the spelling a JSON `policy_config`
+reaches for - is truthy, and before the check `allow_missing_models="false"`
+selected the test seam, skipping the eager load and deferring the missing
+checkpoint to the first `get_actions` call.
+
 ### Config value domain
 
 `WBCConfig` refuses an unusable *value* at construction, because every numeric
@@ -212,6 +219,50 @@ also the way to evaluate WBC at a fixed velocity, since `policy_kwargs` is wired
 on the control path (`run_policy` / `start_policy` / `tell()`), not on
 `eval_policy`.
 
+### Recording it
+
+`run_policy(video={...})` records from the scene's `default` camera unless told
+otherwise, and that view is a fixed function of the compiled model - its pose
+does not move while the robot does. On the stock G1 scene the pelvis crosses the
+right edge of the 640x480 default view after 1.5 m of forward walk (under 4 s at
+0.4 m/s) and the rest of the clip is empty floor. Add a camera first and name it
+in `video`. Mounted on the pelvis it rides with the robot and turns with it -
+`position` and `target` are then in the pelvis frame, x forward:
+
+```python
+sim = Robot("unitree_g1")
+sim.add_camera(
+    name="follow",
+    parent_body="unitree_g1/pelvis",
+    position=[-2.6, -1.6, 1.1],     # behind and to the right, a little above
+    target=[0.4, 0.0, -0.3],        # looking just ahead of the base
+    fov=45,
+    width=1280,
+    height=720,
+)
+sim.run_policy(
+    robot_name="unitree_g1",
+    policy_provider="wbc",
+    policy_config={"checkpoint": "/path/to/grootwbc-g1", "walk": True},
+    policy_kwargs={"target_velocity": [0.5, 0.0, 0.3]},
+    duration=6.0,
+    control_frequency=50.0,
+    action_horizon=1,
+    video={"path": "/tmp/g1_follow.mp4", "fps": 30, "camera": "follow", "width": 1280, "height": 720},
+)
+```
+
+The mount holds the base at one pixel for the whole rollout, so a longer walk
+needs no re-placement.
+[`examples/microduck/eval_rl_policy.py`](https://github.com/strands-labs/robots/blob/main/examples/microduck/eval_rl_policy.py)
+records a walking robot this way: a `chase` camera mounted on
+`microduck/trunk_base`, added before the rollout and named in its `video`.
+A fixed camera works when the path is known -
+[`examples/kimodo/kimodo_g1_walking.py`](https://github.com/strands-labs/robots/blob/main/examples/kimodo/kimodo_g1_walking.py)
+calls `add_camera` with `position=[3.0, 0.0, 1.2]`, `target=[0.0, 0.0, 0.8]` to
+face the G1 where it starts. Either way the camera has to be added before the
+rollout; `add_camera` is refused while a policy is running.
+
 ## Watching it walk (torque-control deploy)
 
 [`examples/wbc/wbc_g1_torque_deploy.py`](https://github.com/strands-labs/robots/blob/main/examples/wbc/wbc_g1_torque_deploy.py)
@@ -261,7 +312,11 @@ policy = CompositePolicy(
 
 Each child contributes only its own joint group; a genuine ownership conflict
 is raised, never silently resolved, and the merged chunk length is the shorter
-of the two so the per-tick controller is never starved. `lower_obs_keys` /
+of the two so the per-tick controller is never starved. An explicit group is
+exclusive either way round - the child it names is the only one allowed to
+command those joints, so a whole-body manipulation policy paired with
+`lower_joints=WBC_G1_LEG_WAIST_JOINTS` is refused rather than allowed to drive
+the waist on the ticks the balance controller happens not to command it. `lower_obs_keys` /
 `upper_obs_keys` optionally narrow what each child is queried with, and a subset
 sharing no key with the observation is refused - a balance controller reading
 nothing runs open-loop. Run the composite like a bare policy; the torque shim is

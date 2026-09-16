@@ -71,12 +71,13 @@ Register custom predicates with :func:`register_predicate`.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from strands_robots.utils import finite_number_error, finite_vector_error, name_list_error
+from strands_robots.utils import finite_number_error, finite_vector_error, name_list_error, refusal_repr
 
 if TYPE_CHECKING:
     from strands_robots.simulation.base import SimEngine
@@ -2032,6 +2033,31 @@ _TOLERANCE_PARAM_SUFFIX = "_tol"
 _HEADING_PARAM_NAMES = frozenset({"yaw"})
 
 
+# The annotation that carries the entity-NAME domain: a required name of
+# something in the scene - a body, a joint, a geom, a container, or the prefix
+# selecting a gripper's geoms. Read from the annotation for the same reason the
+# numeric domain above is: a predicate added later is covered by declaring its
+# params, with no per-predicate table to drift out of step with the registry.
+#
+# ``str | None`` is deliberately NOT in the set. There ``None`` is a documented
+# value rather than a missing name - the ``base_*`` family's ``robot`` selector
+# defaults to "the sole robot" - so absence carries meaning and is resolved by
+# :func:`can_resolve_base` against the live scene.
+_ENTITY_NAME_ANNOTATIONS = frozenset({"str"})
+
+
+# Name params whose value is matched as a PREFIX over the names the scene
+# reports, rather than compared whole: ``grasped``'s ``gripper_prefix``, which
+# selects the gripper as a SET of geoms (fingers, pads, tip sites) from their
+# common prefix. The empty string is the identity prefix - every name starts
+# with it - so a blank one selects EVERY geom in the scene instead of none, and
+# the clause it decides is pinned ``True`` rather than ``False``. Both are the
+# permanently-decided clause this module refuses, but they need opposite
+# wording, so the refusal reads the kind off the name the way the tolerance and
+# heading domains already do.
+_PREFIX_PARAM_SUFFIX = "_prefix"
+
+
 def _is_heading_param(param: str) -> bool:
     """True when ``param`` names a heading and so is bounded to the ``atan2`` range.
 
@@ -2048,15 +2074,73 @@ def _is_tolerance_param(param: str) -> bool:
     return param in _TOLERANCE_PARAM_NAMES or param.endswith(_TOLERANCE_PARAM_SUFFIX)
 
 
-def _kwarg_domain_error(name: str, factory: PredicateFactory, kwargs: dict[str, Any]) -> str | None:
-    """Return an error message if a numeric kwarg for *name* is outside its domain.
+def _is_prefix_param(param: str) -> bool:
+    """True when ``param``'s value is matched as a prefix rather than compared whole.
 
-    Three domains are enforced: every numeric kwarg must be a finite number, a
+    See :data:`_PREFIX_PARAM_SUFFIX` for why a blank value pins the clause to
+    ``True`` for these and to ``False`` for every other name param.
+    """
+    return param.endswith(_PREFIX_PARAM_SUFFIX)
+
+
+def _entity_name_error(context: str, param: str, value: Any) -> str | None:
+    """Return a message if *value* cannot name a scene entity, else ``None``.
+
+    The entity-name half of :func:`_kwarg_domain_error`. A name is usable when
+    it is a non-empty string; whether it RESOLVES is a separate question, asked
+    against the live scene by :func:`can_resolve_body` /
+    :func:`can_resolve_joint` / :func:`can_resolve_base` when the clause is
+    armed. This is the domain that must hold before that probe can run at all -
+    the probe collects only non-empty strings, so a blank name reaches the
+    rollout unexamined.
+
+    Args:
+        context: ``"predicate '<name>'"``, opening the message.
+        param: The parameter name, for the message.
+        value: The spec-supplied value.
+
+    Returns:
+        A message naming the predicate, the parameter and the consequence, or
+        ``None`` when the value can name something.
+    """
+    if not isinstance(value, str):
+        return (
+            f"{context}: {param} must be a string naming a scene entity, got {refusal_repr(value)} "
+            f"({type(value).__name__}). A non-string name compiles clean and is only read inside "
+            "the evaluation loop, where it raises mid-rollout naming neither the predicate nor "
+            "the clause it came from."
+        )
+    if value:
+        return None
+    if _is_prefix_param(param):
+        return (
+            f"{context}: {param} must be a non-empty string, got ''. It is matched as a PREFIX "
+            "over the names the scene reports and the empty string is the identity prefix - it "
+            "selects EVERY geom instead of the gripper's, so the clause fires on any contact the "
+            "body has at all, including the floor it was placed on. That is a success reported on "
+            "step 1 with nothing moved, and a benchmark success_rate of 1.0 to match. Name the "
+            "gripper's geoms by their common prefix (list_bodies(robot_name=...) reports the "
+            "gripper/end-effector mount)."
+        )
+    return (
+        f"{context}: {param} must be a non-empty string naming a scene entity, got ''. Nothing is "
+        "named by the empty string, so the term degrades to a constant - a bool predicate pinned "
+        "to False, a reward term to 0.0 - which silently prevents success instead of measuring "
+        "it. Check the name against the loaded scene (get_state lists objects, list_bodies lists "
+        "bodies, get_observation's keys list joints)."
+    )
+
+
+def _kwarg_domain_error(name: str, factory: PredicateFactory, kwargs: dict[str, Any]) -> str | None:
+    """Return an error message if a kwarg for *name* is outside its domain.
+
+    Four domains are enforced: every numeric kwarg must be a finite number, a
     kwarg that names a TOLERANCE must additionally be ``>= 0`` (see
-    :func:`_is_tolerance_param`), and a kwarg that names a HEADING must lie
-    strictly inside ``(-pi, pi)`` (see :func:`_is_heading_param`). All three
-    refuse for the same reason - a value that compiles clean and leaves the clause
-    permanently decided.
+    :func:`_is_tolerance_param`), a kwarg that names a HEADING must lie
+    strictly inside ``(-pi, pi)`` (see :func:`_is_heading_param`), and a kwarg
+    that names a scene ENTITY must be a non-empty string (see
+    :func:`_entity_name_error`). All four refuse for the same reason - a value
+    that compiles clean and leaves the clause permanently decided.
 
     A spec kwarg is coerced with a bare ``float(...)`` inside the factory and
     then closed over, so a ``nan``/``inf`` threshold or weight compiles clean
@@ -2099,10 +2183,31 @@ def _kwarg_domain_error(name: str, factory: PredicateFactory, kwargs: dict[str, 
     meaning, and a heading COMMAND (``ros_bridge.navigate_to``, which encodes
     ``yaw`` as a quaternion) is a different surface with no such bound.
 
-    Only params the factory annotates as numeric are constrained, so a ``str``
-    body name, a ``bool`` flag and a ``str | None`` robot selector are untouched,
-    and a predicate registered via :func:`register_predicate` without
-    annotations is exempt (the caller opted in by registering it).
+    An entity NAME reaches the same permanently-decided clause by a fifth route,
+    and it is the only one that can decide the clause ``True``. A name is read
+    against the scene, not converted, so a blank one compiles clean and the
+    arm-time probe cannot see it either: the collector
+    (:func:`~strands_robots.simulation.benchmark_spec.stop_when_referenced_entities`)
+    gathers only non-empty strings, so ``body=""`` is never handed to
+    :func:`can_resolve_body` and the term is pinned to a constant for the whole
+    rollout - ``False`` for a bool predicate, ``0.0`` for a reward term. The one
+    name matched as a PREFIX inverts that: ``grasped``'s ``gripper_prefix`` is
+    compared with ``str.startswith``, and the empty string is the identity
+    prefix, so a blank one selects EVERY geom in the scene rather than none and
+    pins the clause to ``True``. ``grasped(body="cube", gripper_prefix="")``
+    reports a grasp while the cube rests untouched on the floor - a
+    ``stop_when`` clause satisfied on step 1 with nothing moved, and a benchmark
+    ``success_rate`` of 1.0 under ``success_measured: true``. A non-string name
+    is refused for the third reason the numeric domain gives: unchecked it
+    escapes as a bare ``TypeError: startswith first arg must be str`` from
+    inside the evaluation loop, naming neither the predicate nor the clause.
+
+    Only params the factory annotates as numeric or as a required ``str`` name
+    are constrained, so a ``bool`` flag and a ``str | None`` robot selector are
+    untouched (there ``None`` is the documented sole-robot default, resolved by
+    :func:`can_resolve_base`), and a predicate registered via
+    :func:`register_predicate` without annotations is exempt (the caller opted
+    in by registering it).
 
     Args:
         name: Predicate name, used in the message.
@@ -2110,7 +2215,7 @@ def _kwarg_domain_error(name: str, factory: PredicateFactory, kwargs: dict[str, 
         kwargs: The spec-supplied kwargs, checked by name.
 
     Returns:
-        An error message, or ``None`` when every numeric kwarg is usable.
+        An error message, or ``None`` when every kwarg is usable.
     """
     annotations = getattr(factory, "__annotations__", {})
     context = f"predicate '{name}'"
@@ -2145,6 +2250,12 @@ def _kwarg_domain_error(name: str, factory: PredicateFactory, kwargs: dict[str, 
         elif annotation in _NUMBER_SEQUENCE_ANNOTATIONS:
             if (err := finite_vector_error(context, param, value)) is not None:
                 return err
+        elif annotation in _ENTITY_NAME_ANNOTATIONS:
+            # A name reaches the same permanently-decided clause the numeric
+            # domains refuse, and the blank PREFIX reaches it from the other
+            # side - pinned True rather than False. See _entity_name_error.
+            if (err := _entity_name_error(context, param, value)) is not None:
+                return err
     return None
 
 
@@ -2158,7 +2269,8 @@ def make_predicate(name: str, **kwargs: Any) -> Callable[[SimEngine], Any]:
 
     Every numeric kwarg is held to a finite domain here - a tolerance kwarg
     additionally to a non-negative one and a heading kwarg to the measurable
-    ``(-pi, pi)`` range - rather than in the
+    ``(-pi, pi)`` range - and every kwarg naming a scene entity to a non-empty
+    string, rather than in the
     spec compiler, because this is the only choke point every predicate call
     passes through: ``staged_reward`` builds its per-stage ``reward`` /
     ``advance_when`` calls by calling back into this function, so a guard in
@@ -2177,8 +2289,9 @@ def make_predicate(name: str, **kwargs: Any) -> Callable[[SimEngine], Any]:
     Raises:
         ValueError: If ``name`` is unknown, a kwarg the factory annotates as
             numeric is not a finite number, a kwarg that names a tolerance is
-            negative, or a kwarg that names a heading lies outside the
-            ``(-pi, pi)`` range a heading can be measured in.
+            negative, a kwarg that names a heading lies outside the
+            ``(-pi, pi)`` range a heading can be measured in, or a kwarg that
+            names a scene entity is not a non-empty string.
         TypeError: If required factory kwargs are missing.
     """
     factory = PREDICATE_REGISTRY.get(name)
@@ -2220,6 +2333,39 @@ def predicate_kind(name: str) -> str:
     if "Reward" in annotation:
         return "float"
     return "unknown"
+
+
+def predicate_reads_robot_base(name: str) -> bool:
+    """Whether a registered predicate resolves a robot's FLOATING BASE.
+
+    True for the ``base_*`` family - every term that reads ``get_observation``'s
+    ``base_pos`` / ``base_quat`` floating-base signals through
+    :func:`_base_position` / :func:`_base_quaternion` / :func:`_base_twist`, and
+    so selects its robot with the optional ``robot`` kwarg (default: the sole
+    robot). Read from the factory's signature rather than a name list, so it
+    stays in lock-step with the registry with no separate table to drift -
+    including predicates added by :func:`register_predicate`.
+
+    Args:
+        name: A predicate name. Must be registered in :data:`PREDICATE_REGISTRY`.
+
+    Returns:
+        ``True`` when the factory accepts a ``robot`` parameter.
+
+    Raises:
+        ValueError: If ``name`` is not registered (mirrors :func:`make_predicate`).
+    """
+    factory = PREDICATE_REGISTRY.get(name)
+    if factory is None:
+        valid = sorted(PREDICATE_REGISTRY.keys())
+        raise ValueError(f"Unknown predicate '{name}'. Valid: {valid}")
+    try:
+        return "robot" in inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        # A factory whose signature cannot be read (a C callable, an exotic
+        # partial) cannot be classified; treat it as not base-referencing
+        # rather than refusing a clause we cannot describe.
+        return False
 
 
 def supports_body_lookup(sim: SimEngine) -> bool:
@@ -2276,17 +2422,45 @@ def can_resolve_joint(sim: SimEngine, joint: str) -> bool:
     return _joint_position(sim, joint) is not None
 
 
+def can_resolve_base(sim: SimEngine, robot: str | None) -> bool:
+    """Whether *robot*'s floating base resolves in *sim* right now.
+
+    Mirrors :func:`can_resolve_body` for the ``base_*`` family, using the same
+    ``get_observation`` path those terms read at evaluation time
+    (:func:`_base_position`). ``False`` means every base-referencing term for
+    that robot would degrade to a constant forever, which happens for two
+    reasons the evaluation path already treats alike (both log the one
+    ``robot base`` warning): the name matches no robot in the scene, or it
+    matches a robot that has no floating base - a fixed-base arm.
+
+    A floating base surfaces ``base_pos`` and ``base_quat`` together (both are
+    read from the same free-joint block), so probing the position covers the
+    orientation- and twist-reading terms as well.
+
+    Args:
+        sim: The engine to probe.
+        robot: The robot name a base clause references, or ``None`` for the
+            sole robot - the default every ``base_*`` predicate applies.
+
+    Returns:
+        ``True`` when the floating base resolves to a position.
+    """
+    return _base_position(sim, robot) is not None
+
+
 __all__ = [
     "PREDICATE_REGISTRY",
     "BoolPredicate",
     "PredicateFactory",
     "RewardTerm",
     "StatefulRewardTerm",
+    "can_resolve_base",
     "can_resolve_body",
     "can_resolve_joint",
     "contact_is_active",
     "make_predicate",
     "predicate_kind",
+    "predicate_reads_robot_base",
     "register_predicate",
     "supports_body_lookup",
 ]

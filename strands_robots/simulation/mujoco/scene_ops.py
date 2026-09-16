@@ -21,6 +21,9 @@ Public API:
 * :func:`reposition_body_in_scene` - edit a body's spec ``pos``/``quat`` + recompile.
 * :func:`eject_robot_from_scene` - walk the spec, delete everything namespaced
   under ``{robot_name}/``, then recompile.
+* :func:`registry_rebuild_loss_error` - why that rebuild cannot be performed on
+  a scene this engine did not author, so the caller is refused instead of
+  losing the scene.
 * :func:`refresh_body_inertial_from_geometry` - re-derive a body's mass /
   center of mass / inertia after one of its geoms was resized at runtime.
 * :func:`fromto_fixed_size_components` - which ``geom_size`` components a geom's
@@ -43,6 +46,7 @@ from typing import Any
 from strands_robots.simulation.models import SimCamera, SimObject, SimRobot, SimWorld
 from strands_robots.simulation.mujoco.backend import _ensure_mujoco, filter_mujoco_attach_noise, mj_name_to_id
 from strands_robots.simulation.mujoco.spec_builder import _SIZE_LAYOUT, SpecBuilder
+from strands_robots.simulation.tool_frame import ToolFrame, ToolFrameRefused
 from strands_robots.utils import (
     coerce_rgba,
     entity_name_error,
@@ -181,6 +185,38 @@ def actuator_joint_id(model: Any, act_id: int, mj: Any) -> int:
     if int(model.actuator_trntype[act_id]) not in joint_trn:
         return -1
     return int(model.actuator_trnid[act_id, 0])
+
+
+def joint_position_unit(model: Any, jnt_id: int, mj: Any) -> str:
+    """Return the unit one scalar of joint ``jnt_id``'s coordinate is expressed in.
+
+    A MuJoCo joint coordinate carries a unit set by the joint's TYPE, not by the
+    model or the asset: a hinge -- and each component of a ball joint's rotation --
+    is an angle in radians, and a slide is a translation in the model's length
+    unit, metres for every asset the registry ships. A free joint's 7 coordinates
+    mix a translation with a quaternion, so no single unit names them.
+
+    The unit is what a caller converting a reading from a real arm needs, because
+    the driver reports something else: ``drivers/feetech`` reads an SO-arm in
+    degrees, and a degree reading written here unconverted is a pose an order of
+    magnitude away from the one intended. Answering it here keeps "what unit is
+    this number" one rule the messages read, rather than one each re-derives.
+
+    Args:
+        model: The compiled ``MjModel``.
+        jnt_id: Joint index in ``range(model.njnt)``.
+        mj: The ``mujoco`` module.
+
+    Returns:
+        ``"rad"`` for a hinge or ball joint, ``"m"`` for a slide joint, and ``""``
+        for a free joint, whose coordinates have no single unit.
+    """
+    jnt_type = int(model.jnt_type[jnt_id])
+    if jnt_type == int(mj.mjtJoint.mjJNT_SLIDE):
+        return "m"
+    if jnt_type == int(mj.mjtJoint.mjJNT_FREE):
+        return ""
+    return "rad"
 
 
 def joint_drive_map(model: Any, mj: Any) -> tuple[dict[int, int], dict[int, int]]:
@@ -441,6 +477,54 @@ def actuator_driven_joint_ids(model: Any, act_id: int, mj: Any) -> frozenset[int
     if int(model.actuator_trntype[act_id]) != int(mj.mjtTrn.mjTRN_TENDON):
         return frozenset()
     return tendon_joint_ids(model, int(model.actuator_trnid[act_id, 0]), mj)
+
+
+def mj_contact_is_active(contact: Any) -> bool:
+    """True when MuJoCo admitted this ``mjContact`` to the constraint solver.
+
+    The engine-level half of
+    :func:`~strands_robots.simulation.predicates.contact_is_active`: the
+    ``active`` flag that function reads on a ``get_contacts`` record is this
+    decision, recorded into the payload. ``mjData.contact`` lists every pair
+    inside the *detection* range (``margin`` plus ``gap``); only the admitted
+    ones push back, so a report that counts the rest answers "touching" for
+    bodies that are visibly apart. ``dist`` cannot stand in for it - a pair
+    with a wide ``margin`` is load-bearing at a positive distance.
+
+    Args:
+        contact: One ``mjData.contact`` record.
+
+    Returns:
+        True when the pair carries force.
+    """
+    return int(contact.exclude) == 0
+
+
+def geom_label(model: Any, geom_id: int, mj: Any) -> str:
+    """Return the name a human can find geom ``geom_id`` by in the model.
+
+    Most collision geoms in a shipped asset are unnamed - the so100 jaw pad is
+    geom 18 with no name of its own - so a report that prints only
+    ``mj_id2name`` says ``''`` for exactly the pairs a caller most needs to
+    identify. The body a geom hangs off is named in every asset this package
+    loads, so the fallback ``<body>/geom_<id>`` locates it in the MJCF.
+
+    Args:
+        model: The ``mujoco.MjModel`` the geom lives in.
+        geom_id: The geom to label.
+        mj: The ``mujoco`` module.
+
+    Returns:
+        The geom's own name; else ``"<body>/geom_<id>"``; else ``"geom_<id>"``.
+    """
+    name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, geom_id)
+    if name:
+        return str(name)
+    try:
+        body = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom_id]))
+    except (IndexError, AttributeError):
+        body = None
+    return f"{body}/geom_{geom_id}" if body else f"geom_{geom_id}"
 
 
 def actuator_target_body_ids(model: Any, act_id: int, mj: Any) -> frozenset[int]:
@@ -1027,29 +1111,59 @@ def _recompile_preserving_state(world: SimWorld, spec: Any, *, raise_on_refusal:
     # load_scene + add_robot round-trip).
     _sync_cached_xml(world, spec)
 
-    # Re-discover per-robot IDs. Names inside MuJoCo are namespaced under
-    # robot.namespace (e.g. "arm1/shoulder_pan") when robots were attached
-    # via SpecBuilder.attach_robot; fall back to the raw name otherwise.
+    rediscover_robot_ids(world, new_model, mj)
+
+    return True
+
+
+def rediscover_robot_ids(world: SimWorld, model: Any, mj: Any) -> None:
+    """Resolve every registered robot's joint / actuator ids against ``model``.
+
+    Names inside MuJoCo are namespaced under ``robot.namespace`` (e.g.
+    ``"arm1/shoulder_pan"``) when robots were attached via
+    ``SpecBuilder.attach_robot``; the raw name is the fallback. Called after
+    every recompile, and by ``load_scene`` when it carries a registered robot
+    into a loaded model that already contains that robot's subtree (the
+    ``export_xml`` -> ``load_scene`` round trip).
+    """
     for robot in world.robots.values():
         pfx = robot.namespace or ""
         robot.joint_ids = []
         for jnt_name in robot.joint_names:
             jid = -1
             if pfx:
-                jid = mj_name_to_id(new_model, mj.mjtObj.mjOBJ_JOINT, pfx + jnt_name)
+                jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, pfx + jnt_name)
             if jid < 0:
-                jid = mj_name_to_id(new_model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
+                jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
             if jid >= 0:
                 robot.joint_ids.append(jid)
-        robot.actuator_ids = robot_owned_actuator_ids(new_model, robot, mj)
+        robot.actuator_ids = robot_owned_actuator_ids(model, robot, mj)
         # Single-robot fallback. Ownership above is settled by namespace or by
         # driven joint; a lone robot whose actuators are neither prefixed nor
         # joint-driven (a tendon or site transmission in a scene loaded whole,
         # so no attach prefix) matches on neither, and in a one-robot scene
         # every actuator is unambiguously that robot's.
         if not robot.actuator_ids and len(world.robots) == 1:
-            robot.actuator_ids = list(range(new_model.nu))
+            robot.actuator_ids = list(range(model.nu))
 
+
+def robot_subtree_in_model(robot: SimRobot, model: Any, mj: Any) -> bool:
+    """Whether ``model`` already contains ``robot``'s joints under its namespace.
+
+    True when the robot has joint names and every one resolves (namespaced,
+    else raw) in ``model`` - the signature of a scene file that was exported
+    with the robot in it. A robot with no recorded joint names cannot be
+    recognised, so the answer is False.
+    """
+    if not robot.joint_names:
+        return False
+    pfx = robot.namespace or ""
+    for jnt_name in robot.joint_names:
+        jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, pfx + jnt_name) if pfx else -1
+        if jid < 0:
+            jid = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, jnt_name)
+        if jid < 0:
+            return False
     return True
 
 
@@ -1393,8 +1507,18 @@ def inject_robot_into_scene(
     world: SimWorld,
     robot: SimRobot,
     robot_xml_path: str,
+    tool_frame: ToolFrame | None = None,
 ) -> bool:
     """Attach a robot to the scene via ``spec.attach(other, prefix=..., frame=...)``.
+
+    ``tool_frame`` is a registry-declared tool point for a model that ships no
+    tool site (:mod:`strands_robots.simulation.tool_frame`); it is added to the
+    robot's spec before the attach. A declaration the model cannot honour
+    (unknown body, duplicate site name) raises ``ValueError`` with the reason
+    rather than folding into a bare ``False``, so the caller can report which
+    entry is wrong. That check reads the robot's OWN spec before anything
+    touches the scene's, so the scene needs no rollback: a refused add leaves
+    the live spec byte-identical and the next add succeeds.
 
     MuJoCo handles name prefixing (bodies, joints, geoms, actuators, sensors,
     sites), asset deduplication (meshes, textures, materials), and default-
@@ -1439,16 +1563,28 @@ def inject_robot_into_scene(
 
     try:
         with filter_mujoco_attach_noise():
-            joint_names = SpecBuilder.attach_robot(spec, robot, robot_xml_path)
+            joint_names = SpecBuilder.attach_robot(spec, robot, robot_xml_path, tool_frame=tool_frame)
         robot.joint_names = joint_names
+    except ToolFrameRefused:
+        # The registry asked for a tool site the model cannot carry. The check
+        # reads the robot's own spec before the attach, so the scene's spec was
+        # never touched and there is nothing to put back (measured: the live
+        # spec's XML is byte-identical across a refused add). Re-raised so the
+        # reason reaches the caller instead of the handler below folding it
+        # into a bare False.
+        raise
     except (ValueError, RuntimeError, OSError) as e:
         # attach_robot can insert its worldbody frame before the call that
         # raised. That leftover compiles, so it never broke the scene, but the
         # snapshot is already in hand - restoring it costs nothing and puts
         # every failure path on one rule: the spec is left as it was found.
+        # Re-raised after the rollback, like the recompile refusal below: folded
+        # into False the caller reported "Failed to inject robot '<name>' into
+        # scene." and MuJoCo's reason - e.g. "repeated name 'so101/base' in
+        # mesh" when the scene already carries that robot - stayed in the log.
         logger.error("Robot attach failed for '%s': %s", robot.name, e)
         world._backend_state["spec"] = backup_spec
-        return False
+        raise
 
     # Ask for the refusal's own reason rather than a bare False, exactly as
     # inject_object_into_scene does. Folded into a False it reached the caller as
@@ -2108,6 +2244,50 @@ def _resolve_joint_key(model: Any, key: _JointKey, mj: Any) -> int:
     return jid if int(model.jnt_type[jid]) == mj.mjtJoint.mjJNT_FREE else -1
 
 
+def registry_rebuild_loss_error(world: SimWorld, method: str) -> str | None:
+    """Why ``method`` cannot rebuild this scene from the registry, else ``None``.
+
+    :func:`eject_robot_from_scene` does not delete the departing robot from the
+    live spec - deleting an ``spec.attach()``-ed body segfaults MuJoCo at
+    interpreter shutdown - so it rebuilds the base scene with
+    ``SpecBuilder.build(world)`` and re-attaches the survivors. That rebuild is
+    faithful only to what the registry holds: ``world.robots``,
+    ``world.objects``, ``world.cameras``, the lights and the ground.
+
+    A scene installed by ``load_scene`` is not in the registry. Its bodies,
+    joints, lights, tendons and equality constraints exist only in the compiled
+    spec, so the rebuild silently omits every one of them - measured on a
+    two-prop scene, ``remove_robot`` reported ``"success"`` while both props
+    left the model, and a ``cube`` added afterwards through ``add_object``
+    survived because the registry did hold that one. The additive path has the
+    opposite property: ``add_object`` / ``add_camera`` / ``add_robot`` mutate the
+    loaded spec in place and preserve it, which is what ``load_scene``
+    documents.
+
+    So the rebuild is refused here, before the caller's registry entry is
+    popped and while the scene is still exactly as it was found. This is the
+    one consumer of the ``scene_loaded`` marker ``load_scene`` records.
+
+    Args:
+        world: The scene the rebuild would be performed on.
+        method: Public method name, used to prefix the message.
+
+    Returns:
+        The refusal text, or ``None`` when the registry can reproduce this
+        scene.
+    """
+    if not world._backend_state.get("scene_loaded", False):
+        return None
+    return (
+        f"{method}: this scene came from load_scene, and removing a robot rebuilds the scene from "
+        "the registry of robots/objects/cameras this engine authored - which does not hold the "
+        "bodies, lights, tendons or equality constraints the loaded MJCF compiled. The rebuild "
+        "would drop all of them and still report success, so it is refused with the scene exactly "
+        "as it was. To get the same world without this robot, call load_scene again and add_robot "
+        "only the robots you want; to change the scene wholesale, use replace_scene_mjcf."
+    )
+
+
 def eject_robot_from_scene(world: SimWorld, robot_name: str) -> bool:
     """Remove every spec element namespaced under ``{robot_name}/``.
 
@@ -2117,6 +2297,11 @@ def eject_robot_from_scene(world: SimWorld, robot_name: str) -> bool:
     we REBUILD the scene spec from scratch using the post-remove
     ``world.robots`` / ``world.objects`` / ``world.cameras`` state, then
     re-attach the remaining robots.
+
+    Scope: the rebuild reproduces the scene from the registry, so it can only
+    be run on a scene this engine authored. A ``load_scene`` world is refused by
+    :func:`registry_rebuild_loss_error` at the calling verb, before its registry
+    entry is popped - see that function for what the rebuild would drop.
 
     State preservation: the fresh compile below allocates a fresh ``MjData``,
     so every buffer starts at its reset value. Before the rebuild we snapshot
