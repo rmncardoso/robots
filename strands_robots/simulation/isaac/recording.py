@@ -421,7 +421,14 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
 
                 if resume_existing:
                     logger.info("Resuming existing dataset for append: %s", dataset_dir)
-                    resumed = _DatasetRecorder.resume(repo_id=repo_id, root=root, task=task, vcodec=vcodec)
+                    resumed = _DatasetRecorder.resume(
+                        repo_id=repo_id,
+                        root=root,
+                        task=task,
+                        vcodec=vcodec,
+                        joint_names=joint_names,
+                        extra_state_specs=base_state_specs,
+                    )
                     # The expanded names, not the bare joint list: a resumed
                     # dataset's on-disk observation.state includes the base columns,
                     # so validating against joint_names alone would report a

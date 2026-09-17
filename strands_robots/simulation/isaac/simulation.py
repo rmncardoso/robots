@@ -590,6 +590,69 @@ _RENDERER_BY_MODE: dict[str, str] = {
 }
 
 
+def _physics_view_stale_error(engine: Any, verb: str) -> dict[str, Any] | None:
+    """The refusal a tick owes a tensor view that no longer covers the scene.
+
+    One owner, six callers. Adding or removing a DYNAMIC body invalidates the
+    view PhysX built at ``world.reset()``, and until a ``reset()`` rebuilds it
+    every robot's ``get_observation()`` comes back empty - so a tick against a
+    stale view advances ``_sim_time`` over a scene that is not being simulated
+    and reports success for an action that never applied.
+
+    ``step()`` refused this and the other time-advancing paths did not, which
+    left the refusal covering the verb an agent calls least. The reachable one is
+    ``send_action``: it is this backend's primary drive path, so
+    ``add_object(is_static=False)`` followed by ``run_policy(...)`` with no
+    intervening ``reset()`` recorded a whole rollout - and any dataset of it -
+    over an un-simulated scene, under ``status="success"``. Same shape as the
+    ``step()`` refusal and ``changelog.d/3343-isaac-step-refuses-an-unreset-scene.md``
+    document, reached one call deeper.
+
+    Shared rather than copied because the wording IS the remedy: the caller is
+    one ``reset()`` away from correct, and hand-kept copies of that sentence is
+    how some of them come to omit the part about the pose.
+
+    MODULE-LEVEL, and taking the engine as an argument rather than being a
+    method, because several cross-backend suites drive ``IsaacSimulation.step``
+    with a ``types.SimpleNamespace`` as ``self`` - they seed the attributes the
+    call reads and nothing else, so a method here is an ``AttributeError`` on a
+    stub that legitimately carries the flag. Same reason ``_resolved_physics_dt``
+    and ``_resolved_physics_device`` below are functions. Reads the flag through
+    ``getattr`` for the other half of that: 24 test modules build the engine with
+    ``__new__``, which never runs ``__init__``.
+
+    Args:
+        engine: The engine whose view may be stale. Only ``_physics_view_stale``
+            is read.
+        verb: The public method name to name in the refusal, so the caller is
+            told which of their own calls to fix rather than an internal
+            helper's.
+
+    Returns:
+        The error envelope when the view is stale, else ``None`` - so a caller
+        reads ``if stale := _physics_view_stale_error(self, "step"):``. Returns
+        rather than raises: every one of these callers owes its caller a dict.
+    """
+    if not getattr(engine, "_physics_view_stale", False):
+        return None
+    return {
+        "status": "error",
+        "content": [
+            {
+                "text": (
+                    f"{verb}: a DYNAMIC body was added or removed since the last reset(), "
+                    "so PhysX's tensor view no longer covers the scene and every "
+                    "robot's get_observation() comes back empty. Call reset() first, "
+                    f"then {verb}(). Note reset() returns robots to their default pose. "
+                    "Only a dynamic body does this: a static add_object or "
+                    "remove_object, add_camera, move_object, add_robot and "
+                    "remove_robot all leave the view intact."
+                )
+            }
+        ],
+    }
+
+
 def _resolved_physics_dt(world: Any) -> float | None:
     """The physics timestep the World is actually integrating at, or ``None``.
 
@@ -1588,6 +1651,44 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     "content": [{"text": "World already created. Call destroy() first."}],
                 }
 
+            # Bound before the ``try`` because the cleanup handler below reads it,
+            # and the import that binds it lives INSIDE that try - after the
+            # first fallible statement in it.
+            #
+            # ``_get_or_create_simulation_app`` is that statement, and
+            # ``SimulationApp`` raising RuntimeError/OSError is the common real
+            # launch failure for this backend: no GPU, no driver, no display.
+            # That lands in the handler with ``World`` never bound, so the
+            # ``World.clear_instance()`` there raised ``UnboundLocalError`` - a
+            # ``NameError`` subclass, in neither that handler's except tuple nor
+            # the outer one, and deliberately so ("programming bugs propagate").
+            # It therefore escaped ``create_world`` entirely and replaced the
+            # actionable launch error with ``cannot access local variable
+            # 'World'``: a crash out of a method whose contract is to return an
+            # error dict, on exactly the failure class the cleanup was added to
+            # handle.
+            #
+            # ``None`` means the import never ran, which is the one state with no
+            # symbol to clear the singleton WITH. Skipping the teardown there
+            # loses nothing, and the reason is that it was never performed: the
+            # pre-fix code raised AT the ``clear_instance()`` call, so on every
+            # path where the name was unbound the count of clears was already
+            # zero.
+            #
+            # Deliberately not argued as "no singleton can exist here" - that is
+            # not sound. ``_SIMULATION_APP`` can be ``None`` while a ``World``
+            # was constructed outside this module's tracking, in which case a
+            # stale singleton IS live and this skips it, exactly as the raising
+            # version did. What the fix buys is the launch error being reported
+            # instead of destroyed; recovering a clear in that corner would mean
+            # re-attempting the import here, which is a larger change than this
+            # handler wants.
+            #
+            # A separate name from the imported ``World`` deliberately: binding
+            # ``World = None`` here and letting the import rebind it is a
+            # redefinition mypy refuses (``no-redef``), and silencing that would
+            # hide the same class of error elsewhere in the function.
+            world_cls: Any = None
             try:
                 # Create/get SimulationApp singleton, selecting the RTX
                 # renderer that ``render_mode`` names. The value used to be
@@ -1609,6 +1710,10 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                     from isaacsim.core.api import World  # type: ignore[import-not-found]
                 except ImportError:
                     from omni.isaac.core import World  # type: ignore[import-not-found]
+
+                # Published to the cleanup handler below, which cannot see the
+                # import-scoped name when the import never ran.
+                world_cls = World
 
                 dt = timestep if timestep is not None else self._config.physics_dt
                 grav = gravity
@@ -1802,15 +1907,18 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                             "reported, and clear_instance is still attempted): %s",
                             stop_exc,
                         )
-                try:
-                    World.clear_instance()
-                except (RuntimeError, OSError, AttributeError) as clear_exc:
-                    logger.warning(
-                        "World.clear_instance() after a failed create_world raised; a stale singleton may "
-                        "outlive this call and be returned to the next create_world() (the original "
-                        "failure is reported): %s",
-                        clear_exc,
-                    )
+                # ``world_cls is None`` means the failure preceded the import, so
+                # no singleton was ever registered and there is nothing to clear.
+                if world_cls is not None:
+                    try:
+                        world_cls.clear_instance()
+                    except (RuntimeError, OSError, AttributeError) as clear_exc:
+                        logger.warning(
+                            "World.clear_instance() after a failed create_world raised; a stale singleton may "
+                            "outlive this call and be returned to the next create_world() (the original "
+                            "failure is reported): %s",
+                            clear_exc,
+                        )
                 self._world = None
                 logger.error("Failed to create Isaac world: %s", e)
                 return {
@@ -2188,23 +2296,8 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             # remedy is the whole point - the operation is one call away from
             # correct, and MuJoCo needs no equivalent because its step reads the
             # compiled model directly.
-            if self._physics_view_stale:
-                return {
-                    "status": "error",
-                    "content": [
-                        {
-                            "text": (
-                                "step: a DYNAMIC body was added or removed since the last reset(), "
-                                "so PhysX's tensor view no longer covers the scene and every "
-                                "robot's get_observation() comes back empty. Call reset() first, "
-                                "then step(). Note reset() returns robots to their default pose. "
-                                "Only a dynamic body does this: a static add_object or "
-                                "remove_object, add_camera, move_object, add_robot and "
-                                "remove_robot all leave the view intact."
-                            )
-                        }
-                    ],
-                }
+            if stale := _physics_view_stale_error(self, "step"):
+                return stale
 
         # Nested (not a separate method) so the batching loop remains part of
         # ``step``'s own body: the cross-backend batch-and-recheck contract is
@@ -2234,6 +2327,14 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
                             "status": "error",
                             "content": [{"text": step_aborted_msg(n_steps - remaining, n_steps)}],
                         }
+                    # Re-checked per batch for the same reason the world is: the
+                    # lock is released between batches, so a worker thread's
+                    # ``add_object(is_static=False)`` can invalidate the view
+                    # mid-``step(N)``. Checking only on entry left every
+                    # remaining batch ticking a stale view under the success
+                    # this call would still have returned.
+                    if stale := _physics_view_stale_error(self, "step"):
+                        return stale
                     render = self._config.render_mode != "headless"
                     for _ in range(batch):
                         # ``getattr`` rather than a class-level default: two
@@ -5395,6 +5496,14 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             if not registered(self._robots, robot_name):
                 return {"status": "error", "content": [{"text": f"Robot '{robot_name}' not found."}]}
 
+            # Refused here, before the action is converted, written or stepped:
+            # this is the drive path a rollout reaches physics through, so a
+            # stale view would otherwise advance the clock and report success for
+            # an action that never applied. Placed after the robot resolves so a
+            # bad ``robot_name`` still reports itself rather than the staleness.
+            if stale := _physics_view_stale_error(self, "send_action"):
+                return stale
+
             robot = self._robots[robot_name]
 
             # Route a dict action through the robot's installed task-space
@@ -5725,6 +5834,13 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
 
         if not getattr(self, "_world_created", False) or self._world is None:
             return {"status": "error", "content": [{"text": "No world created. Use action='create_world' first."}]}
+        # Refused in the preflight, where an envelope is still returnable: the
+        # loop's own tick (``_apply_all_and_step``) returns None, so a stale view
+        # discovered there can only raise. This is the reachable order -
+        # ``add_object(is_static=False)`` then ``run_multi_policy`` - and it is
+        # the whole rollout that would otherwise run over an un-simulated scene.
+        if stale := _physics_view_stale_error(self, "run_multi_policy"):
+            return stale
         if err := self._validate_multi_policies(policies, "run_multi_policy"):
             return err
 
@@ -5917,6 +6033,22 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         def _apply_all_and_step(per_robot_action: dict[str, dict[str, Any]]) -> None:
             """Main-thread hop 2: apply EVERY robot's targets, step physics ONCE."""
             with self._lock:
+                # The preflight refused a view that was already stale; this
+                # catches one invalidated MID-rollout by a worker thread's
+                # dynamic add. Raised rather than returned because this hop
+                # returns None - the same shape, and the same reason, as the
+                # empty-chunk RuntimeError below: advancing a scene PhysX no
+                # longer covers is not something to paper over with a tick.
+                # ``run_multi_policy``'s ``finally`` discards the partial
+                # episode, so no half-rollout is recorded as if it simulated.
+                if self._physics_view_stale:
+                    raise RuntimeError(
+                        "run_multi_policy: a DYNAMIC body was added or removed mid-rollout, so "
+                        "PhysX's tensor view no longer covers the scene and the remaining steps "
+                        "would advance a scene that is not being simulated. Call reset() before "
+                        "starting the rollout, and do not add or remove dynamic bodies while one "
+                        "is running."
+                    )
                 for rname, act in per_robot_action.items():
                     self._apply_lockstep_action(rname, act, warned_unresolved)
                 # Same replay as ``step`` and ``send_action``: this tick advances
@@ -6613,6 +6745,27 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             surface/attribute error visible only at DEBUG.
         """
         if self._world is None:
+            return False
+
+        # A stale tensor view is the same class of precondition as an absent
+        # world, and reported the same way: this returns ``bool`` and documents
+        # "never raises", so the honest answer is that the camera did not warm
+        # up rather than an envelope this signature cannot carry. Its caller
+        # already handles ``False``.
+        #
+        # Warming a camera is not itself a physics claim, but the loop below
+        # advances ``_sim_time`` per iteration, and the read it is waiting on is
+        # exactly the kind that hangs against an invalidated view - the measured
+        # 2-minute stall on a post-remove articulation read. So the budget would
+        # be spent stepping a scene PhysX no longer covers, for frames that
+        # cannot arrive.
+        if self._physics_view_stale:
+            logger.warning(
+                "_warmup_camera(%r): skipped - a dynamic body was added or removed since the "
+                "last reset(), so PhysX's tensor view no longer covers the scene and the "
+                "render products cannot accumulate. Call reset() first.",
+                name,
+            )
             return False
 
         # A stopped timeline never feeds the RTX render products, so a

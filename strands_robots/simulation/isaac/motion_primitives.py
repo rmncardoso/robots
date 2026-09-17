@@ -98,6 +98,7 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
         _sim_time: float
         _step_count: int
         _pump_running: bool
+        _physics_view_stale: bool
 
         def _on_main_thread(self) -> bool:
             """Provided by ``IsaacSimulation``; declared here for type-checkers."""
@@ -187,6 +188,25 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
                     "for the rollout to finish (Isaac policy loops clear the flag on exit)."
                 ),
             )
+        # A primitive drive loop advances ``_sim_time`` like ``step`` and
+        # ``send_action`` do - ``_primitive_tick``'s own comment says so - so it
+        # owes the same refusal when PhysX's tensor view no longer covers the
+        # scene. Without it the loop ticked a dead view and then blamed the
+        # SERVO: measured, ``rotate_wrist`` after a dynamic ``add_object``
+        # burned its 6 ticks and reported "residual 0.3000 rad", sending the
+        # caller after a tolerance or a gain for a joint that was never going to
+        # move. Refused here rather than in each of ``move_to`` /
+        # ``rotate_wrist`` / ``set_gripper``, because this is the preamble all
+        # three already share.
+        # Imported here rather than at module scope because ``simulation`` imports
+        # THIS module to build ``IsaacSimulation`` (line 45 there), so a top-level
+        # import is a cycle. The refusal has one owner regardless - copying the
+        # wording is what this avoids.
+        from strands_robots.simulation.isaac.simulation import _physics_view_stale_error
+
+        stale = _physics_view_stale_error(self, action)
+        if stale is not None:
+            return None, None, stale
         return robot_name, robot, None
 
     def _primitive_abort_reason(self, action: str, robot_name: str) -> dict[str, Any] | None:
@@ -207,6 +227,16 @@ class IsaacMotionPrimitivesMixin(MotionPrimitivesCore):
             return _err(f"{action}: robot '{robot_name}' was removed mid-run; aborting.")
         if robot.policy_running:
             return _err(f"{action}: a policy started on '{robot_name}' mid-run; aborting.")
+        # The same mid-run window this method exists for: the loop releases the
+        # lock between ticks, so a worker thread's dynamic add_object can
+        # invalidate the tensor view while the primitive is driving. Aborting
+        # names the view, where continuing would spend the remaining ticks on a
+        # scene PhysX no longer covers and then report a residual.
+        if self._physics_view_stale:
+            return _err(
+                f"{action}: a dynamic body was added or removed mid-run, so PhysX's tensor view "
+                "no longer covers the scene; aborting. Call reset() before retrying."
+            )
         return None
 
     def _run_primitive_on_kit(self, action: str, fn: Any) -> dict[str, Any]:
