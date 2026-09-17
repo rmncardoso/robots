@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+# hatchling 1.32+ emits Metadata-Version 2.5, which the PyPI publisher's twine
+# rejects (v0.5.2 publish, run 35206733145); 1.31 built v0.5.1. Lift the pin
+# once pypa/gh-action-pypi-publish ships a twine that knows 2.5.
+requires = ["hatchling<1.32", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
@@ -1009,6 +1012,7 @@ markers = [
     "wbc: requires onnxruntime + a downloaded GR00T-WBC (SONIC) checkpoint + mujoco. Run with: pytest -m wbc (set WBC_LIVE=1)",
     "molmoact2: requires lerobot >= 0.5.2 (from source) + the [molmoact2] extra (transformers, peft, scipy). Run with: pytest -m molmoact2",
     "rtps: requires cyclonedds ([ros2] extra) + a live ROS 2 peer (e.g. turtlesim) on the DDS domain. Run with: RTPS_LIVE=1 pytest -m rtps",
+    "hardware: requires a real serial arm. Run with: STRANDS_HW_PORT=/dev/tty... pytest -m hardware",
 ]
 
 [tool.coverage.run]

@@ -225,10 +225,11 @@
     },
     "policy_provider": {
       "type": "string",
-      "description": "Policy provider name (e.g. groot, lerobot_local, lerobot_async, cosmos3, mock). See list_providers()."
+      "description": "Which policy backend runs: one of cosmos3, curobo, groot, kimodo, lerobot_async, lerobot_local, microduck, mock, moveit2, protomotions, remote, rl, wbc, wbc_gait (default mock - a no-op policy for smoke tests). The model or checkpoint itself is named inside policy_config (lerobot_local: pretrained_name_or_path; groot: host/port). Not an action - an unknown name is refused listing the current registry (strands_robots.policies.list_providers())."
     },
     "instruction": {
-      "type": "string"
+      "type": "string",
+      "description": "The natural-language task the policy is conditioned on (run_policy, start_policy, eval_policy), e.g. 'pick up the red cube'. This is the field for what a caller might otherwise call task= or prompt=."
     },
     "duration": {
       "type": "number"
@@ -237,7 +238,8 @@
       "type": "integer"
     },
     "control_frequency": {
-      "type": "number"
+      "type": "number",
+      "description": "run_policy/start_policy/run_multi_policy/eval_policy/evaluate_benchmark: control-loop rate in Hz - one policy query and one applied action per 1/control_frequency s of sim time (duration = n_steps / control_frequency). Unset = the active recording's fps when a recording is open (the dataset recorder writes one frame per control step, so the two rates must agree), else 50. A value you pass that disagrees with an open recording is refused, naming both rates"
     },
     "camera_name": {
       "type": "string"
@@ -389,7 +391,12 @@
     },
     "success_fn": {
       "type": "string",
-      "description": "Success function ('contact')"
+      "description": "eval_policy: named success criterion; the ONLY name is 'contact' (any robot-object contact during the episode). For a condition on the scene use 'success_when' instead. Without either (and no benchmark) success_rate is a hard 0.0 with success_measured=false"
+    },
+    "success_when": {
+      "type": "object",
+      "description": "eval_policy: success criterion as a predicate clause - the SAME DSL as run_policy's stop_when and a benchmark spec's success clause: a single bool predicate call like {'predicate': 'body_above_z', 'body': 'cube', 'z': 0.2} or {'predicate': 'base_beyond_x', 'x': 0.5}, or a group {'all': [<call>, ...]} / {'any': [<call>, ...]}. Compiled through the closed predicate registry (unknown name -> refused with the valid list) and probed against the live scene before the first episode (a body the scene lacks -> refused up front, not a fake 0%). An unnamed base_* clause reads the robot under evaluation. Alternative to success_fn; passing both is refused",
+      "additionalProperties": true
     },
     "fast_mode": {
       "type": "boolean",

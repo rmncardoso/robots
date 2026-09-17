@@ -47,11 +47,22 @@ The recorder captures **one frame per control step and never decimates**, so the
 rate frames arrive at is the rollout's `control_frequency` - and LeRobot derives
 every timestamp from the dataset's declared `fps` positionally
 (`timestamp = frame_index / fps`). A differing `fps` therefore cannot be
-honored, only mislabelled, so it is refused:
+honored, only mislabelled, so it is refused.
+
+Leave `control_frequency` unset and a rollout started while a recording is open
+**adopts the recording's fps** - the plain sequence just works:
+
+```python
+sim.start_recording(repo_id="user/my_dataset", task="t")          # 30 fps
+sim.run_policy(robot_name="so100", policy_provider="mock")        # steps at 30 Hz
+```
+
+A rate you pass yourself is never corrected behind your back; a disagreeing one
+is refused:
 
 ```python
 sim.start_recording(repo_id="user/my_dataset", task="t", fps=30)
-sim.run_policy(robot_name="so100", policy_provider="mock")   # default 50.0 Hz
+sim.run_policy(robot_name="so100", policy_provider="mock", control_frequency=50.0)
 # -> "run_policy: the active recording declares 30 fps but this rollout captures
 #     at control_frequency=50 Hz. [...] a 1.667x distortion of the episode
 #     duration [...] Align the two rates: pass control_frequency=30 to
@@ -88,8 +99,10 @@ runner.run("so100", policy, control_frequency=50.0, on_frame=hook)
 
 The rule holds whichever call comes first. `start_policy` returns while its
 rollout keeps running, so a recording can be opened against a rollout already in
-flight - and on the defaults (`fps=30` against `control_frequency=50.0`) that
-recorded a 1.667x mislabelled episode with every call reporting success.
+flight - and on the defaults (`fps=30` against a rollout that, with no recording
+open when it started, stepped at `50.0` Hz) that recorded a 1.667x mislabelled
+episode with every call reporting success. (This is the one ordering the
+adopt-the-recording rule above cannot help: the rollout's rate is already fixed.)
 `start_recording` refuses the same disagreement, before creating the dataset:
 
 ```python
@@ -1068,16 +1081,26 @@ So every flush refuses rather than continues. `save_episode()` and
 loop on the facade's behalf and reports the reason as `recording_save_error`
 beside its parquet-truth counts - `reset()` surfaces the
 failure instead of resetting into an undefined state, and a recorded
-`eval_policy` / `evaluate_benchmark` - one driven with an `on_frame` hook that
-calls `add_frame`, which is the only way those two feed a recorder - stops at the
-episode whose flush failed and reports the reason:
+`eval_policy` / `evaluate_benchmark` - run under an open recording they feed it
+themselves, one dataset episode per evaluation episode, and their answer names
+what was recorded (`Recorded 20 episode(s), N frames to <repo_id>`); a caller's
+own `on_frame` replaces that hook and then records only if it calls `add_frame`
+- stops at the episode whose flush failed and reports the reason:
 
 ```python
-result = sim.eval_policy(robot_name="so100", n_episodes=20, on_frame=hook)
+result = sim.eval_policy(robot_name="so100", n_episodes=20)
 payload = next(b["json"] for b in result["content"] if "json" in b)
 if payload["recording_save_error"]:      # None on every healthy evaluation
     ...   # status is "error"; episodes_completed is the episode it stopped at
 ```
+
+Those frames are labelled with the instruction the *policy* was given: the
+caller's `instruction=`, else - on the `evaluate_benchmark` route - the
+benchmark's own `spec.instruction`, which is the language a LIBERO/Meta-World
+spec ships with the task and what the eval loop conditions the policy on (#187).
+That is the precedence `run_policy(instruction=...)` already has over the
+session's `start_recording(task=...)`, so a recorded evaluation's `task` column
+names the task the rollout was actually driven with rather than `"untitled"`.
 
 `episodes_completed` and `success_rate` then cover only the episodes that ran, so
 an aggregate is never reported over episodes whose frames reached no dataset. The

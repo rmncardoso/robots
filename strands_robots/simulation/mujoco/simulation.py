@@ -68,6 +68,7 @@ import logging
 import math
 import numbers
 import os
+import re
 import threading
 import time
 import weakref
@@ -567,6 +568,73 @@ def _published_string_params(field_aliases: dict[str, str]) -> frozenset[str]:
 # reason ``_PUBLISHED_ACTIONS`` is, and used to decide which spelling a refusal
 # may name: a model constrained to this schema can emit no other.
 _PUBLISHED_PARAMS: frozenset[str] = frozenset(_TOOL_SPEC_SCHEMA["properties"]) - {"action"}
+
+
+# An annotation JSON cannot construct: a callable, or an already-built Policy.
+# Applied to one union member at a time, never to the whole annotation - see
+# :func:`_tool_call_can_carry`.
+_UNCARRIABLE_ANNOTATION = re.compile(r"Callable|\bPolicy\b")
+
+
+def _union_members(text: str) -> list[str]:
+    """The top-level ``|`` members of an annotation's text.
+
+    Splitting only at bracket depth zero keeps a union that appears *inside* a
+    subscript out of the result: the members of
+    ``Callable[[Started | Step | Ended], None] | None`` are the callable and
+    ``None``, not the three event types.
+
+    Args:
+        text: The annotation rendered as text.
+
+    Returns:
+        The stripped top-level members, in source order.
+    """
+    members: list[str] = []
+    depth = start = 0
+    for index, char in enumerate(text):
+        if char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        elif char == "|" and depth == 0:
+            members.append(text[start:index])
+            start = index + 1
+    members.append(text[start:])
+    return [member.strip() for member in members if member.strip()]
+
+
+def _tool_call_can_carry(param: inspect.Parameter) -> bool:
+    """Whether a JSON tool call can supply *param* at all.
+
+    A parameter that only ever holds a callback (``observer``, ``on_frame``) or
+    a live :class:`Policy` instance (``policy_object``) exists for the Python
+    caller; no JSON value satisfies it, so a refusal's "Valid:" list leaves it
+    out. Everything else is kept, an unannotated parameter included: the list
+    must never hide a key the caller could have used.
+
+    A union is judged member by member, because one alternative being
+    unreachable does not make the parameter unreachable. ``stop_when`` is
+    ``dict[str, Any] | Callable[[SimEngine], bool] | None`` - the schema
+    publishes it and documents the dict predicate DSL, and a tool call carries
+    that dict, so the callable alternative must not hide it. ``None`` alone is
+    not a value a caller passes to fill a parameter, so it never keeps one.
+
+    Args:
+        param: The method parameter as :func:`inspect.signature` reports it.
+
+    Returns:
+        ``False`` only when every alternative is a callable or a ``Policy``,
+        ``True`` otherwise.
+    """
+    annotation = param.annotation
+    if annotation is inspect.Parameter.empty:
+        return True
+    text = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", None) or repr(annotation)
+    fillable = [member for member in _union_members(text) if member not in ("None", "NoneType")]
+    if not fillable:
+        return True
+    return any(_UNCARRIABLE_ANNOTATION.search(member) is None for member in fillable)
 
 
 def _reported_param_name(param: str, field_aliases: Mapping[str, str], received: Mapping[str, Any]) -> str:
@@ -3819,7 +3887,7 @@ class MuJoCoSimEngine(
         # MuJoCo-scoped like the sibling describe() families.)
         base["methods"]["run_multi_policy"] = (
             "(policies: dict[str, Policy], instructions='' | dict, duration=10.0, "
-            "control_frequency=50.0, action_horizon=8 | dict, n_steps=None, "
+            "control_frequency=None (the open recording's fps, else 50.0), action_horizon=8 | dict, n_steps=None, "
             "max_steps=None) -> dict  # drive MULTIPLE robots, each with its own "
             "Policy, in one synchronized loop that records ALL robots into ONE "
             "merged frame per timestep (prefixed state/action, e.g. "
@@ -6126,7 +6194,7 @@ class MuJoCoSimEngine(
         well, so it and ``list_policies_running`` reported opposite facts about
         the same instant ("Stopped on 'arm'" with ``was_running=True`` against
         "No policies running.") - the two-sources drift #2833 is about, and the
-        thing ``docs/simulation/overview.md`` promised could not happen. The
+        thing ``docs/simulation/rollouts.md`` promised could not happen. The
         union is spelled once, here, and every reader inherits it.
 
         ``policy_running`` is the flag the launching thread raises around every
@@ -6526,7 +6594,7 @@ class MuJoCoSimEngine(
         policy_config: dict[str, Any] | None = None,
         instruction: str = "",
         duration: float = 10.0,
-        control_frequency: float = 50.0,
+        control_frequency: float | None = None,
         action_horizon: int = 8,
         fast_mode: bool = False,
         video: dict[str, Any] | None = None,
@@ -6594,6 +6662,7 @@ class MuJoCoSimEngine(
         # that named no problem.
         if err := self._validate_posture_flags("start_policy", fast_mode=fast_mode):
             return err
+        control_frequency = self._resolve_control_frequency(control_frequency)
         if err := self._validate_positive_frequency(control_frequency, "start_policy"):
             return err
         resolved_duration, resolved_n_steps, horizon_error = self._resolve_horizon(
@@ -6716,15 +6785,20 @@ class MuJoCoSimEngine(
     def _rollouts_ended_in_error(self) -> Mapping[str, str]:
         return dict(self._rollout_failures)
 
-    def _make_run_policy_hook(self, robot_name: str, instruction: str):
-        """MuJoCo override: recording + policy_running flag + lock.
+    def _make_recording_on_frame(self, robot_name: str, instruction: str) -> Any:
+        """MuJoCo override: the recording half of the rollout hook, on its own.
 
-        Returns an ``on_frame(step, obs, action)`` closure that:
-        * READS ``robot.policy_running`` so ``stop_policy`` can interrupt (the
-          launching thread raises it - see :meth:`_announce_rollout`),
-        * appends to ``_backend_state["trajectory"]`` when recording,
-        * forwards frames to the LeRobot ``dataset_recorder`` if attached,
-        * raises ``PolicyStopped`` when the user calls ``stop_policy``.
+        Returns an ``(step, observation, action) -> None`` closure that appends
+        the frame to ``_backend_state["trajectory"]`` and forwards it to the
+        attached LeRobot ``dataset_recorder`` while a recording is open - the
+        same writes :meth:`_make_run_policy_hook` performs, without that
+        hook's ``policy_running`` claim and mesh telemetry. The closure reads
+        the recording flag per frame, so a recording opened or closed during a
+        rollout is honoured from that frame on. ``None`` when the robot is not
+        registered. The single-robot evaluation facades (``eval_policy``,
+        ``evaluate_benchmark``) install it when the caller passes no
+        ``on_frame`` and a recording is open: before that, an evaluation run
+        under an open recording advanced every episode and wrote no frame.
         """
         import numpy as np
 
@@ -6733,25 +6807,6 @@ class MuJoCoSimEngine(
         world = self._world
         if world is None or not registered(world.robots, robot_name):
             return None
-
-        robot = world.robots[robot_name]
-        # Raise the flag for a rollout whose claim is still current, and ONLY
-        # then. This factory runs on the executor worker for a ``start_policy``
-        # rollout, so an unconditional raise here landed after the launch
-        # returned - it overwrote a stop issued in the launch window and the
-        # rollout ran to full duration having reported that it stopped (#2833).
-        # A claim carries the stop count its launcher observed
-        # (:meth:`_announce_rollout`); once a stop has landed against it the
-        # count has moved, and leaving the flag down here is what makes the
-        # hook's own first-frame check refuse the rollout. ``None`` means no
-        # launcher claimed the robot - a caller driving ``PolicyRunner`` with
-        # this hook directly - and that rollout is claimed here, on its own
-        # thread, exactly as before.
-        if robot.policy_claim_stops is None or robot.policy_claim_stops == robot.policy_stops:
-            robot.policy_running = True
-        robot.policy_instruction = instruction
-        robot.policy_steps = 0
-
         lock = self._lock
 
         # Action columns this rollout is responsible for: the driven robot's own
@@ -6777,59 +6832,7 @@ class MuJoCoSimEngine(
                 action_key_cache[prefixed] = cached
             return cached
 
-        # N4: stream per-step telemetry on the mesh. publish_step existed with
-        # consumers (robot_mesh watch, dashboards) but ZERO producers - no
-        # rollout ever emitted it. Rate-limited to ~10 Hz to respect the
-        # transport caps. Prefer the robot's own child-peer mesh (per-robot
-        # topic), fall back to the parent sim's mesh.
-        _mesh = getattr(robot, "mesh", None) or getattr(self, "mesh", None)
-        # ``-inf`` rather than ``0.0``: a monotonic reading is only meaningful
-        # relative to another one, so the first step of a rollout is due
-        # wherever this platform's monotonic epoch happens to sit instead of
-        # depending on it being far from zero. It also means the gate's
-        # subtraction is ``inf`` on the first step, which clears any period at
-        # all - see ``_stream_enabled`` below.
-        _stream_state = {"last": float("-inf")}
-        from strands_robots.mesh.session import stream_min_period_from_env
-
-        # inf when step telemetry is off / misconfigured. A bare division here
-        # killed run_policy hook setup on STRANDS_MESH_STREAM_HZ=0.
-        _stream_min_period = stream_min_period_from_env()
-        # An infinite period is the operator's opt-out, and no finite elapsed
-        # time reaches it - but the sentinel above is below every reading, so
-        # the subtraction alone would read ``inf >= inf`` and let exactly one
-        # publish per rollout past the opt-out. The period is therefore read
-        # directly, once here rather than on every step.
-        _stream_enabled = math.isfinite(_stream_min_period)
-
-        def _hook(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
-            # Cooperative cancellation: stop_policy flips this flag.
-            if not robot.policy_running:
-                raise CooperativeStop(f"Policy stopped on '{robot_name}'")
-
-            robot.policy_steps = step + 1
-
-            if _mesh is not None and _stream_enabled:
-                # ``time.monotonic()``: this is an elapsed interval, and it
-                # carries its own base forward as it goes - each publish
-                # records when it happened and the next is due a period
-                # later. On ``time.time()`` a backward wall-clock step (an
-                # NTP correction, a ``date -s``, a resume from suspend)
-                # landing between two publishes made the difference
-                # negative, so the throttle refused every later step until
-                # the date caught up. The gaps that did land stay correctly
-                # spaced, so the shortfall is indistinguishable afterwards
-                # from a rollout that simply ran for less time. The
-                # hardware control loop throttles the same publish on the
-                # same period and already reads this clock.
-                _now = time.monotonic()
-                if _now - _stream_state["last"] >= _stream_min_period:
-                    _stream_state["last"] = _now
-                    try:
-                        _mesh.publish_step(step, observation, action, instruction=instruction)
-                    except Exception:  # noqa: BLE001 - telemetry must not kill the rollout
-                        pass
-
+        def _record(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
             with lock:
                 if world._backend_state.get("recording", False):
                     world._backend_state["trajectory"].append(
@@ -6889,6 +6892,99 @@ class MuJoCoSimEngine(
                                 required_action_keys=_required_action_keys(False),
                             )
 
+        return _record
+
+    def _make_run_policy_hook(self, robot_name: str, instruction: str):
+        """MuJoCo override: recording + policy_running flag + lock.
+
+        Returns an ``on_frame(step, obs, action)`` closure that:
+        * READS ``robot.policy_running`` so ``stop_policy`` can interrupt (the
+          launching thread raises it - see :meth:`_announce_rollout`),
+        * appends to ``_backend_state["trajectory"]`` when recording,
+        * forwards frames to the LeRobot ``dataset_recorder`` if attached,
+        * raises ``PolicyStopped`` when the user calls ``stop_policy``.
+        """
+        world = self._world
+        if world is None or not registered(world.robots, robot_name):
+            return None
+
+        robot = world.robots[robot_name]
+        # Raise the flag for a rollout whose claim is still current, and ONLY
+        # then. This factory runs on the executor worker for a ``start_policy``
+        # rollout, so an unconditional raise here landed after the launch
+        # returned - it overwrote a stop issued in the launch window and the
+        # rollout ran to full duration having reported that it stopped (#2833).
+        # A claim carries the stop count its launcher observed
+        # (:meth:`_announce_rollout`); once a stop has landed against it the
+        # count has moved, and leaving the flag down here is what makes the
+        # hook's own first-frame check refuse the rollout. ``None`` means no
+        # launcher claimed the robot - a caller driving ``PolicyRunner`` with
+        # this hook directly - and that rollout is claimed here, on its own
+        # thread, exactly as before.
+        if robot.policy_claim_stops is None or robot.policy_claim_stops == robot.policy_stops:
+            robot.policy_running = True
+        robot.policy_instruction = instruction
+        robot.policy_steps = 0
+
+        record_frame = self._make_recording_on_frame(robot_name, instruction) or (
+            lambda step, observation, action: None
+        )
+
+        # N4: stream per-step telemetry on the mesh. publish_step existed with
+        # consumers (robot_mesh watch, dashboards) but ZERO producers - no
+        # rollout ever emitted it. Rate-limited to ~10 Hz to respect the
+        # transport caps. Prefer the robot's own child-peer mesh (per-robot
+        # topic), fall back to the parent sim's mesh.
+        _mesh = getattr(robot, "mesh", None) or getattr(self, "mesh", None)
+        # ``-inf`` rather than ``0.0``: a monotonic reading is only meaningful
+        # relative to another one, so the first step of a rollout is due
+        # wherever this platform's monotonic epoch happens to sit instead of
+        # depending on it being far from zero. It also means the gate's
+        # subtraction is ``inf`` on the first step, which clears any period at
+        # all - see ``_stream_enabled`` below.
+        _stream_state = {"last": float("-inf")}
+        from strands_robots.mesh.session import stream_min_period_from_env
+
+        # inf when step telemetry is off / misconfigured. A bare division here
+        # killed run_policy hook setup on STRANDS_MESH_STREAM_HZ=0.
+        _stream_min_period = stream_min_period_from_env()
+        # An infinite period is the operator's opt-out, and no finite elapsed
+        # time reaches it - but the sentinel above is below every reading, so
+        # the subtraction alone would read ``inf >= inf`` and let exactly one
+        # publish per rollout past the opt-out. The period is therefore read
+        # directly, once here rather than on every step.
+        _stream_enabled = math.isfinite(_stream_min_period)
+
+        def _hook(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
+            # Cooperative cancellation: stop_policy flips this flag.
+            if not robot.policy_running:
+                raise CooperativeStop(f"Policy stopped on '{robot_name}'")
+
+            robot.policy_steps = step + 1
+
+            if _mesh is not None and _stream_enabled:
+                # ``time.monotonic()``: this is an elapsed interval, and it
+                # carries its own base forward as it goes - each publish
+                # records when it happened and the next is due a period
+                # later. On ``time.time()`` a backward wall-clock step (an
+                # NTP correction, a ``date -s``, a resume from suspend)
+                # landing between two publishes made the difference
+                # negative, so the throttle refused every later step until
+                # the date caught up. The gaps that did land stay correctly
+                # spaced, so the shortfall is indistinguishable afterwards
+                # from a rollout that simply ran for less time. The
+                # hardware control loop throttles the same publish on the
+                # same period and already reads this clock.
+                _now = time.monotonic()
+                if _now - _stream_state["last"] >= _stream_min_period:
+                    _stream_state["last"] = _now
+                    try:
+                        _mesh.publish_step(step, observation, action, instruction=instruction)
+                    except Exception:  # noqa: BLE001 - telemetry must not kill the rollout
+                        pass
+
+            record_frame(step, observation, action)
+
         return _hook
 
     def run_policy(
@@ -6898,7 +6994,7 @@ class MuJoCoSimEngine(
         policy_config: dict[str, Any] | None = None,
         instruction: str = "",
         duration: float = 10.0,
-        control_frequency: float = 50.0,
+        control_frequency: float | None = None,
         action_horizon: int = 8,
         fast_mode: bool = False,
         video: dict[str, Any] | None = None,
@@ -7003,7 +7099,7 @@ class MuJoCoSimEngine(
         policies: dict[str, "Policy"],
         instructions: dict[str, str] | str = "",
         duration: float = 10.0,
-        control_frequency: float = 50.0,
+        control_frequency: float | None = None,
         action_horizon: int | dict[str, int] = _DEFAULT_ACTION_HORIZON,
         n_steps: int | None = None,
         max_steps: int | None = None,
@@ -7118,6 +7214,7 @@ class MuJoCoSimEngine(
         # hand-rolled check only fired on the n_steps path, leaving the default
         # duration path to compute total_steps = int(duration * frequency) = 0
         # and report a rollout that never ran as a success.
+        control_frequency = self._resolve_control_frequency(control_frequency)
         if err := self._validate_positive_frequency(control_frequency, "run_multi_policy"):
             return err
         if err := self._validate_recording_rate(control_frequency, "run_multi_policy"):
@@ -7616,13 +7713,28 @@ class MuJoCoSimEngine(
             # exists to prevent, surviving in the one branch that read the loop
             # variable directly.
             reported_unknown = _reported_param_name(unknown[0], self._FIELD_ALIASES, received)
-            valid_sorted = sorted(
-                _reported_param_name(param, self._FIELD_ALIASES, received) for param in method_param_names - {"action"}
-            )
+            # The "Valid:" list is what the caller will pick from next, so it
+            # names only parameters a tool call can carry. A method may also
+            # take a callback or a live object (``observer``, ``stop_when``,
+            # ``on_frame``, ``success_fn``, ``policy_object``) for the Python
+            # caller; listing those to a model that just sent ``policy=`` sends
+            # it to keys it cannot fill, and the one it needs
+            # (``policy_provider`` / ``policy_config``) is buried between them.
+            reachable = {name for name in method_param_names - {"action"} if _tool_call_can_carry(named_params[name])}
+            valid_sorted = sorted(_reported_param_name(param, self._FIELD_ALIASES, received) for param in reachable)
+            # ...and the nearest of them is named, the way an unknown action or
+            # an unknown robot already is: ``policy`` is answered with
+            # ``policy_provider, policy_config`` instead of a 20-name list to
+            # scan.
+            hint = close_match_hint(reported_unknown, valid_sorted)
             return None, {
                 "status": "error",
                 "content": [
-                    {"text": (f"Unknown parameter '{reported_unknown}' for action '{action}'. Valid: {valid_sorted}")}
+                    {
+                        "text": (
+                            f"Unknown parameter '{reported_unknown}' for action '{action}'.{hint} Valid: {valid_sorted}"
+                        )
+                    }
                 ],
             }
 
@@ -8014,6 +8126,9 @@ class MuJoCoSimEngine(
             if exited:
                 self._prune_done_futures()
         if not was_running:
+            # The verdict is right and the silence was not: a rollout that died
+            # on its first inference reads exactly like one that completed. The
+            # shared renderer carries that reason and the in-flight population.
             msg = self._was_not_running_msg(robot_name)
         elif exited is False:
             msg = (

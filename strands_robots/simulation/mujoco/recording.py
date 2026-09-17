@@ -266,6 +266,15 @@ class RecordingMixin(DatasetRecordingMixin):
         ):
             return error
 
+        # A second start while one recording is live used to fall through: it
+        # replaced the recorder object (the frames buffered since the last
+        # save_episode went with it - never saved, never mentioned) and, when
+        # the new dataset then refused (schema mismatch on resume), left
+        # ``recording`` False with the first session's frames gone too. Refuse
+        # up front and leave the live recording exactly as it was.
+        if error := self._already_recording_error("start_recording", repo_id):
+            return error
+
         self._world._backend_state["recording"] = True
         self._world._backend_state["trajectory"] = []
         self._world._backend_state["push_to_hub"] = push_to_hub
@@ -551,8 +560,9 @@ class RecordingMixin(DatasetRecordingMixin):
                             f"Frames are captured by a policy rollout - run_policy (one rollout; "
                             f"it closes NO episode, so call reset between rollouts or pass "
                             f"n_episodes=N in one call, else consecutive rollouts merge into one "
-                            f"episode), start_policy (async) or run_multi_policy (several robots "
-                            f"into one merged frame) - or by stepping a scripted motion: "
+                            f"episode), start_policy (async), eval_policy / evaluate_benchmark "
+                            f"(one dataset episode per evaluation episode) or run_multi_policy "
+                            f"(several robots into one merged frame) - or by stepping a scripted motion: "
                             f"set_joint_positions(hold=True) + step records one frame per 1/{fps}s "
                             f"of sim time. teleoperate and replay_episode do not feed the "
                             f"recorder. Then stop_recording to save the open episode"
