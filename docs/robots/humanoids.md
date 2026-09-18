@@ -123,13 +123,14 @@ motion-switcher open - reported as `motion_switcher_open_error` by the G1's
 name the same recipe and keep the SDK's own exception, so the module that is
 actually missing is in the text.
 
-The upstream checkout installed beside a `cyclonedds` wheel is what works. On
-macOS arm64 and x86_64 Linux (Python 3.12):
+The upstream checkout installed beside a `cyclonedds` wheel is what works, and
+the binding comes from this project's `[ros2]` extra - the one place the range is
+declared. On macOS arm64 and x86_64 Linux (Python 3.12):
 
 ```bash
-pip install 'cyclonedds>=0.10.2,<12'
+pip install 'strands-robots[ros2]'                # the cyclonedds binding
 git clone https://github.com/unitreerobotics/unitree_sdk2_python
-pip install --no-deps -e ./unitree_sdk2_python     # --no-deps skips the ==0.10.2 pin
+pip install --no-deps -e ./unitree_sdk2_python    # --no-deps skips the ==0.10.2 pin
 python -c "from unitree_sdk2py.core.channel import ChannelFactoryInitialize; print('ok')"
 ```
 
@@ -214,13 +215,15 @@ ends at the wrists - `pelvis` to hips/knees/ankles, and `waist_yaw_link` to
 feet. Mount on the torso with a local offset instead:
 
 ```python
-sim.add_camera(name="head", parent_body="g1/torso_link",
+sim = Robot("unitree_g1")
+sim.add_camera(name="head", parent_body="unitree_g1/torso_link",
                position=[0.08, 0.0, 0.35], target=[1.0, 0.0, 0.2])
 ```
 
 That puts the camera 0.35 m above the torso frame, roughly head height, and it
 rides with the torso through waist yaw and roll. An arm camera mounts the same
-way on a wrist link (`g1/left_wrist_yaw_link`).
+way on a wrist link (`unitree_g1/left_wrist_yaw_link`). Bodies are namespaced by
+the name passed to `Robot(...)`, so `Robot("g1")` would report `g1/torso_link`.
 
 ## See also
 

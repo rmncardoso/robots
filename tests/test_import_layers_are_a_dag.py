@@ -180,6 +180,152 @@ class TestTheContract:
         ]
         assert offenders == []
 
+    def test_no_unitree_driver_reaches_into_the_g1_verb_package(self, graph: Any) -> None:
+        """The DDS transport three drivers share is theirs, not a verb package's.
+
+        Graded across all three import kinds rather than the runtime graph
+        alone: a late import of the transport from inside a driver method is the
+        same inversion, deferred to first call, and the Go2's motion-switcher
+        read is exactly that shape.
+        """
+        offenders = sorted(
+            (importer, target)
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            if importer.startswith("strands_robots.drivers.")
+            for target in targets
+            if target == "strands_robots.tools.g1" or target.startswith("strands_robots.tools.g1.")
+        )
+        assert offenders == []
+
+    def test_the_path_sandbox_reads_nothing_from_the_package(self, graph: Any) -> None:
+        """A core guard is standard-library-only, which is what lets it sit there.
+
+        ``_path_validation`` is the sandbox every filesystem-writing surface runs
+        a caller's directory and file name through - ``training/_validate`` and
+        three tool modules - so it belongs under the lowest of them rather than
+        beside the one that first needed it. It earns ``core`` by importing
+        nothing internal, in any of the three kinds: an internal import here
+        would either invert the graph or make this guard's own import order
+        load-bearing.
+        """
+        sandbox = "strands_robots._path_validation"
+        assert sandbox in graph.modules
+        assert mod.layer_of(sandbox) == mod.LAYER_NAMES.index("core")
+        for kind in ("runtime", "typing_only", "late"):
+            reads = set(getattr(graph, kind).get(sandbox, frozenset()))
+            assert reads == set(), f"{kind} imports from a core guard: {sorted(reads)}"
+        importers = {
+            importer
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            if sandbox in targets
+        }
+        assert len(importers) >= 4, f"only {sorted(importers)} read the sandbox, so the rule above is vacuous"
+
+    def test_the_operator_gate_sits_below_every_caller_that_asks_a_human(self, graph: Any) -> None:
+        """The approval decision is core, not a helper of the package that wrote it.
+
+        ``_command_gate`` is the one owner of the blocklist, the operator
+        interrupt and the fail-closed rule; ``_hitl_audit`` is the one owner of
+        the row that records the answer. Six tool modules and ``hardware_robot``
+        share them, so the pair belongs under the lowest of those callers: a gate
+        that lives above one of its callers is a safety decision that caller
+        reaches up for, or copies.
+
+        Neither reads anything above ``core`` at import time. The audit row's one
+        upward read - the mesh safety log it writes through - is deferred to the
+        call and pinned here as exactly that, so a second upward dependency
+        cannot join it unnoticed, and moving it to module scope fails.
+        """
+        core = mod.LAYER_NAMES.index("core")
+        deferred = {
+            "strands_robots._command_gate": set(),
+            "strands_robots._hitl_audit": {"strands_robots.mesh.audit"},
+        }
+        for name, allowed_late in deferred.items():
+            assert name in graph.modules
+            assert mod.layer_of(name) == core, f"{name} is not in core"
+            for kind in ("runtime", "typing_only"):
+                above = sorted(t for t in getattr(graph, kind).get(name, frozenset()) if mod.layer_of(t) != core)
+                assert above == [], f"{name} has a {kind} import above core: {above}"
+            late = {t for t in graph.late.get(name, frozenset()) if mod.layer_of(t) != core}
+            assert late == allowed_late, f"{name} defers to {sorted(late)}, not {sorted(allowed_late)}"
+        callers = {
+            mod.LAYER_NAMES[mod.layer_of(importer)]
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            for name in deferred
+            if name in targets
+        }
+        assert {"app", "tools"} <= callers, f"only {sorted(callers)} ask a human, so the rule above is vacuous"
+
+    def test_no_layer_below_app_reaches_into_it(self, graph: Any) -> None:
+        """The ``app`` layer is a consumer of the package, not a dependency of it.
+
+        ``app`` is where the hosts live - the hardware ``Robot``, the rollout
+        runner, teleoperation, recording - so every layer under it exists to be
+        composed by one. Three runtime edges pointed the other way, and each was
+        a contract stored with its first host rather than under all of them: the
+        teleoperation mixin (read by the Device Connect sim driver and the MuJoCo
+        ``Simulation`` as well as by ``Robot``) and the recording frame error
+        (raised in ``app``, caught by the rollout drivers a layer down).
+        """
+        app = mod.LAYER_NAMES.index("app")
+        offenders = sorted(edge for edge in mod.upward_edges(graph) if mod.layer_of(edge[1]) == app)
+        assert offenders == [], f"a layer below app imports one of its modules: {offenders}"
+
+    @pytest.mark.parametrize(
+        ("name", "layer", "deferred_above", "caller_layers"),
+        [
+            (
+                "strands_robots.recording_errors",
+                "core",
+                frozenset(),
+                frozenset({"sim|policies", "app"}),
+            ),
+            (
+                "strands_robots.teleop_mixin",
+                "drivers|mesh",
+                frozenset({"strands_robots.teleoperator"}),
+                frozenset({"drivers|mesh", "sim|policies", "app"}),
+            ),
+        ],
+    )
+    def test_a_contract_several_layers_share_sits_under_all_of_them(
+        self,
+        graph: Any,
+        name: str,
+        layer: str,
+        deferred_above: frozenset[str],
+        caller_layers: frozenset[str],
+    ) -> None:
+        """Placement, the reads that justify it, and the callers that need it.
+
+        Each row states the same three things the ``_command_gate`` pin above
+        states for the operator decision. The module sits in the named layer; it
+        reads nothing above that layer at import time, which is what lets it sit
+        there; and its callers span more than one layer, which is why it has to.
+        A deferred read above the layer is listed explicitly rather than allowed
+        in general - the mixin's ``teleoperator`` read is late because that module
+        imports lerobot, and promoting it to module scope has to fail here.
+        """
+        assert name in graph.modules
+        assert mod.LAYER_NAMES[mod.layer_of(name)] == layer
+        index = mod.LAYER_NAMES.index(layer)
+        for kind in ("runtime", "typing_only"):
+            above = sorted(t for t in getattr(graph, kind).get(name, frozenset()) if mod.layer_of(t) > index)
+            assert above == [], f"{name} has a {kind} import above {layer}: {above}"
+        late = {t for t in graph.late.get(name, frozenset()) if mod.layer_of(t) > index}
+        assert late == set(deferred_above), f"{name} defers to {sorted(late)}, not {sorted(deferred_above)}"
+        callers = {
+            mod.LAYER_NAMES[mod.layer_of(importer)]
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            if name in targets
+        }
+        assert callers == set(caller_layers), f"{name} is read from {sorted(callers)}, not {sorted(caller_layers)}"
+
     def test_the_script_reports_the_tree_as_conforming(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert mod.main([]) == 0
         assert "OK: no runtime cycle, no undeclared inversion" in capsys.readouterr().out

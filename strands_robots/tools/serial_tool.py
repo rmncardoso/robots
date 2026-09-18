@@ -45,7 +45,7 @@ that already fits.
 Operator approval: the four actions that write to the bus - ``send``,
 ``send_read``, ``feetech_position`` and ``feetech_velocity`` - stop for a human
 BEFORE the port is opened, through the same decision path the ROS transports
-use (:func:`~strands_robots.tools._command_gate.gate_motion`).
+use (:func:`~strands_robots._command_gate.gate_motion`).
 ``STRANDS_SERIAL_COMMAND_ALLOW`` (comma-separated action names, or ``*``)
 pre-approves, ``BYPASS_TOOL_CONSENT=true`` lifts the gate with a WARNING,
 otherwise the operator is prompted through the tool context and, with none
@@ -66,6 +66,7 @@ from typing import Any
 from strands import tool
 from strands.types.tools import ToolContext
 
+from strands_robots._command_gate import gate_motion
 from strands_robots.drivers.feetech.protocol import (
     BROADCAST_ID,
     MAX_GOAL_POSITION,
@@ -74,8 +75,9 @@ from strands_robots.drivers.feetech.protocol import (
     Register,
     encode_word,
     max_magnitude,
+    ping_packet,
+    write_packet,
 )
-from strands_robots.tools._command_gate import gate_motion
 from strands_robots.utils import (
     finite_number_error,
     non_negative_count_error,
@@ -463,13 +465,6 @@ def serial_tool(
             )
         return ports
 
-    def build_feetech_packet(motor_id: int, instruction: int, params: list[int]) -> bytes:
-        """Build Feetech servo protocol packet."""
-        packet = [0xFF, 0xFF, motor_id, len(params) + 2, instruction] + params
-        checksum = ~sum(packet[2:]) & 0xFF
-        packet.append(checksum)
-        return bytes(packet)
-
     try:
         if action == "list_ports":
             ports = list_serial_ports()
@@ -589,9 +584,9 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id and position required"}]}
 
-            # Feetech position command: INST_WRITE (0x03), Goal_Position address (0x2A)
-            params = [0x2A, *encode_word(position)]
-            packet = build_feetech_packet(motor_id, 0x03, params)
+            # The broadcast is allowed here: this write expects no reply, and
+            # ``_motor_id_error`` refuses it only for the actions that read one.
+            packet = write_packet(motor_id, Register.GOAL_POSITION, encode_word(position), allow_broadcast=True)
             ser.write(packet)
             ser.close()
 
@@ -610,9 +605,7 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id and velocity required"}]}
 
-            # Feetech velocity command: Goal_Velocity address (0x2E)
-            params = [0x2E, *encode_word(velocity)]
-            packet = build_feetech_packet(motor_id, 0x03, params)
+            packet = write_packet(motor_id, Register.GOAL_VELOCITY, encode_word(velocity), allow_broadcast=True)
             ser.write(packet)
             ser.close()
 
@@ -623,8 +616,7 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id required"}]}
 
-            # Feetech ping command
-            packet = build_feetech_packet(motor_id, 0x01, [])  # INST_PING
+            packet = ping_packet(motor_id)
             ser.write(packet)
 
             time.sleep(0.1)

@@ -34,7 +34,7 @@ import strands_robots.drivers.reachy as reachy_mod
 from strands_robots.drivers import get_native_driver_class, resolve_driver
 from strands_robots.drivers.base import HardwareDriver, missing_driver_members
 from strands_robots.drivers.reachy import ReachyDriver
-from strands_robots.tools.reachy import HEAD_BODY_YAW_DELTA_LIMIT_DEG, MOTION_ENVELOPE_DEG
+from strands_robots.drivers.reachy_envelope import HEAD_BODY_YAW_DELTA_LIMIT_DEG, MOTION_ENVELOPE_DEG
 
 # A status body shaped like the daemon's: the variant flag the driver reads, plus
 # fields it passes over. ``wireless_version=False`` is a Lite, which is the
@@ -300,13 +300,11 @@ class TestTheDaemonProbeDecidesTheConnection:
         assert link.build_calls == 1
         assert driver._link is link
 
-    def test_a_wireless_without_a_transport_is_refused_by_name(self) -> None:
-        # Exercises the real _build_link rather than the double, because the
-        # refusal *is* the thing under test.
+    def test_a_wireless_without_a_transport_gets_the_websocket_link(self) -> None:
+        from strands_robots.device_connect.reachy_transport import WebSocketLink
+
         driver = ReachyDriver(port="reachy-a.local", transport=None)
-        link = driver._build_link(is_lite=False)
-        assert isinstance(link, str)
-        assert "Zenoh" in link and "transport=" in link
+        assert isinstance(driver._build_link(is_lite=False), WebSocketLink)
 
     def test_a_lite_gets_the_websocket_link(self) -> None:
         from strands_robots.device_connect.reachy_transport import WebSocketLink
@@ -530,7 +528,7 @@ class TestTheEnvelopeRefusesWhatTheNeckCannotDo:
         # ``rpy_to_pose`` and puts a matrix of nans on the link, with the call
         # reported as a success.
         driver, _, link = _connected(monkeypatch)
-        from strands_robots.tools.reachy import envelope_error
+        from strands_robots.drivers.reachy_envelope import envelope_error
 
         assert envelope_error({key: value}, "send_action") is None, (
             f"{key} is bounded after all; this test no longer grades the driver's own pass"
@@ -547,7 +545,7 @@ class TestTheEnvelopeRefusesWhatTheNeckCannotDo:
         import inspect
 
         source = inspect.getsource(reachy_mod)
-        assert "from strands_robots.tools.reachy import envelope_error" in source
+        assert "from strands_robots.drivers.reachy_envelope import envelope_error" in source
         for limit in ("40.0", "160.0", "65.0"):
             assert limit not in source, f"{limit} is restated in the driver instead of imported"
 
@@ -564,7 +562,7 @@ class TestActionsReachTheWireInTheDaemonsUnits:
         driver, _, link = _connected(monkeypatch)
         assert driver.send_action({"antenna_left": 60.0, "antenna_right": -60.0})["status"] == "success"
         assert link.commands == [
-            {"antennas_joint_positions": [pytest.approx(math.radians(60)), pytest.approx(math.radians(-60))]}
+            {"antennas_joint_positions": [pytest.approx(math.radians(-60)), pytest.approx(math.radians(60))]}
         ]
 
     def test_one_antenna_still_sends_both_because_the_daemon_takes_a_pair(
@@ -572,7 +570,7 @@ class TestActionsReachTheWireInTheDaemonsUnits:
     ) -> None:
         driver, _, link = _connected(monkeypatch)
         driver.send_action({"antenna_left": 30.0})
-        assert link.commands[0]["antennas_joint_positions"][1] == pytest.approx(0.0)
+        assert link.commands[0]["antennas_joint_positions"] == pytest.approx([0.0, math.radians(30)])
 
     def test_a_head_axis_becomes_a_four_by_four_pose(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from strands_robots.device_connect.reachy_transport import rpy_to_pose

@@ -44,29 +44,38 @@ PACKAGE = "strands_robots"
 #: module's layer is its first path component under the package, so a subpackage
 #: never disagrees with its parent.
 #:
-#: The two placements that are a judgement rather than a reading of the tree:
+#: The placements that are a judgement rather than a reading of the tree:
 #: ``assets`` sits with ``registry`` because it resolves the asset paths the
-#: registry declares, and ``streaming_dataset`` sits with ``dataset_recorder``
-#: in ``app`` because it is the same recording concern written incrementally.
+#: registry declares; ``streaming_dataset`` sits with ``dataset_recorder`` in
+#: ``app`` because it is the same recording concern written incrementally; and
+#: ``teleop_mixin`` sits with ``drivers|mesh`` because it is an input-device
+#: concern shared by three hosts in three layers - the hardware ``Robot``, the
+#: MuJoCo ``Simulation`` and the Device Connect sim driver - so it belongs under
+#: the lowest of them, which is where its own module-scope imports already put
+#: it (``utils`` alone).
 LAYERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "core",
         (
             "_async_utils",
+            "_command_gate",
             "_dyld",
+            "_hitl_audit",
             "_mesh_switch",
             "_mujoco_gl",
+            "_path_validation",
             "_serial_discovery",
             "bus_access",
             "episode_labels",
             "locomotion_envelope",
+            "recording_errors",
             "refusal_codes",
             "rendering",
             "utils",
         ),
     ),
     ("registry", ("assets", "registry")),
-    ("drivers|mesh", ("device_connect", "drivers", "mesh", "ros_telemetry", "rtps")),
+    ("drivers|mesh", ("device_connect", "drivers", "mesh", "ros_telemetry", "rtps", "teleop_mixin")),
     ("sim|policies", ("inference", "policies", "simulation", "training")),
     (
         "app",
@@ -80,7 +89,6 @@ LAYERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "hardware_rtps_bridge",
             "robot",
             "streaming_dataset",
-            "teleop_mixin",
             "teleoperator",
             "verify_dataset",
         ),
@@ -100,33 +108,12 @@ LAYER_NAMES: tuple[str, ...] = tuple(name for name, _members in LAYERS)
 #: not here, and on an entry here that no longer exists, so the roster can only
 #: shrink deliberately.
 KNOWN_UPWARD_EDGES: tuple[tuple[str, str], ...] = (
-    # drivers|mesh -> tools. The Unitree DDS transport and the Reachy envelope
-    # check are driver machinery that landed under the agent-tool package that
-    # first needed it; the mesh robots call the ``@tool`` entry point instead of
-    # a transport of their own.
-    ("strands_robots.device_connect.reachy_mini_driver", "strands_robots.tools.reachy"),
-    ("strands_robots.drivers.booster", "strands_robots.tools.g1._g1_common"),
-    ("strands_robots.drivers.g1", "strands_robots.tools.g1"),
-    ("strands_robots.drivers.g1", "strands_robots.tools.g1._dds_engine"),
-    ("strands_robots.drivers.g1", "strands_robots.tools.g1._g1_common"),
-    ("strands_robots.drivers.g1", "strands_robots.tools.g1._motion_switcher"),
-    ("strands_robots.drivers.go2", "strands_robots.tools.g1._dds_engine"),
-    ("strands_robots.drivers.go2", "strands_robots.tools.g1._g1_common"),
-    ("strands_robots.drivers.reachy", "strands_robots.tools.reachy"),
+    # drivers|mesh -> tools. The mesh robots call the ``@tool`` entry point
+    # instead of a transport of their own.
     ("strands_robots.mesh.ackermann_robot", "strands_robots.tools.use_ros"),
     ("strands_robots.mesh.ros_bridge", "strands_robots.tools.use_ros"),
     ("strands_robots.mesh.rosbridge_robot", "strands_robots.tools.use_rosbridge"),
     ("strands_robots.mesh.rtps_robot", "strands_robots.tools.use_rtps"),
-    # drivers|mesh -> app. Device Connect is scheduled for removal, which takes
-    # this edge with it.
-    ("strands_robots.device_connect.sim_driver", "strands_robots.teleop_mixin"),
-    # sim|policies -> app.
-    ("strands_robots.simulation.mujoco.simulation", "strands_robots.teleop_mixin"),
-    ("strands_robots.simulation.policy_runner", "strands_robots.dataset_recorder"),
-    # sim|policies -> tools, app -> tools. Two private helpers - the path
-    # sandbox and the motion gate - that every layer needs and only one owns.
-    ("strands_robots.hardware_robot", "strands_robots.tools._command_gate"),
-    ("strands_robots.training._validate", "strands_robots.tools._path_validation"),
 )
 
 
