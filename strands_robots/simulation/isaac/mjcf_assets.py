@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import xml.etree.ElementTree as ET
 
 from strands_robots.utils import get_base_dir
 
@@ -88,6 +89,112 @@ def robot_usd_cache_dir() -> str:
     return cache_dir
 
 
+#: MJCF ``<asset>`` children that name a file on disk. ``<mesh>`` is the one that
+#: matters for PhysX, and the rest are hashed for the same reason: a texture or a
+#: heightfield swapped under a byte-identical entry directory is a different
+#: robot, and nothing downstream would report it.
+_ASSET_FILE_TAGS: tuple[str, ...] = ("mesh", "texture", "hfield", "skin")
+
+
+#: The file whose presence makes a cache entry usable. Written INSIDE the staging
+#: directory and published by the rename, so a reader never observes an entry
+#: without one.
+_MARKER_NAME = ".converted"
+
+
+def _read_marker(marker: str) -> str | None:
+    """The USD path a completed cache entry records, or ``None``.
+
+    ``None`` covers every not-usable state without distinguishing them, because
+    the caller's action is the same for all of them: an absent marker, an
+    unreadable one, an empty one, and one naming a file that is no longer there.
+    """
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            cached = fh.read().strip()
+    except OSError:
+        return None
+    return cached if cached and os.path.isfile(cached) else None
+
+
+def _referenced_files(mjcf_path: str) -> list[str]:
+    """Every file *mjcf_path* pulls in, transitively and absolute.
+
+    An MJCF reaches outside its own directory in two ways, and the shipped
+    registry uses both (AGENTS.md > Registry conventions records the nested
+    layouts):
+
+    * ``<include file="../so_arm100/so_arm100.xml"/>`` - ``lekiwi``'s entry point
+      does this, so the whole arm's joints and geoms live in a sibling directory.
+    * ``<compiler meshdir="../assets/meshes"/>`` - ``asimov_v0`` does this, so
+      every mesh PhysX simulates is outside the entry directory.
+
+    Resolution follows MuJoCo's own rules, matching
+    :func:`strands_robots.simulation.isaac.loaders._mjcf_model_toplevel` and
+    :func:`~strands_robots.simulation.isaac.loaders._parse_mjcf_mesh_assets`: an
+    include path is relative to the *including* file, while ``<compiler>`` and
+    ``<asset>`` are model-global so a mesh directory declared in an included
+    fragment still resolves against the *entry* file's directory, and the last
+    declaration in document order wins with ``meshdir`` beating ``assetdir``.
+
+    A missing, unreadable, malformed or cyclic reference contributes its path and
+    no bytes rather than raising: this is a cache key, and refusing to compute one
+    would fail a conversion the vendor importer is perfectly able to report on
+    itself. The path still enters the manifest, so two trees differing only in a
+    broken reference do not collide.
+    """
+    entry = os.path.normpath(os.path.abspath(mjcf_path))
+    entry_dir = os.path.dirname(entry)
+
+    includes: list[str] = []
+    compiler_dirs: list[str] = []
+    asset_files: list[str] = []
+
+    def _walk(path: str, base_dir: str, seen: frozenset[str]) -> None:
+        try:
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, OSError):
+            return
+        for element in root.iter():
+            if element.tag == "compiler":
+                for attr in ("meshdir", "assetdir", "texturedir"):
+                    value = element.get(attr)
+                    if value:
+                        compiler_dirs.append(value)
+            elif element.tag in _ASSET_FILE_TAGS:
+                value = element.get("file")
+                if value:
+                    asset_files.append(value)
+            elif element.tag == "include":
+                value = element.get("file")
+                if not value:
+                    continue
+                target = os.path.normpath(
+                    os.path.abspath(value if os.path.isabs(value) else os.path.join(base_dir, value))
+                )
+                if target in seen:
+                    continue
+                includes.append(target)
+                _walk(target, os.path.dirname(target), seen | {target})
+
+    _walk(entry, entry_dir, frozenset({entry}))
+
+    # ``meshdir`` wins over ``assetdir`` within one element and the last element
+    # wins overall, so the effective base is the last directory collected; with
+    # none declared, MuJoCo resolves a relative asset against the model file's
+    # own directory.
+    asset_base = entry_dir
+    for declared in compiler_dirs:
+        asset_base = declared if os.path.isabs(declared) else os.path.join(entry_dir, declared)
+
+    resolved = list(includes)
+    for name in asset_files:
+        resolved.append(
+            os.path.normpath(os.path.abspath(name if os.path.isabs(name) else os.path.join(asset_base, name)))
+        )
+    return resolved
+
+
 def _asset_digest(mjcf_path: str) -> str:
     """A digest covering the description *and the files it pulls in*.
 
@@ -103,28 +210,60 @@ def _asset_digest(mjcf_path: str) -> str:
     a cache hit; it is bounded by the size of one robot description and is
     negligible beside the conversion it guards, which takes seconds.
 
+    **And every file it references from OUTSIDE that directory**, because the
+    directory walk alone is not the file set the conversion reads. The shipped
+    registry's nested layouts reach out of it by design: ``lekiwi``'s entry point
+    ``<include>``s ``../so_arm100/so_arm100.xml``, and ``asimov_v0`` declares
+    ``meshdir="../assets/meshes"`` - so a change to the arm's joints or to any
+    mesh left the key identical and served the USD built from the *old*
+    description, silently, under ``status: success``. That is the exact staleness
+    the paragraph above says this digest exists to prevent, and the wrong
+    ``so_arm100.xml`` is a wrong joint vocabulary, which defeats the
+    joint-name-parity guarantee this module is here to provide. The collision
+    holds in the other direction too: two trees whose entry directories are
+    byte-identical but whose siblings differ shared one key.
+
+    The referenced closure is a *superset* of the walk rather than a replacement
+    for it. A file inside the entry directory is already covered by relative path
+    and content, so only the outside ones are added, and each contributes the
+    path it resolved to relative to that directory (``../so_arm100/so_arm100.xml``)
+    - a relative spelling so two machines with the same layout agree, which is the
+    same reason the walk below sorts.
+
     Sorting the manifest is what makes the digest reproducible: :func:`os.walk`
     does not promise an order, so an unsorted manifest would key the same bytes
     differently on two machines and miss every cache entry.
     """
     root = os.path.dirname(os.path.abspath(mjcf_path))
     manifest = hashlib.sha256()
+
+    def _fold(full: str, label: str) -> None:
+        manifest.update(label.encode("utf-8", "surrogateescape"))
+        try:
+            with open(full, "rb") as fh:
+                for chunk in iter(lambda fh=fh: fh.read(1 << 20), b""):  # type: ignore[misc]
+                    manifest.update(chunk)
+        except OSError:
+            # A file that cannot be read cannot contribute its bytes, and
+            # skipping it silently would let two different trees share a
+            # digest. Fold the failure itself in, so an unreadable file is a
+            # distinct key rather than an absent one.
+            manifest.update(b"\x00<unreadable>")
+
+    walked: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for filename in sorted(filenames):
             full = os.path.join(dirpath, filename)
-            rel = os.path.relpath(full, root)
-            manifest.update(rel.encode("utf-8", "surrogateescape"))
-            try:
-                with open(full, "rb") as fh:
-                    for chunk in iter(lambda fh=fh: fh.read(1 << 20), b""):  # type: ignore[misc]
-                        manifest.update(chunk)
-            except OSError:
-                # A file that cannot be read cannot contribute its bytes, and
-                # skipping it silently would let two different trees share a
-                # digest. Fold the failure itself in, so an unreadable file is a
-                # distinct key rather than an absent one.
-                manifest.update(b"\x00<unreadable>")
+            walked.add(os.path.normpath(os.path.abspath(full)))
+            _fold(full, os.path.relpath(full, root))
+
+    # Then whatever the description reaches for outside that tree. Sorted for the
+    # same reproducibility reason, and de-duplicated so a mesh named twice does
+    # not fold twice.
+    for referenced in sorted(set(_referenced_files(mjcf_path)) - walked):
+        _fold(referenced, os.path.relpath(referenced, root))
+
     # The description's own path within the tree matters: one directory can hold
     # several entry points (Menagerie ships ``scene.xml`` beside the bare robot
     # body), and they convert to different USD.
@@ -217,12 +356,10 @@ def convert_mjcf_to_usd(
     # The layout the importer produces, recorded by the marker below rather than
     # recomputed: the vendor writes ``<root>/<stem>/<stem>.usda`` today, and a
     # future release that changes that would make a derived path silently wrong.
-    marker = os.path.join(target_root, ".converted")
-    if os.path.isfile(marker):
-        with open(marker, encoding="utf-8") as fh:
-            cached = fh.read().strip()
-        if cached and os.path.isfile(cached):
-            return cached
+    marker = os.path.join(target_root, _MARKER_NAME)
+    cached = _read_marker(marker)
+    if cached is not None:
+        return cached
 
     try:
         from isaacsim.asset.importer.mjcf import (  # type: ignore[import-not-found]
@@ -240,10 +377,11 @@ def convert_mjcf_to_usd(
         ) from exc
 
     # Convert into a sibling staging directory, then rename into place, so a
-    # crashed or half-written conversion is never visible under the real key.
-    # ``os.replace`` refuses a non-empty destination directory, so the marker
-    # written last is what makes an entry usable and the rename only has to be
-    # atomic enough that no reader sees a directory without one.
+    # crashed or half-written conversion is never visible under the real key. The
+    # marker is written inside staging before that rename, so the rename publishes
+    # a complete entry and no reader can see a directory without one -
+    # :func:`_install_entry` owns the rest of that contract, including what to do
+    # when another process has already published this key.
     staging = os.path.join(out_dir, f".{key}.{os.getpid()}.tmp")
     _remove_tree(staging)
     os.makedirs(staging, exist_ok=True)
@@ -267,12 +405,85 @@ def convert_mjcf_to_usd(
             f"return a path nothing can reference."
         )
 
-    _remove_tree(target_root)
-    os.replace(staging, target_root)
     final = os.path.join(target_root, os.path.relpath(resolved, staging))
-    with open(marker, "w", encoding="utf-8") as fh:
+    # The marker goes INSIDE staging, naming the path it will have once installed,
+    # so the rename below publishes a COMPLETE entry in one step. Written after the
+    # rename instead, there was a window in which ``target_root`` existed with no
+    # marker: a concurrent reader saw an unusable entry and converted again for
+    # nothing, and a crash in the window left a torn entry behind permanently.
+    with open(os.path.join(staging, _MARKER_NAME), "w", encoding="utf-8") as fh:
         fh.write(final)
-    return final
+
+    return _install_entry(staging, target_root, marker, final, mjcf_path)
+
+
+def _install_entry(staging: str, target_root: str, marker: str, final: str, mjcf_path: str) -> str:
+    """Publish *staging* as the entry at *target_root*, or defer to the winner.
+
+    **Never deletes a completed entry.** The cache root is shared cross-process -
+    ``~/.strands_robots/asset_cache/usd_robots`` - and the pid-suffixed staging
+    directory says concurrent converters are an intended case, so two processes
+    that both miss the marker for one key both convert. The install used to
+    ``_remove_tree(target_root)`` before renaming, which means the loser deleted
+    the winner's finished entry *after* the winner had returned its path and
+    referenced that USD into a live stage. USD composes payloads lazily, so a read
+    landing in the delete-then-rename window failed, or composed the robot without
+    its meshes, in a process whose own conversion was entirely correct - a
+    nondeterministic stage-load error attributable to nobody.
+
+    Both converters produce identical content for a given key, so the winner's
+    entry is always the right answer and losing the race costs only the staging
+    directory. ``os.rename`` onto an existing non-empty directory is refused by
+    the OS (``ENOTEMPTY``, or ``FileExistsError`` on Windows), which is what makes
+    that check atomic rather than a test-then-act.
+
+    A torn ``target_root`` - a directory with no usable marker, left by a crash or
+    by an older build that wrote the marker after renaming - would otherwise make
+    the entry permanently uninstallable, since nothing deletes it any more. It is
+    moved aside to a pid-unique quarantine path with a single ``os.rename``, which
+    is itself atomic: whichever process gets there first moves it, and the others
+    see their rename fail and re-read the marker. The quarantined directory is then
+    removed, because at that point no live reader can reach it by name.
+    """
+    try:
+        os.rename(staging, target_root)
+        return final
+    except OSError:
+        pass
+
+    # Lost the race, or something is already at the target.
+    winner = _read_marker(marker)
+    if winner is not None:
+        _remove_tree(staging)
+        return winner
+
+    # Nothing usable is there, so it is torn. Move it aside and try once more.
+    quarantine = f"{target_root}.torn.{os.getpid()}"
+    try:
+        os.rename(target_root, quarantine)
+    except OSError:
+        # Another process moved it, or installed over it, in the meantime.
+        winner = _read_marker(marker)
+        if winner is not None:
+            _remove_tree(staging)
+            return winner
+    else:
+        _remove_tree(quarantine)
+
+    try:
+        os.rename(staging, target_root)
+        return final
+    except OSError:
+        winner = _read_marker(marker)
+        if winner is not None:
+            _remove_tree(staging)
+            return winner
+        _remove_tree(staging)
+        raise RuntimeError(
+            f"converted {mjcf_path!r} but could not install the cache entry at "
+            f"{target_root!r}, and no other process left a usable one there. "
+            f"Refusing to return a path that may not survive."
+        ) from None
 
 
 def _resolve_produced(produced: object, staging: str, stem: str) -> str | None:
@@ -316,13 +527,11 @@ def _remove_tree(path: str) -> None:
         try:
             os.unlink(path)
         except OSError:
-            # Best-effort, and not silent where it would matter. The only
-            # caller that removes something load-bearing is the
-            # ``_remove_tree(target_root)`` immediately above ``os.replace``,
-            # and a removal that did not happen is reported there rather than
-            # here: renaming the staging directory onto a surviving file raises
-            # ``NotADirectoryError``, and onto a surviving directory raises
-            # ``OSError`` (``ENOTEMPTY``). Every other caller passes a staging
-            # entry, where a failed unlink leaks a temp path instead of
-            # corrupting the cache - the distinction this helper exists to keep.
+            # Best-effort, and now uniformly so: no caller removes a *completed*
+            # cache entry any more (:func:`_install_entry` renames rather than
+            # deletes), so every path through here passes either a staging
+            # directory or a quarantined torn one. A failed unlink on either
+            # leaks a temp path instead of corrupting the cache, which is the
+            # distinction this helper exists to keep - and the install's own
+            # rename reports separately if it could not publish.
             pass

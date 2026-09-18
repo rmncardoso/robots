@@ -305,16 +305,27 @@ class TestTheCacheLocation:
         assert str(tmp_path) in robot_usd_cache_dir()
 
 
-class TestTheToleratedUnlinkIsSafeBecauseTheRenameRefuses:
-    """``_remove_tree`` swallows ``OSError`` from ``os.unlink``, and that is only
-    sound while the one removal that is load-bearing stays in front of the rename.
+class TestTheToleratedUnlinkNeverRisksACompletedEntry:
+    """``_remove_tree`` swallows ``OSError`` from ``os.unlink``, and the reason it
+    is sound got stronger rather than disappearing.
 
-    Three of its four callers pass ``staging``, where a failed unlink leaks a temp
-    path. The fourth passes ``target_root`` - the real cache entry the conversion is
-    about to move into place - and tolerating *that* failure is safe only because
-    ``os.replace`` immediately after it refuses to rename onto an entry that is
-    still there, which ``convert_mjcf_to_usd`` already states at the top of the
-    staging block. These cells pin that reason so the tolerance cannot outlive it.
+    It used to rest on an *adjacency*: the one caller that removed something
+    load-bearing passed ``target_root`` - the real cache entry - and tolerating
+    that failure was safe only because the ``os.replace`` on the very next line
+    refused to rename onto an entry still sitting there.
+
+    That adjacency is gone, because the removal is. Deleting ``target_root`` was
+    itself the install race: the cache root is shared cross-process, so the loser
+    of a concurrent conversion deleted the *winner's* finished entry while a live
+    USD stage was still composing payloads out of it. :func:`_install_entry` now
+    renames rather than deletes, so **no caller passes a completed entry at all** -
+    every path through ``_remove_tree`` gets a staging directory or a quarantined
+    torn one, where a failed unlink leaks a temp path and corrupts nothing.
+
+    So the property pinned below is the absence of that caller, which is what the
+    tolerance now rests on, and it is a stronger claim than the ordering it
+    replaces: an ordering holds only where the two statements stay adjacent,
+    whereas this holds wherever the helper is called from.
 
     Scoped to this handler rather than to the tree: the package holds many
     tolerated swallows and their reasons are not one idiom, so a tree-wide rule
@@ -342,51 +353,71 @@ class TestTheToleratedUnlinkIsSafeBecauseTheRenameRefuses:
             "cannot tell a considered tolerance from a swallowed bug"
         )
 
-    def test_the_load_bearing_removal_is_the_statement_before_the_rename(self) -> None:
-        """The tolerance rests on this adjacency, so the adjacency is pinned."""
-        module = ast.parse(inspect.getsource(mjcf_assets))
-        convert = next(
-            node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "convert_mjcf_to_usd"
-        )
-        removals = [
-            index
-            for index, statement in enumerate(convert.body)
-            if isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Call)
-            and getattr(statement.value.func, "id", None) == "_remove_tree"
-            and statement.value.args
-            and getattr(statement.value.args[0], "id", None) == "target_root"
-        ]
-        assert len(removals) == 1, f"expected one target_root removal, found {len(removals)}"
+    def test_no_caller_removes_the_completed_cache_entry(self) -> None:
+        """The property the tolerance now rests on, over the whole module.
 
-        following = convert.body[removals[0] + 1]
-        assert isinstance(following, ast.Expr) and isinstance(following.value, ast.Call)
-        assert ast.unparse(following.value).startswith("os.replace("), ast.unparse(following)
+        ``target_root`` is the installed entry another process may be reading, so
+        a ``_remove_tree`` naming it is the install race itself rather than a
+        cleanup. Graded across every function here, not just the converter, so
+        re-introducing it in a helper is caught too.
+        """
+        module = ast.parse(inspect.getsource(mjcf_assets))
+
+        offenders = [
+            ast.unparse(node)
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "_remove_tree"
+            and node.args
+            and getattr(node.args[0], "id", None) == "target_root"
+        ]
+
+        assert offenders == [], (
+            f"a _remove_tree deletes the completed cache entry, which is the cross-process install race: {offenders}"
+        )
+
+    def test_every_removal_names_a_staging_or_quarantine_path(self) -> None:
+        """The positive half: what the surviving callers do pass."""
+        module = ast.parse(inspect.getsource(mjcf_assets))
+
+        named = {
+            getattr(node.args[0], "id", ast.unparse(node.args[0]))
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_remove_tree" and node.args
+        }
+
+        assert named, "no _remove_tree calls found; this sweep has stopped measuring"
+        assert named <= {"staging", "quarantine"}, f"a removal names something other than a temp path: {named}"
 
     def test_a_surviving_file_makes_the_rename_refuse(self, tmp_path) -> None:
-        """If the unlink of a file at ``target_root`` failed, the rename reports it."""
+        """The OS-level refusal the install's race check is built on.
+
+        ``_install_entry`` treats a failed ``os.rename`` as "another process
+        published this key first", so that refusal has to be the OS's rather than
+        a test-then-act of its own - which is what makes it atomic.
+        """
         staging = tmp_path / "staging"
         staging.mkdir()
         (staging / "probe.usda").write_text("#usda 1.0\n", encoding="utf-8")
         target = tmp_path / "entry"
         target.write_text("a file where the cache entry belongs", encoding="utf-8")
 
-        with pytest.raises(NotADirectoryError):
-            os.replace(str(staging), str(target))
+        with pytest.raises(OSError):
+            os.rename(str(staging), str(target))
 
         assert target.read_text(encoding="utf-8") == "a file where the cache entry belongs"
 
     def test_a_surviving_directory_makes_the_rename_refuse(self, tmp_path) -> None:
-        """And if ``rmtree(ignore_errors=True)`` left anything behind, likewise."""
+        """And a non-empty directory - the shape a completed rival entry has."""
         staging = tmp_path / "staging"
         staging.mkdir()
         (staging / "probe.usda").write_text("#usda 1.0\n", encoding="utf-8")
         target = tmp_path / "entry"
         target.mkdir()
-        (target / "leftover").write_text("survived the rmtree", encoding="utf-8")
+        (target / "leftover").write_text("a rival entry", encoding="utf-8")
 
         with pytest.raises(OSError) as exc:
-            os.replace(str(staging), str(target))
+            os.rename(str(staging), str(target))
 
-        assert exc.value.errno == errno.ENOTEMPTY
-        assert (target / "leftover").read_text(encoding="utf-8") == "survived the rmtree"
+        assert exc.value.errno in (errno.ENOTEMPTY, errno.EEXIST)
+        assert (target / "leftover").read_text(encoding="utf-8") == "a rival entry"
