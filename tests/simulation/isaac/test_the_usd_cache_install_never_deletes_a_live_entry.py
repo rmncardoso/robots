@@ -41,6 +41,7 @@ in the window on purpose rather than hoping to land in it.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import pathlib
 import threading
@@ -136,24 +137,22 @@ class TestTwoConcurrentConversionsBothEndUpWithAUsablePath:
         so one of these two paths stopped existing while its caller held it."""
         cache = str(tmp_path / "cache")
         importer.gate = threading.Barrier(2, timeout=10)
-        results: dict[int, str] = {}
-        errors: list[BaseException] = []
 
-        def _convert(index: int) -> None:
-            try:
-                results[index] = convert_mjcf_to_usd(mjcf, cache)
-            except BaseException as exc:  # noqa: BLE001 - reported below
-                errors.append(exc)
+        # ``concurrent.futures`` rather than a hand-rolled exception-marshal box.
+        # These threads are created here, so CPython's own ``_WorkItem.run``
+        # already holds the ``except BaseException`` this needs and
+        # ``Future.result()`` re-raises with object identity preserved - which
+        # AGENTS.md records as strictly better than the box, not merely quieter,
+        # and is why the box belongs only to a marshal onto an ALREADY-RUNNING
+        # foreign thread (``IsaacSimulation.run_on_main``).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(convert_mjcf_to_usd, mjcf, cache) for _ in range(2)]
+            # ``result()`` re-raises, so a conversion that failed fails this cell
+            # naming its own exception rather than an empty-list assertion.
+            paths = [future.result(timeout=20) for future in futures]
 
-        threads = [threading.Thread(target=_convert, args=(i,)) for i in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=20)
-
-        assert errors == [], f"a concurrent conversion raised: {errors!r}"
-        assert len(results) == 2
-        for index, path in results.items():
+        assert len(paths) == 2
+        for index, path in enumerate(paths):
             assert os.path.isfile(path), f"caller {index} was handed {path!r}, which does not exist"
 
     def test_they_agree_on_one_entry(self, importer: type[_Importer], mjcf: str, tmp_path: pathlib.Path) -> None:

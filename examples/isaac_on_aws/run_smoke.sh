@@ -12,8 +12,29 @@ REPO_ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET="strands-isaac-example-$ACCOUNT-$REGION"
 
+# One private directory for everything this run stages through the filesystem,
+# removed however the script ends. Two things make that necessary rather than
+# tidy, and both are about /tmp being world-writable on a shared host:
+#
+#   * The SSM parameter document below is EXECUTED AS ROOT on the instance under
+#     the operator's credentials. At a fixed, predictable path another local user
+#     can pre-create it as a symlink - so the `>` redirect clobbers whatever the
+#     operator can write - or swap its contents between the write and the
+#     `aws ssm send-command` read, which is arbitrary command injection into that
+#     channel (CWE-377).
+#   * That document embeds the presigned S3 URL, a one-hour bearer credential to
+#     the whole packed source tree. Left at a default-umask path it outlived the
+#     run world-readable.
+#
+# `mktemp -d` creates the directory 0700, so neither is reachable. It also fixes
+# the shape the tarball used: `$(mktemp ...).tgz` appends a suffix to the name
+# mktemp RESERVED, so the file actually written is a different, unreserved path -
+# the same race more weakly - and the reserved one was then leaked.
+WORKDIR=$(mktemp -d -t strands-robots-XXXXXX)
+trap 'rm -rf "$WORKDIR"' EXIT
+
 echo "== packing the local tree ($REPO_ROOT) =="
-TARBALL=$(mktemp -t strands-robots-XXXX).tgz
+TARBALL="$WORKDIR/payload.tgz"
 tar czf "$TARBALL" -C "$REPO_ROOT" \
   --exclude '.git' --exclude '__pycache__' --exclude '.venv' \
   strands_robots examples pyproject.toml README.md
@@ -115,12 +136,16 @@ nohup docker run --rm --gpus all -e OMNI_KIT_ACCEPT_EULA=YES -e ACCEPT_EULA=Y -e
 echo launched
 EOF
 )
-python3 - "$STAGE" <<'PY' > /tmp/strands_ssm_params.json
+# Inside $WORKDIR (0700, trap-removed) rather than a fixed /tmp name: this file
+# carries the presigned URL and is read back to build a document that runs as
+# root on the instance. See the $WORKDIR comment above.
+PARAMS="$WORKDIR/ssm-params.json"
+python3 - "$STAGE" <<'PY' > "$PARAMS"
 import json, sys
 print(json.dumps({"commands": sys.argv[1].splitlines()}))
 PY
 CID=$(aws ssm send-command --region "$REGION" --instance-ids "$IID" \
-  --document-name AWS-RunShellScript --parameters file:///tmp/strands_ssm_params.json \
+  --document-name AWS-RunShellScript --parameters "file://$PARAMS" \
   --query 'Command.CommandId' --output text)
 sleep 20
 aws ssm get-command-invocation --region "$REGION" --command-id "$CID" --instance-id "$IID" \
