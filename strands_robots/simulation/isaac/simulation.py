@@ -1128,6 +1128,15 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
     #: and say why.
     _physics_view_stale: bool = False
 
+    #: Whether ``pump`` has already reported the stale view it is skipping the
+    #: joint-cache refresh for. A class-level default for the same reason as the
+    #: flag above: ``pump`` reads it on the tick that finds the view stale, and 24
+    #: test modules build this engine with ``__new__``, so ``__init__`` has not
+    #: necessarily run. Latching is what keeps a ~50 ms loop from writing one
+    #: identical WARNING per tick for as long as the staleness lasts; ``pump``
+    #: clears it on the first live tick, so the latch cannot outlive the condition.
+    _pump_stale_warned: bool = False
+
     #: Whether ``run_pump_forever`` currently owns the renderer, and therefore
     #: whether anything drains ``_action_q``.
     #:
@@ -8458,16 +8467,50 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         # every tool call for the length of a render.
         with self._lock:
             robots_snapshot = list(self._robots.items())
-        for rname, r in robots_snapshot:
-            if r.articulation is None:
-                continue
-            try:
-                q = r.articulation.get_joint_positions()
-                if q is not None:
-                    arr = q.cpu().numpy() if hasattr(q, "cpu") else np.asarray(q)
-                    self._joint_cache[rname] = {jn: float(v) for jn, v in zip(r.joint_names, list(arr))}
-            except (RuntimeError, ValueError, AttributeError, TypeError):
-                pass
+        # Skipped entirely while the view is stale, keeping the cache at its last
+        # good values rather than reading. The handler below is the SAME narrow
+        # tuple ``get_observation`` documents as unable to catch what this read
+        # raises against an invalidated view - a bare ``Exception`` ("Failed to get
+        # DOF positions from backend") - and widening it is what AGENTS.md forbids.
+        # Here that escape is worse than elsewhere: ``pump`` runs on the MAIN
+        # thread and ``run_pump_forever`` wraps it in ``try/finally`` with no
+        # ``except``, so one escape ends the loop and takes the app down - the same
+        # whole-app failure the snapshot above was added to prevent. The other
+        # measured outcome is worse still and no handler helps: ``remove_object``
+        # recorded the post-delete joint read HANGING until a 2-minute timeout,
+        # which on this thread wedges a live UI session.
+        #
+        # The trigger is ordinary shipped usage, not a contrived race: a worker
+        # thread's ``remove_object`` - or ``load_scene``'s per-episode reload -
+        # invalidates the view, and the very next pump tick performs this read.
+        # Degrades to a render-only tick until the caller's ``reset()`` rebuilds
+        # the view, which is what the sibling surfaces do.
+        stale_view = self._physics_view_stale
+        if stale_view:
+            # Latched, not logged per tick: ``run_pump_forever`` calls this every
+            # ~50 ms, so an unlatched WARNING writes thousands of identical lines
+            # while the view stays stale and buries the one that mattered. Reset
+            # in the else-branch rather than at the four sites that clear the flag,
+            # so the latch cannot outlive the staleness it describes.
+            if not self._pump_stale_warned:
+                logger.warning(
+                    "pump(): joint-state cache not refreshed - a dynamic body was added or removed "
+                    "since the last reset(), so PhysX's tensor view no longer covers the scene and "
+                    "the read would hang or raise. Rendering continues; call reset() to rebuild it."
+                )
+                self._pump_stale_warned = True
+        else:
+            self._pump_stale_warned = False
+            for rname, r in robots_snapshot:
+                if r.articulation is None:
+                    continue
+                try:
+                    q = r.articulation.get_joint_positions()
+                    if q is not None:
+                        arr = q.cpu().numpy() if hasattr(q, "cpu") else np.asarray(q)
+                        self._joint_cache[rname] = {jn: float(v) for jn, v in zip(r.joint_names, list(arr))}
+                except (RuntimeError, ValueError, AttributeError, TypeError):
+                    pass
         # 4. Refresh camera frame cache for the live preview -- only when we
         # actually rendered this tick (idle path). When actions ran, the
         # capture already published its frames to the cache; re-grabbing
@@ -8694,6 +8737,21 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
             r = registry_entry(self._robots, robot_name)
             if r is None or r.articulation is None:
                 return {"status": "error", "content": [{"text": f"Robot {robot_name!r} not initialized."}]}
+
+            # This verb READS before it writes: ``_apply`` below reads the live
+            # vector so a partial dict updates only the DOFs it names. That read is
+            # the one ``remove_object`` measured as hanging for two minutes against
+            # an invalidated view, and where it does not hang it raises a bare
+            # ``Exception`` ("Failed to get DOF positions from backend") - which
+            # neither this method's envelope contract nor ``pump``'s queued-action
+            # handler can absorb, the latter being narrowed to
+            # ``(RuntimeError, ValueError, AttributeError, TypeError, KeyError,
+            # IndexError)``. So the escape does not stay local to the call: queued,
+            # it leaves ``pump`` on the MAIN thread and ends ``run_pump_forever``.
+            # Placed after the robot resolves, as ``send_action``'s gate is, so a
+            # bad ``robot_name`` still reports itself rather than the staleness.
+            if stale := _physics_view_stale_error(self, "set_joint_positions"):
+                return stale
 
             joint_names = list(r.joint_names)
             # Normalize both accepted shapes to a {joint name: value} mapping so
@@ -9484,21 +9542,43 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRandomizationMixin, Isaac
         # usefully change anyway.
         with self._lock:
             robots_snapshot = list(self._robots.values())
+        # The pose-hold is dropped while the view is stale, and only the pose-hold:
+        # the render below still runs, so the live preview keeps refreshing instead
+        # of freezing until the caller resets. That split is the whole point of
+        # gating here rather than returning early - holding the pose is a DLSS
+        # convergence nicety, whereas a frozen preview reads to an operator as a
+        # hung app.
+        #
+        # This helper is the sharper of the two pump-side surfaces because it also
+        # WRITES: ``set_joint_positions`` / ``set_joint_velocities`` against a view
+        # PhysX no longer covers, ``max(1, n)`` times per call (``_idle_converge``
+        # by default). The read that opens each iteration is the one
+        # ``remove_object`` measured hanging for two minutes, and the bare
+        # ``Exception`` it raises otherwise is not in the narrow tuple below - so
+        # the escape leaves ``pump`` and ends ``run_pump_forever``. Reached from
+        # pump's step 2, which is the default idle path, so it is live on every
+        # preview tick between episodes.
+        # Re-read per iteration, not once above the loop, for the reason ``step``
+        # re-checks per batch: this loop renders ``n`` times without holding
+        # ``self._lock``, so a worker thread's dynamic add or remove lands between
+        # two iterations. Reading once would hold the pose for the rest of the call
+        # against a view that had gone stale under it.
         for _ in range(max(1, n)):
-            for r in robots_snapshot:
-                if r.articulation is None:
-                    continue
-                try:
-                    q = r.articulation.get_joint_positions()
-                    if q is not None:
-                        qa = np.asarray(q, dtype=float)
-                        r.articulation.set_joint_positions(qa)
-                        try:
-                            r.articulation.set_joint_velocities(np.zeros_like(qa))
-                        except (RuntimeError, ValueError, AttributeError, TypeError):
-                            pass
-                except (RuntimeError, ValueError, AttributeError, TypeError):
-                    pass
+            if not self._physics_view_stale:
+                for r in robots_snapshot:
+                    if r.articulation is None:
+                        continue
+                    try:
+                        q = r.articulation.get_joint_positions()
+                        if q is not None:
+                            qa = np.asarray(q, dtype=float)
+                            r.articulation.set_joint_positions(qa)
+                            try:
+                                r.articulation.set_joint_velocities(np.zeros_like(qa))
+                            except (RuntimeError, ValueError, AttributeError, TypeError):
+                                pass
+                    except (RuntimeError, ValueError, AttributeError, TypeError):
+                        pass
             self._world.step(render=True)
 
     def _grab_frame(self, cname: str, cam: Any) -> Any:
