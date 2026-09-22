@@ -4,6 +4,7 @@ These tests exercise the REAL mapping path (not mocked) to close the gap that
 let B7/B12 slip past the mock-heavy existing suite.
 """
 
+import dataclasses
 import math
 
 import numpy as np
@@ -203,11 +204,61 @@ def test_pack_state_pads():
     assert list(out["observation.state"]) == [1.0, 2.0, 0.0, 0.0]
 
 
-def test_pack_state_get_config_roundtrips():
+# A complete SO-arm frame: mid-centered degrees for the 5 arm columns and
+# RANGE_0_100 for the gripper, i.e. every field the step reads at runtime.
+_SO_ARM_FRAME = {
+    "state_keys": [f"j{i}" for i in range(6)],
+    "expected_dim": 6,
+    "dim_policy": "pad",
+    "state_units": "degrees",
+    "gripper_index": 5,
+    "gripper_joint_range": [-0.175, 1.745],
+    "joint_mids": [0.0, -90.0, 90.0, 0.0, 0.0, 0.0],
+    "strict_keys": True,
+}
+
+
+@pytest.mark.parametrize(("field_name", "declared"), sorted(_SO_ARM_FRAME.items()))
+def test_pack_state_get_config_carries_every_runtime_field(field_name, declared):
+    """``get_config`` emits each field the step reads, so a reload behaves the same.
+
+    LeRobot rehydrates a registered step from exactly this dict
+    (``DataProcessorPipeline._build_steps_from_config``), so a field it omits is
+    a runtime behaviour the checkpoint cannot carry. The unit frame
+    (``state_units`` / ``gripper_index`` / ``gripper_joint_range`` /
+    ``joint_mids``) and the ``strict_keys`` posture were all omitted.
+    """
     Step = _require_pack_state()
-    s = Step(state_keys=["a", "b"], expected_dim=2, dim_policy="pad")
-    cfg = s.get_config()
-    assert cfg == {"state_keys": ["a", "b"], "expected_dim": 2, "dim_policy": "pad"}
+    assert Step(**_SO_ARM_FRAME).get_config()[field_name] == declared
+
+
+def test_pack_state_get_config_omits_the_policys_sink():
+    """``missing_keys_sink`` is the policy's live list, not configuration."""
+    Step = _require_pack_state()
+    sink: list[str] = []
+    assert "missing_keys_sink" not in Step(**_SO_ARM_FRAME, missing_keys_sink=sink).get_config()
+
+
+def test_pack_state_unit_frame_survives_a_pipeline_round_trip(tmp_path):
+    """A saved + reloaded pipeline packs the SAME state vector.
+
+    Without the frame in ``get_config`` the reloaded step fell back to
+    ``state_units="native"`` and packed the sim's raw radians where the
+    checkpoint was trained on mid-centered degrees - a ~57x scale error on every
+    arm column, with no warning.
+    """
+    Step = _require_pack_state()
+    pipeline = pytest.importorskip("lerobot.processor.pipeline")
+
+    observation = dict.fromkeys(_SO_ARM_FRAME["state_keys"], 0.5)
+    packed = Step(**_SO_ARM_FRAME).observation(dict(observation))["observation.state"]
+
+    saved = pipeline.DataProcessorPipeline([Step(**_SO_ARM_FRAME)], name="frame")
+    saved.save_pretrained(tmp_path)
+    reloaded = pipeline.DataProcessorPipeline.from_pretrained(tmp_path, config_filename="frame.json")
+    repacked = reloaded.steps[0].observation(dict(observation))["observation.state"]
+
+    assert [round(float(v), 3) for v in repacked] == [round(float(v), 3) for v in packed]
 
 
 # Full lerobot driver coverage guard
@@ -397,27 +448,62 @@ def test_expected_state_dim_falls_back_to_state_keys():
 # JSON loader internals (_extends inheritance + missing config file)
 
 
-def test_resolve_extends_merges_child_overrides():
+_SO_ARM_PARENT = {
+    "obs_rename": {"image": "observation.images.image"},
+    "state_keys": ["1", "2", "3", "4", "5", "6"],
+    "action_keys": ["1", "2", "3", "4", "5", "6"],
+    "dim_policy": "strict",
+    "state_units": "degrees",
+    "action_units": "degrees",
+    "gripper_index": 5,
+    "gripper_joint_range": [-0.175, 1.745],
+    "joint_mids": [0.0, -90.0, 90.0, 0.0, 0.0, 0.0],
+}
+
+
+def _resolve_parent_and_child(child_overrides=None):
+    """Resolve a parent declaring every field and a child that ``_extends`` it."""
     from strands_robots.policies.lerobot_local.embodiment import _resolve
 
-    definitions = {
-        "base": {
-            "obs_rename": {"image": "observation.images.image"},
-            "state_keys": ["a", "b"],
-            "action_keys": ["a", "b"],
-            "dim_policy": "strict",
-        },
-        "child": {
-            "_extends": "base",
-            "__note__": "doc metadata is stripped",
-            "dim_policy": "pad",  # child override wins over inherited value
-        },
-    }
-    child = _resolve("child", definitions)
+    child = {"_extends": "base", "__note__": "doc metadata is stripped"}
+    child.update(child_overrides or {})
+    definitions = {"base": dict(_SO_ARM_PARENT), "child": child}
+    return _resolve("base", definitions), _resolve("child", definitions)
+
+
+@pytest.mark.parametrize("field_name", [f.name for f in dataclasses.fields(EmbodimentMap) if f.name != "name"])
+def test_resolve_extends_inherits_every_declared_field(field_name):
+    # A child inherits EVERY field, not just the key mapping: dropping
+    # state_units/gripper_index/joint_mids leaves the child silently packing its
+    # state in the native frame while the parent declares degrees.
+    parent, child = _resolve_parent_and_child()
+    assert getattr(child, field_name) == getattr(parent, field_name)
+
+
+def test_resolve_extends_child_keys_win_and_metadata_is_stripped():
+    parent, child = _resolve_parent_and_child({"dim_policy": "pad", "state_units": "native"})
     assert child.name == "child"
-    assert child.dim_policy == "pad"  # overridden
-    assert child.state_keys == ["a", "b"]  # inherited
-    assert child.obs_rename == {"image": "observation.images.image"}  # inherited
+    assert child.dim_policy == "pad"
+    assert child.state_units == "native"
+    assert child.action_units == parent.action_units == "degrees"  # untouched by the override
+    assert not hasattr(child, "__note__")
+
+
+def test_resolve_extends_child_converts_in_the_inherited_unit_frame():
+    # The harm the inheritance exists to prevent, end to end: same sim vector in,
+    # same model vector out, both directions.
+    parent, child = _resolve_parent_and_child()
+    sim = [0.5] * 6
+    assert child.sim_state_to_model(sim) == parent.sim_state_to_model(sim)
+    model = parent.sim_state_to_model(sim)
+    assert child.model_action_to_sim(model) == parent.model_action_to_sim(model)
+
+
+def test_resolve_extends_child_does_not_share_the_parent_container():
+    parent, child = _resolve_parent_and_child()
+    assert child.state_keys is not parent.state_keys
+    assert child.obs_rename is not parent.obs_rename
+    assert child.joint_mids is not parent.joint_mids
 
 
 def test_load_defs_returns_empty_when_config_missing(monkeypatch, tmp_path):

@@ -24,7 +24,7 @@ Two adjacent defects are pinned alongside, because the fix exposed them:
 
 * **Newton's ``joint_vel_std`` configured a channel that did not exist.**
   ``set_obs_noise`` accepted and documented it all along, while the noise pass
-  (``_apply_joint_pos_noise``) applied ``joint_pos_std`` to every entry it was
+  (``_apply_joint_noise``) applied ``joint_pos_std`` to every entry it was
   handed. Now that ``.vel`` entries flow through that pass, it splits by suffix
   exactly as MuJoCo's ``_apply_obs_noise`` does - without the split, position
   noise would land on velocities and ``joint_vel_std`` would stay inert.

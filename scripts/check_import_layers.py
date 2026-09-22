@@ -17,10 +17,16 @@ deadlock an interpreter, so its graph must be acyclic. A **typing-only** import
 nothing at import time and are the two sanctioned ways to break a cycle, so
 they are reported and excluded from the acyclicity requirement.
 
-*No inversions.* Every runtime edge that points at a higher layer is an
-inversion. They are enumerated in :data:`KNOWN_UPWARD_EDGES`, module pair by
-module pair, so the roster is a ratchet: removing an inversion means deleting
-its line, and adding one fails the grader until someone writes it down.
+*No inversions.* Every edge that points at a higher layer is an inversion, and
+direction is graded on two of the three kinds - because direction is a claim
+about who depends on whom, which a deferred import does not change: a function
+that imports the dashboard on its first call still cannot do its job without
+the dashboard. So a runtime inversion is enumerated in
+:data:`KNOWN_UPWARD_EDGES` and a deferred one in
+:data:`KNOWN_DEFERRED_UPWARD_EDGES`, module pair by module pair. Both rosters
+are ratchets: removing an inversion means deleting its line, and adding one
+fails the grader until someone writes it down. Typing-only imports are reported
+and not graded - an annotation is not a dependency at any point in the run.
 
 Usage::
 
@@ -46,8 +52,17 @@ PACKAGE = "strands_robots"
 #:
 #: The placements that are a judgement rather than a reading of the tree:
 #: ``assets`` sits with ``registry`` because it resolves the asset paths the
-#: registry declares; ``streaming_dataset`` sits with ``dataset_recorder`` in
-#: ``app`` because it is the same recording concern written incrementally; and
+#: registry declares; the five dataset modules sit in ``core`` because a dataset
+#: is a contract rather than a host - ``dataset_recorder`` writes one, and
+#: reading what it recorded (``dataset_metadata``), resolving the directory a
+#: ``repo_id`` names (``dataset_source``), streaming the frames back out
+#: (``streaming_dataset``) and uploading the finished directory
+#: (``dataset_transfer``) are the other four. The writer is the one that had to
+#: be argued: no ``app`` module imports it and none holds a recording session -
+#: ``start_recording`` exists only on the three sim backends a layer below -
+#: while its own five imports are all ``core``, so keeping it in ``app`` inverted
+#: the layering for its only caller and made three core modules look like they
+#: had an ``app`` reader when that reader was the recorder. And
 #: ``teleop_mixin`` sits with ``drivers|mesh`` because it is an input-device
 #: concern shared by three hosts in three layers - the hardware ``Robot``, the
 #: MuJoCo ``Simulation`` and the Device Connect sim driver - so it belongs under
@@ -62,36 +77,40 @@ LAYERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "_dyld",
             "_hitl_audit",
             "_mesh_switch",
+            "_motion_grants",
             "_mujoco_gl",
             "_path_validation",
             "_serial_discovery",
             "bus_access",
+            "dataset_metadata",
+            "dataset_recorder",
+            "dataset_source",
+            "dataset_transfer",
             "episode_labels",
             "locomotion_envelope",
             "recording_errors",
             "refusal_codes",
             "rendering",
+            "streaming_dataset",
             "utils",
         ),
     ),
     ("registry", ("assets", "registry")),
     (
         "drivers|mesh",
-        ("device_connect", "drivers", "mesh", "rosbridge", "ros_telemetry", "rtps", "teleop_mixin"),
+        ("device_connect", "drivers", "mesh", "ros", "rosbridge", "ros_telemetry", "rtps", "teleop_mixin"),
     ),
     ("sim|policies", ("inference", "policies", "simulation", "training")),
     (
         "app",
         (
             "__main__",
-            "dataset_recorder",
             "doctor",
             "hardware_observe",
             "hardware_robot",
             "hardware_ros_bridge",
             "hardware_rtps_bridge",
             "robot",
-            "streaming_dataset",
             "teleoperator",
             "verify_dataset",
         ),
@@ -107,14 +126,28 @@ LAYER_OF_MEMBER: dict[str, int] = {member: index for index, (_name, members) in 
 LAYER_NAMES: tuple[str, ...] = tuple(name for name, _members in LAYERS)
 
 #: The runtime imports that still point upward, ``(importer, imported)``. Each
-#: line is a cut this lane has not made yet; the grader fails on an edge that is
-#: not here, and on an entry here that no longer exists, so the roster can only
-#: shrink deliberately.
-KNOWN_UPWARD_EDGES: tuple[tuple[str, str], ...] = (
-    # drivers|mesh -> tools. The mesh robots call the ``@tool`` entry point
-    # instead of a transport of their own.
-    ("strands_robots.mesh.ackermann_robot", "strands_robots.tools.use_ros"),
-    ("strands_robots.mesh.ros_bridge", "strands_robots.tools.use_ros"),
+#: line would be a cut this lane has not made yet; the grader fails on an edge
+#: that is not here, and on an entry here that no longer exists, so the roster
+#: can only shrink deliberately. It is empty: every layer imports downward only.
+KNOWN_UPWARD_EDGES: tuple[tuple[str, str], ...] = ()
+
+#: The deferred imports that point upward, ``(importer, imported)``. A late
+#: import is exempt from the acyclicity requirement and not from the layering
+#: one, so these are the inversions that survive: a module that reaches up from
+#: inside a function body, once, on first call.
+#:
+#: Sanctioned, and staying: ``__main__`` is the command that starts the
+#: dashboard, so it reads its CLI; ``_hitl_audit`` writes the operator's answer
+#: through the mesh safety log; ``teleop_mixin`` defers ``teleoperator`` because
+#: that module imports lerobot. Each is pinned individually in
+#: ``tests/test_import_layers_are_a_dag.py``.
+#:
+#: The one cut left here is ``drivers.ur``, which reaches up to build a policy.
+KNOWN_DEFERRED_UPWARD_EDGES: tuple[tuple[str, str], ...] = (
+    ("strands_robots.__main__", "strands_robots.dashboard.cli"),
+    ("strands_robots._hitl_audit", "strands_robots.mesh.audit"),
+    ("strands_robots.drivers.ur", "strands_robots.policies"),
+    ("strands_robots.teleop_mixin", "strands_robots.teleoperator"),
 )
 
 
@@ -332,13 +365,14 @@ def unassigned_members(graph: ImportGraph) -> tuple[str, ...]:
     return tuple(sorted(members - set(LAYER_OF_MEMBER)))
 
 
-def upward_edges(graph: ImportGraph) -> tuple[tuple[str, str], ...]:
-    """Return every runtime import that points at a higher layer.
+def upward_edges(graph: ImportGraph, kind: str = "runtime") -> tuple[tuple[str, str], ...]:
+    """Return every import of one kind that points at a higher layer.
 
     :param graph: The graph to read.
+    :param kind: ``"runtime"``, ``"typing_only"`` or ``"late"``.
     """
     found = []
-    for importer, targets in graph.runtime.items():
+    for importer, targets in getattr(graph, kind).items():
         source_layer = layer_of(importer)
         if source_layer is None:
             continue
@@ -374,36 +408,38 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parent.parent / PACKAGE
     graph = build_graph(root)
     runtime_cycles = cycles(graph.runtime, frozenset(graph.modules))
-    inversions = upward_edges(graph)
-    known = set(KNOWN_UPWARD_EDGES)
-    missing = sorted(known - set(inversions))
-    new = sorted(set(inversions) - known)
+    graded = (
+        ("runtime", upward_edges(graph), KNOWN_UPWARD_EDGES),
+        ("deferred", upward_edges(graph, "late"), KNOWN_DEFERRED_UPWARD_EDGES),
+    )
     orphans = unassigned_members(graph)
 
     print(f"{PACKAGE}: {len(graph.modules)} modules, {len(LAYERS)} layers")
     for kind in ("runtime", "typing_only", "late"):
         print(f"  {kind:12s} edges: {graph.edge_count(kind)}")
     print(f"  runtime cycles: {len(runtime_cycles)}")
-    counts: dict[str, int] = defaultdict(int)
-    for edge in inversions:
-        counts[_pair_label(edge)] += 1
-    print(f"  upward runtime edges: {len(inversions)} (declared {len(KNOWN_UPWARD_EDGES)})")
-    for label, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        print(f"    {label:30s} {count}")
-    if args.verbose:
-        for importer, target in inversions:
-            print(f"    {importer} -> {target}")
+    for name, inversions, declared in graded:
+        counts: dict[str, int] = defaultdict(int)
+        for edge in inversions:
+            counts[_pair_label(edge)] += 1
+        print(f"  upward {name} edges: {len(inversions)} (declared {len(declared)})")
+        for label, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+            print(f"    {label:30s} {count}")
+        if args.verbose:
+            for importer, target in inversions:
+                print(f"    {importer} -> {target}")
 
     failed = False
     for component in runtime_cycles:
         failed = True
         print(f"FAIL: runtime import cycle over {len(component)} modules: {', '.join(component)}")
-    for importer, target in new:
-        failed = True
-        print(f"FAIL: undeclared upward import {importer} -> {target} ({_pair_label((importer, target))})")
-    for importer, target in missing:
-        failed = True
-        print(f"FAIL: declared upward import no longer exists, delete it: {importer} -> {target}")
+    for name, inversions, declared in graded:
+        for importer, target in sorted(set(inversions) - set(declared)):
+            failed = True
+            print(f"FAIL: undeclared upward {name} import {importer} -> {target} ({_pair_label((importer, target))})")
+        for importer, target in sorted(set(declared) - set(inversions)):
+            failed = True
+            print(f"FAIL: declared upward {name} import no longer exists, delete it: {importer} -> {target}")
     for member in orphans:
         failed = True
         print(f"FAIL: {PACKAGE}.{member} is in no layer; add it to LAYERS")

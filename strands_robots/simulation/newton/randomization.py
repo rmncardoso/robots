@@ -376,20 +376,26 @@ class DomainRandomizationMixin:
             ],
         }
 
-    def _apply_joint_pos_noise(self, obs: dict[str, float]) -> dict[str, float]:
-        """Return ``obs`` with Gaussian sensor noise added to each joint entry.
+    def _apply_joint_noise(self, obs: dict[str, float]) -> dict[str, float]:
+        """Return ``obs`` with Gaussian noise added to each joint scalar.
 
-        Position entries (``"<name>"``) get ``joint_pos_std`` and velocity
-        entries (``"<name>.vel"``) get ``joint_vel_std``, keyed apart by the
-        suffix exactly as the MuJoCo backend's ``_apply_obs_noise`` does. The
-        split is not optional: this used to apply ``joint_pos_std`` to every
+        The observation's joint block holds a position per joint and its
+        velocity companion under ``<joint>.vel``. They are separate quantities
+        with separate stds - ``joint_pos_std`` (radians) for the positions,
+        ``joint_vel_std`` (rad/s) for the ``.vel`` entries - so a position std
+        is never spent on a velocity, matching the MuJoCo backend's
+        ``_apply_obs_noise``. A no-op (returns the input unchanged) when
+        neither std is positive.
+
+        The split is not optional: this used to apply ``joint_pos_std`` to every
         entry it was handed, which was correct only while the dict held nothing
-        but positions - and it meant the ``joint_vel_std`` this backend's
+        but positions - and it meant the ``joint_vel_std`` that
         :meth:`set_obs_noise` has accepted and documented all along configured a
-        channel that did not exist. A no-op when no positive std is configured.
+        channel that did not exist.
 
         Args:
-            obs: Mapping of joint name (or ``"<name>.vel"``) to value.
+            obs: Mapping of joint name to position (radians) and
+                ``<joint>.vel`` to velocity (rad/s).
 
         Returns:
             New mapping with noise applied, or the original when disabled.
@@ -398,7 +404,7 @@ class DomainRandomizationMixin:
         pos_std = cfg.get("joint_pos_std", 0.0)
         vel_std = cfg.get("joint_vel_std", 0.0)
         rng = self._obs_noise_rng
-        if (pos_std <= 0 and vel_std <= 0) or rng is None or not obs:
+        if rng is None or (pos_std <= 0 and vel_std <= 0) or not obs:
             return obs
         out: dict[str, float] = {}
         for k, v in obs.items():

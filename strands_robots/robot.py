@@ -88,8 +88,14 @@ def _auto_detect_mode(canonical: str) -> str:
 
     Priority:
         1. ``STRANDS_ROBOT_MODE`` env var (explicit override)
-        2. Robot-specific USB detection (Feetech/Dynamixel servo controllers)
-        3. Default to sim (safest - never accidentally send commands to hardware)
+        2. For a robot that declares hardware, its native driver's own
+           ``probe_hardware()`` - a robot reached over the network rather than a
+           serial bus answers for itself (a Reachy Mini's daemon answers ``GET
+           /api/daemon/status``; no USB scan can see it). Opt-in per driver: a
+           class that declares no such classmethod is not asked, and the probe
+           is asked once.
+        3. Robot-specific USB detection (Feetech/Dynamixel servo controllers)
+        4. Default to sim (safest - never accidentally send commands to hardware)
     """
     env_mode = os.getenv("STRANDS_ROBOT_MODE", "").lower().strip()
     if env_mode in ("sim", "real"):
@@ -554,7 +560,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
               env default. ``STRANDS_MESH=false`` is a hard kill switch.
         peer_id: Optional mesh peer identifier. Auto-generated when omitted.
         driver: Which implementation drives the robot in ``mode="real"``, one of
-            :data:`~strands_robots.drivers.base.DRIVER_CHOICES`. ``"auto"``
+            :data:`~strands_robots.registry.DRIVER_CHOICES`. ``"auto"``
             (default) states no preference: it honours the robot's registry
             ``hardware.driver`` and otherwise builds the lerobot driver, so a
             call that does not mention ``driver`` behaves exactly as before.
@@ -582,7 +588,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
 
     Raises:
         ValueError: If ``mode`` is not 'sim'/'real'/'auto', if ``driver`` is not
-                    one of :data:`~strands_robots.drivers.base.DRIVER_CHOICES`,
+                    one of :data:`~strands_robots.registry.DRIVER_CHOICES`,
                     if ``driver="strands"`` names a robot with no registered
                     native driver, if ``cameras=``
                     is passed in sim mode, if the robot name is empty

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from typing import Any
@@ -34,10 +35,11 @@ router = APIRouter(tags=["sim"])
 
 _STREAM_FPS = 12.0
 _TELEMETRY_HZ = 15.0
-#: How long the create route waits for a session to build and render its first
-#: frame. Creating the GL context is the slowest part of starting, so this is
-#: generous; a session that misses it is dropped rather than reported running.
-_READY_TIMEOUT = 60.0
+#: How long a start waits for a session to build and render its first frame -
+#: the create route and the agent's ``sim_start``, which drop a session that
+#: misses it rather than reporting a robot that renders nothing as running.
+#: Creating the GL context is the slowest part of starting, so this is generous.
+READY_TIMEOUT = 60.0
 
 
 class Safety:
@@ -128,20 +130,63 @@ async def list_sessions(request: Request, _: dict = Depends(access.require_sessi
     return {"sessions": [s.snapshot.as_dict() for s in _safety(request).store.all()]}
 
 
+def _is_serial_device(port: str) -> bool:
+    return port.startswith("/dev/") and "/../" not in port and os.path.exists(port)
+
+
+def _mirror_source(spec: Any) -> Any:
+    """Open the real arm's bus read-only for ``{"port": "/dev/..."}``, or refuse with why."""
+    from strands_robots.dashboard.mirror import BusMirror
+
+    if not isinstance(spec, dict) or not isinstance(spec.get("port"), str):
+        raise HTTPException(400, 'mirror must be {"port": "/dev/<serial device>"}')
+    port = spec["port"]
+    if not _is_serial_device(port):
+        raise HTTPException(400, f"{port!r} is not a serial device on this machine")
+    source = BusMirror(port)
+    source.wait_ready(15.0)
+    if source.error:
+        source.close()
+        raise HTTPException(502, source.error)
+    return source
+
+
+@router.get("/api/sim/ports")
+async def serial_ports(_: dict = Depends(access.require_session)) -> dict[str, Any]:
+    """Serial devices on this machine a mirror could read, servo buses first. Nothing is opened."""
+    from strands_robots._serial_discovery import scan_serial_devices
+
+    found = await asyncio.to_thread(scan_serial_devices)
+    ports = [
+        {"port": c.port, "stable_id": c.stable_id, "likely_servo_bus": bool(c.likely_servo_bus)}
+        for c in sorted(found, key=lambda c: (not c.likely_servo_bus, c.port))
+    ]
+    return {"ports": ports}
+
+
 @router.post("/api/sim", status_code=201)
 async def create_session(request: Request, who: dict = Depends(access.require_session)) -> dict[str, Any]:
-    """Start a simulated robot. Refused while the e-stop is engaged."""
+    """Start a simulated robot - or a twin that mirrors the real one. Refused while the e-stop is engaged.
+
+    ``{"robot": "so101"}`` steps physics. ``{"robot": "so101", "mirror":
+    {"port": "/dev/cu.usbmodem..."}}`` reads the servo bus at that port
+    (never writes it) and poses the model from the readings; ``set_joints``
+    and ``reset`` are refused on such a session.
+    """
     safety = _safety(request)
     safety.gate("create")
     body = await request.json() if await request.body() else {}
     if not isinstance(body, dict) or not isinstance(body.get("robot"), str):
         raise HTTPException(400, 'body must be {"robot": "<name>"}')
     robot = _known_sim_robot(body["robot"])
+    source = await asyncio.to_thread(_mirror_source, body["mirror"]) if "mirror" in body else None
     try:
-        session = safety.store.create(robot)
+        session = safety.store.create(robot, source=source)
     except RuntimeError as exc:
+        if source is not None:
+            source.close()
         raise HTTPException(429, str(exc))
-    ready = await asyncio.to_thread(session.wait_ready, _READY_TIMEOUT)
+    ready = await asyncio.to_thread(session.wait_ready, READY_TIMEOUT)
     snap = session.snapshot
     if not ready:
         # Ready means built and rendered, and building a GL context is the slow,
@@ -150,7 +195,7 @@ async def create_session(request: Request, who: dict = Depends(access.require_se
         # nothing to stream and a session slot held, so it is dropped here instead
         # of being handed back as a robot the operator can watch.
         await asyncio.to_thread(safety.store.remove, session.id)
-        raise HTTPException(504, f"{robot} did not render a first frame within {_READY_TIMEOUT:.0f}s")
+        raise HTTPException(504, f"{robot} did not render a first frame within {READY_TIMEOUT:.0f}s")
     if snap.state == "error":
         safety.store.remove(session.id)
         raise HTTPException(500, f"could not start {robot}: {snap.error}")
@@ -167,7 +212,9 @@ async def create_session(request: Request, who: dict = Depends(access.require_se
         # read of the lockout here and the fold in which the latch can land.
         await asyncio.to_thread(safety.store.remove, session.id)
         raise
-    logger.info("sim %s started for %s by %s", session.id, one_line(robot), one_line(who.get("via")))
+    logger.info(
+        "sim %s started for %s (%s) by %s", session.id, one_line(robot), one_line(snap.source), one_line(who.get("via"))
+    )
     return snap.as_dict()
 
 

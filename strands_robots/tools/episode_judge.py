@@ -133,7 +133,7 @@ def _episode_frame_rows(root: Path, episode: int) -> list[dict[str, Any]]:
     over consecutive frames, so dropping a shard makes the surviving rows read
     as consecutive when they are not, and ``max_state_delta`` /
     ``rms_state_jerk`` then measure the gap instead of the robot.
-    :func:`strands_robots.verify_dataset.read_dataset_episode_indices`
+    :func:`strands_robots.dataset_metadata.read_dataset_episode_indices`
     tolerates the same damage because naming the damaged files *is* its
     product; it reports them in ``unreadable_files`` and documents its totals
     as a lower bound. Here there is no field to carry that caveat into a
@@ -215,7 +215,7 @@ def _decoded_image_blocks(root: Path, episode: int, positions: list[int]) -> lis
 
     # The dataset is addressed by its on-disk root; the repo_id is only a
     # display name once a root is given.
-    from strands_robots.dataset_recorder import _quiet_backend_kwargs
+    from strands_robots.dataset_source import _quiet_backend_kwargs
 
     ds = LeRobotDataset(repo_id=f"local/{root.name}", root=str(root), **_quiet_backend_kwargs(LeRobotDataset))
     # Episode -> global frame range. LeRobot 0.6 records it per episode in
@@ -313,8 +313,8 @@ def load_episode(root: str, episode: int) -> dict[str, Any]:
             return _error(msg)
         episode = int(episode)
 
+        from strands_robots.dataset_metadata import read_dataset_episode_indices
         from strands_robots.episode_labels import labels_path, read_labels
-        from strands_robots.verify_dataset import read_dataset_episode_indices
 
         indices = read_dataset_episode_indices(root_path)
         if episode not in indices["episode_indices"]:

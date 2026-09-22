@@ -34,6 +34,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from strands_robots.dataset_transfer import sync_dataset_to_bucket
 from strands_robots.utils import (
     boolean_flag_error,
     camera_schema_key,
@@ -1018,6 +1019,61 @@ class DatasetRecordingMixin:
         return world._backend_state
 
     @staticmethod
+    def _dataset_recorder_or_refusal(alternative: str) -> tuple[Any, dict[str, Any] | None]:
+        """Resolve ``DatasetRecorder``, or the refusal naming why it is missing.
+
+        Every backend's ``start_recording`` needs the same two facts before it
+        touches the scene: the recorder class, and - when lerobot's dataset
+        stack is not installed - a diagnosis that names the missing piece
+        instead of a bare ``ImportError`` from inside the first write. The three
+        backends each carried a verbatim copy of the probe, so a change to the
+        diagnosis had to be made three times and could drift in two of them.
+        Only the alternative to recording a dataset differs per backend, so
+        that sentence is the parameter.
+
+        Args:
+            alternative: What to do instead, appended to the refusal - the plain
+                MP4 path this backend offers under its own extra.
+
+        Returns:
+            ``(DatasetRecorder, None)`` when the stack is importable, otherwise
+            ``(None, refusal)`` where ``refusal`` is the tool reply to return.
+        """
+        recorder_cls: Any = None
+        unavailable: str | None = None
+        try:
+            # Deferred because the import is itself what this probe reports on:
+            # at module scope, a partial install would make `import
+            # strands_robots.simulation` fail rather than this verb refuse.
+            from strands_robots.dataset_recorder import DatasetRecorder as recorder_cls
+            from strands_robots.dataset_recorder import lerobot_dataset_import_error
+
+            unavailable = lerobot_dataset_import_error()
+        except ImportError as exc:
+            # strands_robots.dataset_recorder itself did not import (a partial or
+            # drifted install); report that rather than blaming the lerobot extra.
+            unavailable = f"strands_robots.dataset_recorder is unavailable ({exc})."
+        if unavailable is None and recorder_cls is None:
+            unavailable = "strands_robots.dataset_recorder did not provide DatasetRecorder."
+        if unavailable is None:
+            return recorder_cls, None
+        return None, {
+            "status": "error",
+            "content": [
+                {
+                    "text": (
+                        "start_recording produces a LeRobotDataset (parquet + video), which "
+                        "needs lerobot's dataset stack:\n"
+                        "\n"
+                        f"  {unavailable}\n"
+                        "\n"
+                        f"{alternative}"
+                    )
+                }
+            ],
+        }
+
+    @staticmethod
     def _arm_dataset_recorder(state: dict[str, Any], recorder: Any, *, resumed: bool = False) -> str:
         """Open a recording session on ``recorder``, and say what opening it means.
 
@@ -1201,7 +1257,7 @@ class DatasetRecordingMixin:
         """Resolve the directory a recording writes to, stashed with its id.
 
         Every backend's ``start_recording`` resolves its target with
-        :func:`~strands_robots.dataset_recorder.resolve_dataset_dir` - the same
+        :func:`~strands_robots.dataset_source.resolve_dataset_dir` - the same
         resolver ``DatasetRecorder.create()`` uses, so the facade and the
         recorder agree on where a dataset lives (honouring ``$HF_LEROBOT_HOME``)
         - and stashes it as ``last_dataset_root`` for the consumers that run
@@ -1221,7 +1277,7 @@ class DatasetRecordingMixin:
         Returns:
             The resolved directory, for the caller's overwrite/resume logic.
         """
-        from strands_robots.dataset_recorder import resolve_dataset_dir
+        from strands_robots.dataset_source import resolve_dataset_dir
 
         dataset_dir = resolve_dataset_dir(repo_id, root)
         state = self._recording_state()
@@ -1425,8 +1481,9 @@ class DatasetRecordingMixin:
                 "set_joint_positions(hold=True) + step is a scripted demonstration "
                 "(a step call covering less sim time than one frame period captures "
                 "nothing, and its reply says so). To record a dataset: "
-                "start_recording -> run_policy (once per episode) or step through "
-                "the motion -> stop_recording."
+                "start_recording -> run_policy(n_episodes=N), or run_policy then reset "
+                "per episode (reset closes the open episode), or step through the "
+                "motion -> stop_recording."
             )
             return {"status": "error", "content": [{"text": resumed_note + recipe}]}
 
@@ -1635,11 +1692,6 @@ class DatasetRecordingMixin:
                 ],
             }
 
-        # Lazy import: keeps this engine-agnostic mixin free of the
-        # dataset_recorder import (numpy) at module load, matching the lazy
-        # DatasetRecorder import in each backend's start_recording.
-        from strands_robots.dataset_recorder import sync_dataset_to_bucket
-
         # Every no-bucket combination returned above, so bucket is set here.
         assert bucket is not None
         sync_result = sync_dataset_to_bucket(str(last_root), bucket, run_id=run_id)
@@ -1730,7 +1782,7 @@ class DatasetRecordingMixin:
                     {
                         "text": (
                             "save_episode: not recording. Call start_recording first, "
-                            "then run_policy (once per episode) -> save_episode -> stop_recording."
+                            "then run_policy -> save_episode per episode -> stop_recording."
                         )
                     }
                 ],
@@ -1847,7 +1899,7 @@ class DatasetRecordingMixin:
             repo_id: HF dataset id (e.g. ``"lerobot/svla_so100_pickplace"``) or
                 a ``repo_id`` that is itself a path, which streams the directory
                 it recorded to with no ``root`` restated
-                (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
+                (:func:`~strands_robots.dataset_source.local_dataset_dir`).
             **kwargs: Forwarded to
                 :meth:`StreamingDatasetReader.open` - e.g. ``root``,
                 ``delta_timestamps``, ``episodes``, ``shuffle`` (which decides
@@ -1987,7 +2039,26 @@ class DatasetRecordingMixin:
             payload["repo_id"] = self._active_dataset_repo_id()
             payload["root"] = self._active_dataset_root()
             into = f" into {payload['repo_id']} at {payload['root']}" if payload["repo_id"] and payload["root"] else ""
-            text = f"[recording] {steps} steps captured{into}"
+            # `steps` mirrors the OPEN episode only - it empties at every flush,
+            # so read alone it said "0 steps captured" right after
+            # run_policy(n_episodes=3) had saved 45 frames. The dataset's own
+            # counts stand beside it.
+            recorder = self._active_recorder()
+            saved_episodes = int(getattr(recorder, "episode_count", 0) or 0)
+            saved_frames = max(
+                int(getattr(recorder, "frame_count", 0) or 0) - int(getattr(recorder, "episode_frame_count", 0) or 0),
+                0,
+            )
+            payload["open_episode_index"] = saved_episodes
+            payload["episodes_saved"] = saved_episodes
+            payload["frames_saved"] = saved_frames
+            text = (
+                f"[recording] {steps} steps buffered in the open episode "
+                f"(episode_index {saved_episodes}){into}; {saved_episodes} episode(s) / "
+                f"{saved_frames} frames saved so far. reset closes the open episode as its own; "
+                "run_policy(n_episodes=N) records N distinct; stop_recording saves the open "
+                "episode and closes the dataset."
+            )
         elif last is not None:
             text = (
                 f"[idle] Not recording. Last saved: {last['repo_id']} - {last['frame_count']} frames, "

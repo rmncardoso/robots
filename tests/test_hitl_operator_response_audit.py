@@ -45,6 +45,7 @@ from strands.types.tools import ToolUse  # noqa: E402
 
 import strands_robots  # noqa: E402
 import strands_robots._command_gate as gate_mod  # noqa: E402
+import strands_robots.dashboard.agent_console as dash_console_mod  # noqa: E402
 import strands_robots.dashboard.agent_hitl as dash_hitl_mod  # noqa: E402
 import strands_robots.hardware_robot as hw_mod  # noqa: E402
 import strands_robots.tools.g1.use_unitree as unitree_mod  # noqa: E402
@@ -52,8 +53,10 @@ import strands_robots.tools.lerobot_train as train_mod  # noqa: E402
 import strands_robots.tools.pose_tool as pose_mod  # noqa: E402
 import strands_robots.tools.robot_mesh as mesh_mod  # noqa: E402
 import strands_robots.tools.serial_tool as serial_mod  # noqa: E402
-import strands_robots.tools.use_ros as ros_mod  # noqa: E402
+from strands_robots._command_gate import gate_command  # noqa: E402
+from strands_robots._motion_grants import consume_grant  # noqa: E402
 from strands_robots.mesh.audit import audit_log_path, read_audit_log  # noqa: E402
+from strands_robots.ros import GATE_TOOL  # noqa: E402
 
 # A reply that carries a reason. Every gate accepts a canonical affirmative only,
 # so this is always a decline - which is exactly why the audit row is the only
@@ -72,8 +75,15 @@ def _ctx(response: object) -> MagicMock:
 
 
 def _drive_use_ros(response: object) -> dict[str, Any] | None:
-    """A publish aimed at a blocklisted drive topic."""
-    return ros_mod._gate_command("publish", "/cmd_vel", _ctx(response))
+    """A publish aimed at a blocklisted drive topic.
+
+    The gate travels to the ROS 2 transport as an argument, so this builds the
+    same call the ``use_ros`` tool and both ROS 2 mesh bridges build - the verb,
+    the surface and the transport's own label - and wraps its verdict the way the
+    transport does, which is the shape the shared cells below grade.
+    """
+    refusal = gate_command("publish", "/cmd_vel", _ctx(response), tool=GATE_TOOL)
+    return None if refusal is None else {"status": "error", "content": [{"text": f"{GATE_TOOL}: {refusal}"}]}
 
 
 def _drive_use_unitree(response: object) -> dict[str, Any] | None:
@@ -176,7 +186,6 @@ def _drive_robot_mesh(response: object) -> dict[str, Any] | None:
     fn = getattr(mesh_mod.robot_mesh, "__wrapped__", None) or mesh_mod.robot_mesh
     mesh = MagicMock()
     mesh.emergency_stop.return_value = [{"status": "ok"}]
-    mesh_mod._reset_rate_limits()
     with (
         patch.object(mesh_mod, "_gateway_mesh", lambda: None),
         patch.object(mesh_mod, "_resolve_mesh", return_value=mesh),
@@ -211,7 +220,30 @@ def _drive_dashboard_agent_hitl(response: object) -> dict[str, Any] | None:
     finally:
         # A yes deposits a one-shot grant in process-global state; do not leak it
         # into another cell (or another file) that reads the same set.
-        dash_hitl_mod.consume_grant("fleet", tool_input)
+        consume_grant("fleet", tool_input)
+
+    if not event.cancel_tool:
+        return None
+    return {"status": "error", "content": [{"text": str(event.cancel_tool)}]}
+
+
+def _drive_dashboard_agent_console(response: object) -> dict[str, Any] | None:
+    """The dashboard agent asking to move a simulated robot's joints.
+
+    Same hook shape as ``_drive_dashboard_agent_hitl`` - a ``BeforeToolCallEvent``
+    that says "no" through ``event.cancel_tool`` - so the same SDK translation
+    applies. A fresh ``Grants`` per drive: an approval here must not silence the
+    next cell's ask.
+    """
+    tool_input = {"session_id": "sim-1", "positions": {"2": 1.0}}
+    hook = dash_console_mod.MotionGate(dash_console_mod.Grants())
+
+    event = MagicMock(name="BeforeToolCallEvent")
+    event.tool_use = {"name": "sim_set_joints", "input": tool_input}
+    event.interrupt.return_value = response
+    event.cancel_tool = False
+
+    hook._gate(event)
 
     if not event.cancel_tool:
         return None
@@ -311,6 +343,16 @@ _GATES: tuple[_Gate, ...] = (
         dash_hitl_mod,
         "_gate",
         owner=dash_hitl_mod.MotionInterruptHook,
+    ),
+    _Gate(
+        "dashboard_agent_console",
+        "dashboard_agent_console",
+        "sim_set_joints",
+        "sim-1",
+        _drive_dashboard_agent_console,
+        dash_console_mod,
+        "_gate",
+        owner=dash_console_mod.MotionGate,
     ),
 )
 
@@ -602,7 +644,6 @@ def _drive_robot_mesh_racing_the_rate_limit(response: object) -> tuple[dict[str,
     fn = getattr(mesh_mod.robot_mesh, "__wrapped__", None) or mesh_mod.robot_mesh
     mesh = MagicMock()
     mesh.tell.return_value = {"status": "ok"}
-    mesh_mod._reset_rate_limits()
     mesh_mod._reset_interrupt_actions_cache()
 
     taken = 0

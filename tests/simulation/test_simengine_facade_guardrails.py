@@ -175,12 +175,12 @@ def test_evaluate_benchmark_explicit_unknown_robot_reports_not_found(monkeypatch
 
 def _refuse_to_load_a_dataset(monkeypatch) -> None:
     """Make reaching the dataset loader a failure: the refusal must precede it."""
-    import strands_robots.dataset_recorder as dr
+    import strands_robots.dataset_source as dataset_source
 
     def _must_not_load(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("load_lerobot_episode reached before the robot was resolved")
 
-    monkeypatch.setattr(dr, "load_lerobot_episode", _must_not_load, raising=False)
+    monkeypatch.setattr(dataset_source, "load_lerobot_episode", _must_not_load, raising=False)
 
 
 @pytest.mark.parametrize("robots", [("solo",), ("arm_a", "arm_b")], ids=["sole-robot", "multi-robot"])
@@ -254,9 +254,11 @@ def test_replay_episode_ambiguous_multi_robot_refuses_before_commanding_anything
     resolution that still substituted would replay the two frames onto
     ``arm_a`` and fail on the commanded list, not on a stubbed import.
     """
-    import strands_robots.dataset_recorder as dr
+    import strands_robots.dataset_source as dataset_source
 
-    monkeypatch.setattr(dr, "load_lerobot_episode", lambda *a, **k: (_TwoFrameEpisode(), 0, 2), raising=False)
+    monkeypatch.setattr(
+        dataset_source, "load_lerobot_episode", lambda *a, **k: (_TwoFrameEpisode(), 0, 2), raising=False
+    )
     sim = _ActuatedSim(robots=("arm_a", "arm_b"))
 
     result = sim.replay_episode("any/dataset", speed=1000.0)
@@ -269,9 +271,11 @@ def test_replay_episode_ambiguous_multi_robot_refuses_before_commanding_anything
 
 def test_replay_episode_resolves_the_sole_robot_when_name_omitted(monkeypatch):
     """Control: ``None`` in a sole-robot scene still resolves and replays."""
-    import strands_robots.dataset_recorder as dr
+    import strands_robots.dataset_source as dataset_source
 
-    monkeypatch.setattr(dr, "load_lerobot_episode", lambda *a, **k: (_TwoFrameEpisode(), 0, 2), raising=False)
+    monkeypatch.setattr(
+        dataset_source, "load_lerobot_episode", lambda *a, **k: (_TwoFrameEpisode(), 0, 2), raising=False
+    )
     sim = _ActuatedSim(robots=("solo",))
 
     result = sim.replay_episode("any/dataset", speed=1000.0)
@@ -426,7 +430,7 @@ def test_verify_dataset_episodes_missing_parquet_reports_json_diagnostics(monkey
     into a ``status=error`` dict carrying the machine-readable ``json`` block
     (expected/actual/root) rather than letting the exception escape.
     """
-    import strands_robots.verify_dataset as vd
+    import strands_robots.dataset_metadata as dataset_metadata
 
     class RootedSim(FakeSim):
         def _active_dataset_root(self) -> str:
@@ -435,7 +439,7 @@ def test_verify_dataset_episodes_missing_parquet_reports_json_diagnostics(monkey
     def _raise(root):
         raise FileNotFoundError("meta/info.json not found")
 
-    monkeypatch.setattr(vd, "read_dataset_episode_indices", _raise)
+    monkeypatch.setattr(dataset_metadata, "read_dataset_episode_indices", _raise)
 
     result = RootedSim().verify_dataset_episodes(3)
     assert result["status"] == "error"
@@ -504,7 +508,7 @@ def test_verify_dataset_episodes_rejects_matching_count_with_unreadable_shard(tm
 
 def test_verify_dataset_episodes_import_error_is_structured_error(monkeypatch):
     """A missing optional dep behind the reader degrades to a structured error."""
-    import strands_robots.verify_dataset as vd
+    import strands_robots.dataset_metadata as dataset_metadata
 
     class RootedSim(FakeSim):
         def _active_dataset_root(self) -> str:
@@ -513,7 +517,7 @@ def test_verify_dataset_episodes_import_error_is_structured_error(monkeypatch):
     def _raise(root):
         raise ImportError("pandas is required to read dataset episodes")
 
-    monkeypatch.setattr(vd, "read_dataset_episode_indices", _raise)
+    monkeypatch.setattr(dataset_metadata, "read_dataset_episode_indices", _raise)
 
     result = RootedSim().verify_dataset_episodes(1)
     assert result["status"] == "error"

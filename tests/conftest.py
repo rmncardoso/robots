@@ -143,3 +143,116 @@ def _device_connect_modules_are_put_back() -> Iterator[None]:
     finally:
         if held_modules() != held:
             restore(held)
+
+
+@pytest.fixture(autouse=True)
+def _mesh_rate_limit_history_is_left_empty() -> Iterator[None]:
+    """Leave no rate-limit slots consumed once a test is over.
+
+    ``strands_robots.tools.robot_mesh`` bounds LLM-driven nuisance with a
+    process-global sliding window (``_RATE_HISTORY``, 30 ``tell`` calls per
+    60 s). Every accepted tool call consumes a slot for the life of the
+    process, so a test that spends the window makes the *next* test's call
+    return "rate limit exceeded" instead of doing the thing it asserts.
+
+    Measured with ``tests/test_hitl_operator_response_audit.py`` running ahead
+    of ``tests/mesh/test_robot_mesh_tool.py`` (the ordering ``--dist loadfile``
+    produces and a serial run does not): that file drains ``tell`` to exactly
+    its limit of 30 to make the post-approval re-check deterministic, and four
+    cells in the victim then failed on the refusal - one reading ``'error' ==
+    'success'``, two on "rate limit exceeded" where a dispatch error was
+    expected, one on a call that never reached the mesh at all.
+
+    Ten test modules used to reset the window in a fixture of their own,
+    each with a docstring saying the cases must stay independent of collection
+    order. Clearing here rather than in each caller makes that a property of
+    the session: the window a test spends is refunded by the session, not by
+    ten callers remembering to. Resets *inside* a test - a case that needs two
+    accepted calls of one action - stay where they are; they are the test's
+    own subject, not isolation.
+
+    The module is looked up rather than imported so a session that never
+    touches the mesh does not pull it in.
+    """
+    yield
+    module = sys.modules.get("strands_robots.tools.robot_mesh")
+    if module is not None:
+        module._reset_rate_limits()
+
+
+@pytest.fixture(autouse=True)
+def _optional_module_memo_holds_no_stand_in() -> Iterator[None]:
+    """Leave no stand-in module memoised once a test is over.
+
+    ``strands_robots.utils.require_optional`` memoises every optional
+    dependency it resolves in a process-global dict (``_lazy_modules``), and a
+    test stands in for a module nothing installs by rebinding ``sys.modules``.
+    ``monkeypatch.setitem`` restores the binding, but the memo is a second one
+    it cannot reach: the stand-in the package cached during the test is then
+    handed to every later caller in the process, whose production code calls a
+    fake the fixture already took away.
+
+    Measured with ``tests/policies/moveit2/test_zmq_sidecar.py`` running ahead
+    of the groot client files (the ordering ``--dist loadfile`` produces and a
+    serial run does not): that file's ZMQ stand-in carries
+    ``Context = SimpleNamespace(instance=...)``, the memo kept it, and 42 cells
+    across three files died in ``Gr00tInferenceClient.__init__`` /
+    ``MoveIt2Client`` on ``TypeError: 'types.SimpleNamespace' object is not
+    callable``.
+
+    Restoring here rather than in each caller makes it a property of the
+    session: the memo a test fills is emptied by the session, not by every
+    author of a stand-in remembering to. Entries a test installs *itself*
+    (``monkeypatch.setitem(utils._lazy_modules, ...)`` - the seam that injects a
+    fake into the package directly) are monkeypatch's to undo and are left
+    alone; this restores what the package cached on its own behalf.
+
+    The module is looked up rather than imported so a session that never
+    touches it does not pull it in.
+    """
+    memo = getattr(sys.modules.get("strands_robots.utils"), "_lazy_modules", None)
+    before = dict(memo) if memo is not None else {}
+    yield
+    memo = getattr(sys.modules.get("strands_robots.utils"), "_lazy_modules", None)
+    if memo is not None and memo != before:
+        memo.clear()
+        memo.update(before)
+
+
+@pytest.fixture(autouse=True)
+def _predicate_registry_is_left_as_found() -> Iterator[None]:
+    """Leave the predicate registry holding only what the session started with.
+
+    ``strands_robots.simulation.predicates.PREDICATE_REGISTRY`` is a
+    process-global dict, and :func:`register_predicate` is the documented way
+    to extend it. A test that registers one leaves it there for every later
+    test in the process, and a grader that reads the registry as the set of
+    shipped predicates then fails on a name that only a test knows.
+
+    Measured with ``tests/test_fleet_emergency_evacuation.py`` running ahead of
+    ``tests/simulation/test_predicate_docstring_completeness.py`` (the ordering
+    ``--dist loadfile`` produces and a serial run does not): the example under
+    test registers ``evacuation_abort_within``, and the docstring grader read it
+    as drift - ``bool docstring drift: missing=['evacuation_abort_within']``.
+
+    Seven call sites used to undo their own registration in a ``try``/
+    ``finally``; the session owns it now, so a registration is one line again
+    and the one path that forgot is covered too.
+
+    The module is imported here rather than looked up in ``sys.modules`` the way
+    the ``_lazy_modules`` memo above is: that memo is born empty, this registry
+    is born holding the 30 shipped predicates. A lookup that misses the module -
+    which is what happens whenever nothing imported it at collection time, as in
+    ``pytest tests/test_fleet_emergency_evacuation.py`` alone, where the example
+    under test imports it inside a test - would take an empty baseline and this
+    teardown would then wipe the shipped set for the rest of the process, leaving
+    every later cell on ``Unknown predicate 'inside_region'``. The import costs
+    0.1 s once and pulls in stdlib plus :mod:`strands_robots.utils` only.
+    """
+    from strands_robots.simulation import predicates
+
+    before = dict(predicates.PREDICATE_REGISTRY)
+    yield
+    if predicates.PREDICATE_REGISTRY != before:
+        predicates.PREDICATE_REGISTRY.clear()
+        predicates.PREDICATE_REGISTRY.update(before)

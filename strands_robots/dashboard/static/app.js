@@ -172,6 +172,14 @@ async function loadSim() {
       const o = document.createElement("option"); o.value = r.name; o.textContent = `${r.name} · ${r.joints} dof`; sel.appendChild(o);
     }
     sel.value = "so101";
+    try {
+      const { ports } = await api("/api/sim/ports");
+      for (const p of ports) {
+        const o = document.createElement("option"); o.value = p.port;
+        o.textContent = `mirror ${p.port.replace(/^\/dev\//, "")}${p.likely_servo_bus ? " · servo bus" : ""}`;
+        $("#sim-source").appendChild(o);
+      }
+    } catch (e) { console.warn("ports", e); }
   }
   lockoutLine((await api("/api/safety")).lockout);
   const { sessions } = await api("/api/sim");
@@ -184,10 +192,16 @@ async function loadSim() {
 
 function mountSession(s) {
   const el = node("article", "session"); el.dataset.id = s.id;
-  // Built node by node: the robot name, the session id and the joint names all
-  // arrive from routes, and each one is handed to the page as text.
+  const mirror = s.source && s.source.startsWith("real:");
+  // Built node by node: the robot name, the session id, the joint names and the bus
+  // path all arrive from routes, and each one is handed to the page as text.
   const head = node("div", "head");
   head.append(node("span", "name", s.robot), node("span", "pill mono", s.id), node("span", "pill state", s.state));
+  if (mirror) {
+    const pill = node("span", "pill mirror", "mirror · read-only");
+    pill.title = `Reads the servo bus at ${s.source.slice(5)}; never writes it`;
+    head.appendChild(pill);
+  }
   const view = node("div", "view");
   const canvas = node("canvas", "twin");
   const img = node("img", "cam"); img.alt = `${s.robot} camera`; img.hidden = true;
@@ -204,14 +218,14 @@ function mountSession(s) {
     joints.appendChild(j);
   }
   const foot = node("div", "foot");
-  foot.append(node("span", "t", "t=0.00s"), node("span", "fps", ""));
-  const reset = node("button", "", "Reset"); reset.dataset.act = "reset";
-  const stop = node("button", "", "Stop"); stop.dataset.act = "stop";
-  foot.append(reset, stop);
+  foot.append(node("span", "t", "t=0.00s"), node("span", "fps", ""), node("span", "bus mono", ""));
+  if (!mirror) { const reset = node("button", "", "Reset"); reset.dataset.act = "reset"; foot.appendChild(reset); }
+  const stop = node("button", "", "Stop"); stop.dataset.act = "stop"; foot.appendChild(stop);
   el.append(head, view, joints, foot);
   $("#sessions").appendChild(el);
   el.querySelector('[data-act="stop"]').onclick = async () => { await api(`/api/sim/${s.id}`, { method: "DELETE" }); loadSim(); };
-  el.querySelector('[data-act="reset"]').onclick = async () => { try { await api(`/api/sim/${s.id}/reset`, { method: "POST" }); simMessage(""); } catch (e) { await simFailed(e); } };
+  const resetBtn = el.querySelector('[data-act="reset"]');  // a mirror has none: the arm decides the pose
+  if (resetBtn) resetBtn.onclick = async () => { try { await api(`/api/sim/${s.id}/reset`, { method: "POST" }); simMessage(""); } catch (e) { await simFailed(e); } };
   const twin = new Twin(el.querySelector("canvas.twin"), s.id);
   twins.set(s.id, twin);
   twin.load().catch((e) => console.warn("twin", e));
@@ -229,8 +243,11 @@ function mountSession(s) {
     if (ev.data instanceof ArrayBuffer) { twin.poses(ev.data); return; }
     const m = JSON.parse(ev.data);
     el.classList.toggle("frozen", m.state === "frozen");
+    el.classList.toggle("stale", m.state === "stale" || m.state === "refused" || m.state === "error");
     el.querySelector(".state").textContent = m.state;
-    el.querySelector(".t").textContent = `t=${m.sim_time.toFixed(2)}s`;
+    el.querySelector(".t").textContent = m.bus ? `${m.bus.hz} Hz bus` : `t=${m.sim_time.toFixed(2)}s`;
+    // m.error is why the twin is not following - a bus that went away, or a pose the model refused.
+    if (m.bus) { const b = el.querySelector(".bus"); b.textContent = m.error || m.bus.error || (m.bus.age_ms == null ? "waiting for the bus" : `read ${m.bus.age_ms} ms ago · torque untouched`); b.title = b.textContent; }
     el.querySelector(".fps").textContent = m.fps ? `${m.fps} fps` : "";
     m.qpos.forEach((q, i) => { if (vals[i]) { vals[i].textContent = q.toFixed(3); bars[i].style.transform = `translateX(${Math.max(-1, Math.min(1, q / Math.PI)) * 40}px)`; } });
     lockoutLine(m.lockout);
@@ -240,7 +257,10 @@ function mountSession(s) {
 
 $("#sim-new").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  try { await api("/api/sim", { method: "POST", body: JSON.stringify({ robot: $("#sim-robot").value }) }); simMessage(""); await loadSim(); }
+  const port = $("#sim-source").value;
+  const body = { robot: $("#sim-robot").value };
+  if (port) body.mirror = { port };
+  try { await api("/api/sim", { method: "POST", body: JSON.stringify(body) }); simMessage(""); await loadSim(); }
   catch (e) { await simFailed(e); }
 });
 $("#estop").addEventListener("click", async () => {
@@ -270,13 +290,90 @@ $("#login").addEventListener("click", async () => {
   } catch (e) { $("#login-error").textContent = e.message; }
 });
 
+/* ---- agent ---- */
+let agentWs = null, agentTurn = null;
+function agentSocket() {
+  if (agentWs && agentWs.readyState <= 1) return agentWs;
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/agent`);
+  agentWs = ws;
+  ws.onmessage = (ev) => agentEvent(JSON.parse(ev.data));
+  ws.onclose = (ev) => { if (ev.code === 4401) showLogin(); agentIdle(); };
+  return ws;
+}
+function agentLine(cls, text) {
+  const log = $("#agent-log"), el = document.createElement("div");
+  el.className = cls; el.textContent = text; log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
+}
+function agentIdle() { $("#agent-send").disabled = false; agentTurn = null; }
+function agentEvent(m) {
+  switch (m.type) {
+    case "text":
+      if (!agentTurn) agentTurn = agentLine("turn agent", "");
+      agentTurn.textContent += m.text; $("#agent-log").scrollTop = 1e9; break;
+    case "tool_use":
+      agentTurn = null; agentLine("tool", `▸ ${m.name} ${JSON.stringify(m.input)}`); break;
+    case "tool_result":
+      agentTurn = null; agentLine(`tool${m.status === "error" ? " err" : ""}`, `  ${m.text || m.status}`); break;
+    case "interrupt": {
+      agentTurn = null;
+      const r = m.reason || {}, card = node("div", "consent");
+      // The detail is the tool's own words about a move it wants to make; it is
+      // shown to the operator as text, and answered by the buttons built here.
+      const what = node("div", "what", `${r.tool} · session ${r.session_id || "?"}`);
+      what.append(document.createElement("br"), document.createTextNode(r.detail || JSON.stringify(r.positions)));
+      const row = node("div", "row");
+      for (const [cls, a, label] of [["yes", "once", "Allow once"], ["yes", "always", "Allow for this conversation"], ["no", "no", "Refuse"]]) {
+        const b = node("button", cls, label); b.dataset.a = a; row.appendChild(b);
+      }
+      card.append(node("b", "", "The agent wants to move a robot."), what, row);
+      for (const b of card.querySelectorAll("button")) b.onclick = () => {
+        card.classList.add("answered");
+        card.querySelector(".what").insertAdjacentText("beforeend", b.dataset.a === "no" ? "\n— refused" : b.dataset.a === "always" ? "\n— allowed for this conversation" : "\n— allowed once");
+        agentSocket().send(JSON.stringify({ type: "resume", id: m.id, approve: b.dataset.a !== "no", always: b.dataset.a === "always" }));
+      };
+      $("#agent-log").appendChild(card); $("#agent-log").scrollTop = 1e9; break;
+    }
+    case "done": agentIdle(); break;
+    case "error": agentLine("error", m.message); agentIdle(); break;
+  }
+}
+$("#agent-form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const text = $("#agent-text").value.trim(); if (!text) return;
+  const ws = agentSocket();
+  const send = () => { agentLine("turn you", text); ws.send(JSON.stringify({ type: "say", text })); $("#agent-text").value = ""; $("#agent-send").disabled = true; agentTurn = null; };
+  ws.readyState === 1 ? send() : ws.addEventListener("open", send, { once: true });
+});
+async function loadAgent() {
+  try { const info = await api("/api/agent"); $("#agent-model").textContent = info.model; } catch (e) { $("#agent-model").textContent = ""; }
+  agentSocket();
+}
+
+/* The one place a view is entered: show it, then load what it needs. Every way
+   in - a tab, the loaded URL's fragment, a Back that returns to a fragment
+   show() wrote - comes through here, so the address bar and the screen cannot
+   disagree. */
+function route(view) {
+  show(view);
+  if (view === "fleet") loadFleet();
+  if (view === "sim") loadSim();
+  if (view === "agent") loadAgent();
+  if (view === "settings") loadSettings();
+}
+
+const shownView = () => views.find(v => !$(`#view-${v}`).hidden);
+
 $("#tabs").addEventListener("click", (ev) => {
   const v = ev.target.dataset.view; if (!v) return;
   if (!authenticated) return showLogin();
-  show(v);
-  if (v === "fleet") loadFleet();
-  if (v === "sim") loadSim();
-  if (v === "settings") loadSettings();
+  route(v);
+});
+
+window.addEventListener("hashchange", () => {
+  const v = location.hash.slice(1);
+  if (!views.includes(v) || v === shownView()) return;  // show() writing its own hash
+  if (!authenticated) return showLogin();
+  route(v);
 });
 $("#settings-form").addEventListener("submit", saveSettings);
 
@@ -286,10 +383,7 @@ async function boot() {
   await loadStatus();
   if (!authenticated) return showLogin();
   await loadWho();
-  const v = views.includes(location.hash.slice(1)) ? location.hash.slice(1) : "fleet";
-  show(v);
-  if (v === "fleet") loadFleet();
-  if (v === "sim") loadSim();
-  if (v === "settings") loadSettings();
+  const v = location.hash.slice(1);
+  route(views.includes(v) ? v : "fleet");
 }
 boot();

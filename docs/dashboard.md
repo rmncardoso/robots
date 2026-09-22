@@ -40,16 +40,34 @@ python -m strands_robots dashboard --host 0.0.0.0 --port 8090
 
 | Tab | What it shows | Where the rules live |
 |---|---|---|
-| Fleet | every robot the registry knows, sim and real, and the mesh peers when the `[mesh]` extra is installed | `strands_robots.registry` |
-| Sim | a MuJoCo robot stepping in this process - an MJPEG stream and the same model in your browser | `strands_robots.simulation` |
-| Agent | a Strands Agent with the robot tool; anything that would move hardware pauses on a consent card | `dashboard.agent_hitl`, `dashboard.consent` |
+| Fleet | every robot the registry knows, sim and real, whether its sim asset is already on this disk, and the mesh peers when the `[mesh]` extra is installed - a read of what is here; the page fetches nothing | `strands_robots.registry` |
+| Sim | a MuJoCo robot stepping in this process - an MJPEG stream and the same model in your browser. Or a **mirror**: that twin posed from the real arm's servo bus, read and never written | `strands_robots.simulation`, `dashboard.mirror` |
+| Agent | a Strands Agent whose tools are the simulations on this page; anything that moves a robot pauses on a consent card | `dashboard.agent_console`, `dashboard.agent_hitl`, `dashboard.consent` |
 | Settings | the file `~/.strands_robots/dashboard/settings.json` - agent model, mesh endpoints, static token (shown only as set / unset) | `dashboard.settings` |
+
+Each tab has an address - `#fleet`, `#sim`, `#agent`, `#settings`. Bookmark one
+and it opens there; Back and Forward move between the tabs you visited.
 
 Every string a route serves is rendered as text, never as markup: a Fleet row can
 carry a mesh peer's name, and script running in this page would be same-origin -
 it carries the session cookie and names this origin as its own, so it is behind
 every guard above by construction. `tests/test_dashboard_static_renders_data_as_text.py`
 reads that rule off the files the wheel ships.
+
+## The Agent tab
+
+Type a sentence; the agent answers with tool calls you can read. Its tools are
+the simulations - list the robots the registry can simulate, start one, read its
+joints, move them, reset, stop, and the e-stop. Every one goes through the same
+safety object the buttons use, so a latched e-stop refuses the agent exactly as
+it refuses a click, and stopping is never refused.
+
+Moving a robot pauses first. `sim_set_joints` raises an interrupt before it runs,
+the page shows what a yes would move (`2 - 1.000 rad`), and *Allow once*, *Allow
+for this conversation* or *Refuse* resumes the same turn. A conversation-wide yes
+covers that one session, lives in the socket and dies with it; every answer is
+written to the operator-response audit log. The model is the one named by
+`STRANDS_MODEL_ID`, and the page shows which it is.
 
 ## The e-stop
 
@@ -73,6 +91,31 @@ under an e-stop engaged elsewhere shows RESUME, and a button that reads E-STOP
 stops. A refused request is shown as a message beside the line, not painted as
 an e-stop.
 
+## The twin follows the real arm
+
+Pick a robot, change **simulate** to the serial port the arm is on (the list
+is `GET /api/sim/ports`, servo buses first) and press **Start**. The session
+that appears is marked **mirror · read-only**: a thread reads
+`Present_Position` from every motor at ~20 Hz and the model is posed from the
+readings - no physics steps, no `Reset`, and `joints` answers `400`, because
+the arm decides. Move the arm by hand and the twin moves.
+
+What it will not do is write. lerobot's bus is opened for the handshake (a
+ping and a firmware read) and closed with `disable_torque=False`, since the
+default close writes `Torque_Enable=0` to every motor. Torque stays exactly as
+you left it and the footer says so. Angles are `(ticks - 2048) · 2π / 4096`
+with no calibration applied - right up to the offset a calibration would
+record, and labelled `estimate` in the snapshot's `bus` field along with the
+raw ticks, the read rate and the age of the last reading. A bus that stops
+answering shows **stale**, then **error** with the reason. A pose the model
+refuses - one joint past its range writes nothing, so the twin would otherwise
+sit still while the bus reads healthily - shows **refused** with the joint
+named, and clears itself when the arm comes back inside: unlike **error** it
+ends nothing, so the telemetry socket and the page's twin live through it. A
+port that will not open is a `502` naming it, and nothing is left holding the device -
+nor when the port opens but the engine behind it fails to build or
+render: the session reports **error** and the port is released.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -82,6 +125,7 @@ an e-stop.
 | `STRANDS_DASH_AUTH_BOOTSTRAP_TOKEN` | minted into `enrol_token` | the proof the first enrolment needs |
 | `DASHBOARD_AUTH_TOKEN` | unset | a static bearer for scripts; a passkey session is still needed to remove a passkey |
 | `DASHBOARD_SETTINGS_FILE` | `~/.strands_robots/dashboard/settings.json` | where Settings are written |
+| `STRANDS_MODEL_ID` | the model the installed SDK defaults to | which Bedrock model the Agent tab talks to |
 
 Every auth duration knob (`STRANDS_DASH_AUTH_TOKEN_TTL`, `SESSION_MAX_AGE`,
 `HANDOFF_TTL`) is documented in the [configuration reference](reference/configuration.md);

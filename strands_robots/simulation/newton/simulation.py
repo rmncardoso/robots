@@ -70,6 +70,7 @@ from strands_robots.simulation.newton.backend import (
     articulated_solvers,
     ensure_newton,
     resolve_solver_class,
+    solver_contact_budget,
     solver_registry,
 )
 from strands_robots.simulation.newton.randomization import DomainRandomizationMixin
@@ -1180,9 +1181,10 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 state only (used by control loops that do not need pixels).
 
         Returns:
-            Mapping of short joint name to joint position (float), plus one
-            entry per registered camera (name -> RGB ndarray) when
-            ``skip_images`` is False. A robot with a floating base additionally
+            Mapping of short joint name to joint position (float) paired with
+            its velocity under ``<joint>.vel`` (rad/s, the same reading
+            :meth:`get_robot_state` reports), plus one entry per registered
+            camera (name -> RGB ndarray) when ``skip_images`` is False. A robot with a floating base additionally
             carries ``base_pos`` (world x,y,z incl. height), ``base_quat``
             (orientation, w,x,y,z), ``base_lin_vel`` (m/s, WORLD frame) and
             ``base_ang_vel`` (rad/s, BODY frame - matching the MuJoCo backend and
@@ -1224,25 +1226,34 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 idx = self._joint_coord_index.get((robot_name, jname))
                 if idx is not None and idx < len(joint_q):
                     obs[jname] = float(joint_q[idx])
-                # Per-joint velocity, additive (``"<name>.vel"``) - the
-                # ``SimEngine.get_observation`` schema entry MuJoCo has emitted
-                # since #761 and this backend never did, so a WBC/microduck/
-                # ProtoMotions policy that worked on MuJoCo ran open-loop or
-                # raised ``KeyError`` here. Indexed via ``_joint_dof_index``,
-                # NOT ``_joint_coord_index``: a free joint upstream shifts the
-                # two apart (7 position coords vs 6 velocity dofs), which is
-                # the reason the second map exists. The free joint itself is
-                # already skipped above; its twist is ``base_lin_vel`` /
-                # ``base_ang_vel``.
-                dof = self._joint_dof_index.get((robot_name, jname))
-                if dof is not None and dof < len(joint_qd):
-                    obs[f"{jname}.vel"] = float(joint_qd[dof])
+                    # Velocity companion (``<name>.vel``), read from joint_qd via
+                    # the per-joint DOF index - the two indices differ once a
+                    # robot has a multi-coordinate joint, so the position index
+                    # cannot be reused. Concretely, a free joint upstream shifts
+                    # them apart by one entry per joint (7 position coordinates
+                    # against 6 velocity DOFs), which is the whole reason the
+                    # second map exists. The free joint itself is skipped above;
+                    # its own twist is surfaced as ``base_lin_vel`` /
+                    # ``base_ang_vel``.
+                    #
+                    # INSIDE the position branch, and emitted for every position
+                    # entry (0.0 when the DOF index is unavailable, as
+                    # get_robot_state reports it), because a velocity-feedback
+                    # policy reads the pair BY NAME: the MicroduckPolicy
+                    # observation builder indexes obs[f"{joint}.vel"] for all 14
+                    # joints, and WBC / ProtoMotions read the same spelling.
+                    # Without it a locomotion policy that runs on the MuJoCo
+                    # backend raised KeyError on the first tick here. Keeping the
+                    # two in one branch is what makes "every position has a
+                    # velocity" true rather than usually true.
+                    d_idx = self._joint_dof_index.get((robot_name, jname))
+                    obs[f"{jname}.vel"] = float(joint_qd[d_idx]) if d_idx is not None and d_idx < len(joint_qd) else 0.0
         # Joint sensor noise applies only to the float joint entries -
         # ``joint_pos_std`` to positions, ``joint_vel_std`` to the ``.vel``
-        # keys, split by suffix inside the helper; camera frames are added
+        # companions, split by suffix inside the helper; camera frames are added
         # afterwards (and carry their own jitter via the render path), so the
         # result holds mixed float/ndarray values.
-        obs_out: dict[str, Any] = dict(self._apply_joint_pos_noise(obs))
+        obs_out: dict[str, Any] = dict(self._apply_joint_noise(obs))
         # Floating-base IMU-style signals for a robot with a free root (a
         # humanoid / mobile base): ``base_quat`` (orientation, w,x,y,z) and
         # ``base_ang_vel`` (rad/s), consumed by WBC / locomotion controllers.
@@ -3046,7 +3057,11 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         # Rigid-body solvers (notably SolverMuJoCo) require at least one joint.
         # An empty world (ground plane only) has none, so defer solver creation
         # until a robot is added; stepping is a no-op until then.
-        self._solver = solver_cls(self._model) if self._model.joint_dof_count > 0 else None
+        self._solver = (
+            solver_cls(self._model, **solver_contact_budget(solver_cls, self._model.shape_count))
+            if self._model.joint_dof_count > 0
+            else None
+        )
         self._state_0 = self._model.state()
         self._state_1 = self._model.state()
         self._control = self._model.control()

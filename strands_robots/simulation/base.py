@@ -1391,20 +1391,51 @@ class SimEngine(ABC):
         """
         return None
 
-    def _maybe_install_wbc_torque_control(self, policy: Any, robot_name: str) -> Callable[[], None] | None:
+    def _maybe_install_wbc_torque_control(self, policy: Any, robot_name: str) -> Callable[[], None] | str | None:
         """Hook: auto-install an action controller a policy needs to run correctly.
 
-        Default no-op (returns ``None``). The MuJoCo engine overrides this so a
+        The MuJoCo engine overrides this so a
         :class:`~strands_robots.policies.wbc.WBCPolicy` driven through
         :meth:`run_policy` on a position-servo scene gets the torque shim
         (:func:`~strands_robots.policies.wbc.install_wbc_torque_control`) wired
         up automatically - otherwise WBC's position targets fight the stiff
         servo gain and the documented quickstart silently falls over.
 
-        Returns an optional zero-arg cleanup callable that :meth:`run_policy`
-        invokes in a ``finally`` block to restore the scene after the rollout.
+        No other engine can install that shim: it is written against a compiled
+        ``MjModel`` / ``MjData`` pair. This default therefore *reports* the
+        requirement instead of rolling out without it. On the Newton backend the
+        stock G1 drove its position servos directly and the pelvis sank from
+        0.793 m to 0.074 m within a second while ``run_policy`` reported
+        ``status="success"``: the fall was the only evidence the shim was
+        missing. An engine that can install a controller overrides this hook.
+
+        Returns:
+            ``None`` when nothing has to be installed; a zero-arg cleanup
+            callable when a controller was installed, which :meth:`run_policy`
+            invokes in a ``finally`` block to restore the scene after the
+            rollout; or the reason string when the policy needs a controller
+            this engine cannot install, which :meth:`run_policy` refuses as its
+            ``status="error"`` envelope before any action is applied.
         """
-        return None
+        try:
+            from strands_robots.policies.base import iter_policy_tree
+            from strands_robots.policies.wbc import WBCPolicy
+        except ImportError:
+            return None  # no [wbc] extra: nothing here can need the shim
+        # Keyed on the WBC policy actually driving the joints, which may sit
+        # inside a composite / persistent wrapper, exactly as the MuJoCo
+        # override resolves it.
+        if not any(isinstance(p, WBCPolicy) for p in iter_policy_tree(policy)):
+            return None
+        return (
+            f"run_policy: {robot_name!r} is driven by a WBCPolicy, which emits joint-position "
+            f"targets the scene's position servos override, and the {type(self).__name__} backend "
+            "cannot install the torque shim that corrects them (WBCTorqueController applies "
+            "SONIC's per-joint PD law to a compiled MjModel). No rollout was started, because "
+            "without the shim the robot falls within a fraction of a second while the rollout "
+            'reports success. Run this policy on the MuJoCo backend (backend="mujoco"), or pass '
+            "wbc_install_torque_control=False to drive a torque-actuated scene directly."
+        )
 
     def _build_policy(
         self, entry: str, policy_provider: str, policy_config: dict[str, Any] | None
@@ -3315,7 +3346,13 @@ class SimEngine(ABC):
             ``0.0`` == every actuator confirmed every known step, ``~0.83`` ==
             only 1 of 6). A coarse backend error is excluded from both rate
             denominators instead of being counted as a physical miss; it remains
-            visible in ``action_errors`` and the human-readable diagnostic.
+            visible in ``action_errors`` and the human-readable diagnostic. A
+            step whose applied keys name driven JOINTS rather than actuators is
+            excluded on the same terms: ``send_action`` resolves that spelling
+            (it looks the joint's driving actuator up), but it reports no
+            actuator per key, so the step is unknown for per-actuator purposes
+            rather than a miss - a rollout keyed entirely that way reports an
+            empty map and ``0.0``, not the ``1.0`` of a robot that never moved.
 
             Video: ``video_path`` (``None`` when no MP4 was written),
             ``video_frames`` and ``video_fps`` (the rate the MP4 plays at -
@@ -3543,6 +3580,17 @@ class SimEngine(ABC):
         controller_cleanup = (
             self._maybe_install_wbc_torque_control(policy, robot_name) if wbc_install_torque_control else None
         )
+        if isinstance(controller_cleanup, str):
+            # The hook reports a controller this engine cannot install. Refused
+            # here rather than rolled out: the policy would drive a scene it
+            # cannot hold up, and success is what the caller would be told.
+            return {
+                "status": "error",
+                "content": [
+                    {"text": controller_cleanup},
+                    {"json": {"stopped_reason": "error", "steps_used": 0, "n_steps": 0}},
+                ],
+            }
 
         try:
             runner = PolicyRunner(self)
@@ -4451,7 +4499,7 @@ class SimEngine(ABC):
                 ],
             }
 
-        from strands_robots.verify_dataset import read_dataset_episode_indices
+        from strands_robots.dataset_metadata import read_dataset_episode_indices
 
         try:
             info = read_dataset_episode_indices(root)

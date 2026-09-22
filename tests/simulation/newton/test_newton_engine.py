@@ -72,18 +72,22 @@ class TestRobotManagement:
 
 class TestObservationAction:
     def test_observation_keys_match_joints(self, engine_with_so100):
-        """so100 is a fixed-base arm, so the surface is exactly one position key
-        and one ``<joint>.vel`` key per scalar joint - no ``base_*``.
+        """Each joint contributes a position and its ``<joint>.vel`` companion.
+
+        so100 is a fixed-base arm, so the surface is exactly one position key and
+        one ``<joint>.vel`` key per scalar joint - no ``base_*``. The pairing
+        rather than the key count is the contract a policy reads; see
+        ``test_observation_pairs_joint_velocity.py`` for what consumes it.
 
         Derived from ``robot_joint_names`` rather than filtering ``.vel`` out:
         measured, the filtering form still passes with ``.vel`` emission deleted
         from the observation builder, so it would re-permit the very gap this
-        branch closed.
+        closed.
         """
-        joints = engine_with_so100.robot_joint_names("so100")
+        joints = set(engine_with_so100.robot_joint_names("so100"))
         obs = engine_with_so100.get_observation("so100")
 
-        assert set(obs) == set(joints) | {f"{j}.vel" for j in joints}
+        assert set(obs) == joints | {f"{j}.vel" for j in joints}
         assert all(isinstance(v, float) for v in obs.values())
 
     def test_send_action_moves_joint(self, engine_with_so100):

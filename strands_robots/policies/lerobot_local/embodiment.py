@@ -25,11 +25,12 @@ support ``_extends`` inheritance + ``aliases`` (same loader shape as
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -567,6 +568,47 @@ def observed_state_keys(observation: Mapping[str, Any]) -> list[str]:
     return [k for k, v in observation.items() if k != "task" and not (isinstance(v, np.ndarray) and v.ndim >= 2)]
 
 
+def _state_key_mismatch_detail(missing: list[str], observation: Mapping[str, Any], *, total: bool) -> str:
+    """Describe declared ``state_keys`` absent from the observation, with the remedy.
+
+    One text for both reactions to the same degradation - the warning
+    :func:`_warn_state_key_mismatch` emits and the ``strict_keys`` refusal
+    :class:`PackStateProcessorStep` raises - so a caller who turned the warning
+    into an error reads the same sentence rather than a second wording of it.
+
+    Args:
+        missing: Declared ``state_keys`` absent from ``observation``, in
+            declared order.
+        observation: The observation being packed, read for the keys it does
+            carry.
+        total: Whether NO declared key was present (see
+            :func:`_warn_state_key_mismatch`).
+
+    Returns:
+        The degradation and the registry-checked remedy, one line.
+    """
+    observed = observed_state_keys(observation)
+    shown = missing[:_REMEDY_KEYS_INLINE_MAX]
+    ellipsis = "..." if len(missing) > _REMEDY_KEYS_INLINE_MAX else ""
+    if total:
+        detail = (
+            f"None of the {len(missing)} declared state_keys {shown}{ellipsis} are present in the "
+            f"observation. Observed joint/state keys: {observed}. No observation.state was packed, "
+            "so the model receives no proprioceptive input and the failure surfaces downstream. "
+            "The embodiment's declared keys describe a different robot/sim - or a different naming "
+            "convention for the same one - than the observation reporting them."
+        )
+    else:
+        detail = (
+            f"{len(missing)} declared state_keys are not present in the observation: "
+            f"{shown}{ellipsis}. Observed joint/state keys: {observed}. Present joints keep their "
+            "model index and the missing dims are zero-filled in place, but the sim/robot does not "
+            "report those joints - commonly a mimic/tendon gripper actuator whose name differs from "
+            "the observation's finger-joint names."
+        )
+    return f"{detail} {state_key_remedy(observed)}"
+
+
 def _warn_state_key_mismatch(missing: list[str], observation: Mapping[str, Any], *, total: bool) -> None:
     """Warn once that declared ``state_keys`` are absent from the observation.
 
@@ -589,30 +631,11 @@ def _warn_state_key_mismatch(missing: list[str], observation: Mapping[str, Any],
             reported as an unbindable configuration rather than as a
             zero-filled dimension.
     """
-    observed = observed_state_keys(observation)
-    sig = (tuple(missing), tuple(observed))
+    sig = (tuple(missing), tuple(observed_state_keys(observation)))
     if sig in _WARNED_STATE_KEY_MISMATCH:
         return
     _WARNED_STATE_KEY_MISMATCH.add(sig)
-    shown = missing[:_REMEDY_KEYS_INLINE_MAX]
-    ellipsis = "..." if len(missing) > _REMEDY_KEYS_INLINE_MAX else ""
-    if total:
-        detail = (
-            f"None of the {len(missing)} declared state_keys {shown}{ellipsis} are present in the "
-            f"observation. Observed joint/state keys: {observed}. No observation.state was packed, "
-            "so the model receives no proprioceptive input and the failure surfaces downstream. "
-            "The embodiment's declared keys describe a different robot/sim - or a different naming "
-            "convention for the same one - than the observation reporting them."
-        )
-    else:
-        detail = (
-            f"{len(missing)} declared state_keys are not present in the observation: "
-            f"{shown}{ellipsis}. Observed joint/state keys: {observed}. Present joints keep their "
-            "model index and the missing dims are zero-filled in place, but the sim/robot does not "
-            "report those joints - commonly a mimic/tendon gripper actuator whose name differs from "
-            "the observation's finger-joint names."
-        )
-    logger.warning("lerobot_local: %s %s", detail, state_key_remedy(observed))
+    logger.warning("lerobot_local: %s", _state_key_mismatch_detail(missing, observation, total=total))
 
 
 def register_pack_state_step() -> type | None:
@@ -670,6 +693,17 @@ def register_pack_state_step() -> type | None:
                 ``state_keys``, subtracted from the arm columns so the packed
                 state is mid-centered like LeRobot's ``DEGREES`` mode. Empty
                 (the default) = mid 0.
+            strict_keys: Raise instead of packing a zero-filled dim for a
+                declared key the observation does not carry. The same posture
+                :class:`~strands_robots.policies.lerobot_local.policy.LerobotLocalPolicy`
+                takes on its own state path, so the flag means one thing
+                whichever path composes the vector.
+            missing_keys_sink: List the step writes the zero-filled declared
+                keys into, in declared order. The policy owns it and reports it
+                as ``missing_state_keys_used``: this step runs inside LeRobot's
+                pipeline, so a degradation it absorbs is invisible to the
+                envelope a caller gates on unless it is written somewhere the
+                policy reads.
         """
 
         state_keys: list[str] = field(default_factory=list)
@@ -685,6 +719,12 @@ def register_pack_state_step() -> type | None:
         # subtracted from arm columns so observation.state is mid-centered like
         # lerobot motors_bus DEGREES mode. Empty = mid 0 (prior behavior).
         joint_mids: list[float] = field(default_factory=list)
+        # Refuse a zero-filled dim instead of packing one, mirroring
+        # LerobotLocalPolicy._collect_state_values under strict_keys=True.
+        strict_keys: bool = False
+        # The caller's list, written (not replaced) with the declared keys this
+        # step zero-filled, so the policy can report the degradation it packed.
+        missing_keys_sink: list[str] = field(default_factory=list)
 
         def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
             """Compose the declared scalar joint keys into ``observation.state`` (passthrough when already packed)."""
@@ -756,6 +796,13 @@ def register_pack_state_step() -> type | None:
                 return observation
 
             if missing:
+                if self.strict_keys:
+                    raise ValueError(
+                        "strict_keys=True: " + _state_key_mismatch_detail(missing, observation, total=False)
+                    )
+                # Written in place: the list is the policy's, so replacing it
+                # would leave the policy holding the empty one it passed in.
+                self.missing_keys_sink[:] = missing
                 _warn_state_key_mismatch(missing, observation, total=False)
 
             # Convert sim units (radians + gripper joint range) to the model's
@@ -787,12 +834,33 @@ def register_pack_state_step() -> type | None:
             return out
 
         def get_config(self) -> dict[str, Any]:
-            """Return the JSON-serializable config (``state_keys``, ``expected_dim``, ``dim_policy``) for checkpoint round-trip."""
-            return {
-                "state_keys": list(self.state_keys),
-                "expected_dim": self.expected_dim,
-                "dim_policy": self.dim_policy,
-            }
+            """Return the JSON-serializable config for LeRobot's checkpoint round-trip.
+
+            Every field this step READS at runtime is emitted, so a pipeline
+            that is saved and reloaded packs the same vector. The unit frame
+            (``state_units``, ``gripper_index``, ``gripper_joint_range``,
+            ``joint_mids``) and the ``strict_keys`` posture were dropped here,
+            and LeRobot rehydrates a registered step from exactly this dict - so
+            a reloaded ``"degrees"`` pipeline silently packed raw sim radians
+            where the checkpoint was trained on mid-centered degrees, and a
+            declared key the observation did not carry was zero-filled instead of
+            refused.
+
+            ``missing_keys_sink`` is excluded: it is the POLICY's list, passed in
+            so a degradation this step absorbs is visible to the envelope the
+            caller gates on. It is a live object rather than configuration, and
+            whoever rebuilds the step hands it a fresh one.
+            """
+            config: dict[str, Any] = {}
+            for spec in fields(self):
+                if spec.name == "missing_keys_sink":
+                    continue
+                value = getattr(self, spec.name)
+                # Copy the mutable ones: the config is handed to a serializer
+                # (and, on from_pretrained, to another step) that must not alias
+                # this step's lists.
+                config[spec.name] = list(value) if isinstance(value, list) else value
+            return config
 
         def transform_features(self, features):  # type: ignore[no-untyped-def]
             """Return ``features`` unchanged: packing reshapes only the runtime obs, not the model's declared feature set."""
@@ -805,6 +873,13 @@ def register_pack_state_step() -> type | None:
 
 
 # Embodiment map
+
+# The closed unit-frame vocabulary an EmbodimentMap can convert between. Every
+# conversion site compares against "degrees" (sim_state_to_model,
+# model_action_to_sim, PackStateProcessorStep.observation), so a spelling outside
+# this set means "no conversion" -- which is why EmbodimentMap.__post_init__
+# refuses one instead of storing it.
+UNIT_FRAMES: frozenset[str] = frozenset({"native", "degrees"})
 
 
 @dataclass(frozen=True)
@@ -824,7 +899,9 @@ class EmbodimentMap:
         state_units: Unit convention of the sim state vector this map packs:
             ``"native"`` (the default - no conversion) or ``"degrees"`` (arm
             columns in degrees, gripper column in ``RANGE_0_100``), which is
-            what :meth:`sim_state_to_model` converts from.
+            what :meth:`sim_state_to_model` converts from. Those two are the
+            whole vocabulary (:data:`UNIT_FRAMES`); any other spelling is
+            refused by :meth:`__post_init__`.
         action_units: Unit convention of the model's action vector, same
             vocabulary as ``state_units``. On ``"degrees"``
             :meth:`model_action_to_sim` converts the model's degrees back to sim
@@ -886,6 +963,25 @@ class EmbodimentMap:
     # (RANGE_0_100). Empty (default) = mid 0, i.e. sim qpos=0 is assumed to be
     # the calibration mid (the prior absolute-degrees behavior).
     joint_mids: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Refuse a unit frame no conversion site can honor.
+
+        Raises:
+            ValueError: ``state_units`` or ``action_units`` names a frame outside
+                :data:`UNIT_FRAMES`.
+        """
+        for attr in ("state_units", "action_units"):
+            frame = getattr(self, attr)
+            if frame not in UNIT_FRAMES:
+                raise ValueError(
+                    f"embodiment {self.name!r}: {attr}={frame!r} is not a unit frame this map "
+                    f"can convert; expected one of {sorted(UNIT_FRAMES)}. Every conversion site "
+                    f"compares against 'degrees', so another spelling (LeRobot's own 'DEGREES', "
+                    f"say) silently means 'native': the sim's raw radians reach a degrees-trained "
+                    f"checkpoint unconverted, and its degree actions saturate the sim's radian "
+                    f"joint limits. dim_policy is refused the same way by reconcile_dim."
+                )
 
     def validate(self, input_features: dict[str, Any], output_features: dict[str, Any]) -> None:
         """Fail-fast validation against the model's declared features.
@@ -992,6 +1088,13 @@ _CONFIG_FILE = Path(__file__).parent / "embodiments.json"
 def _resolve(name: str, definitions: dict) -> EmbodimentMap:
     """Resolve a definition name to an :class:`EmbodimentMap`, following ``_extends``.
 
+    A child inherits EVERY field the parent declares except ``name`` (its own),
+    read off :func:`dataclasses.fields` rather than a hand-written list, so a
+    field added to :class:`EmbodimentMap` later cannot silently fail to be
+    inherited and leave the child in the default unit frame while the parent
+    declares ``degrees``. Each value is copied so a child never shares the
+    parent's mutable container. Keys the child declares win.
+
     Keys beginning with a double underscore (e.g. ``__note__``, ``__doc__``) are
     treated as human-facing documentation/metadata and are stripped before
     constructing the dataclass, so the JSON can carry inline provenance notes
@@ -1001,10 +1104,7 @@ def _resolve(name: str, definitions: dict) -> EmbodimentMap:
     if "_extends" in definition:
         parent = _resolve(definition["_extends"], definitions)
         merged: dict[str, Any] = {
-            "obs_rename": dict(parent.obs_rename),
-            "state_keys": list(parent.state_keys),
-            "action_keys": list(parent.action_keys),
-            "dim_policy": parent.dim_policy,
+            f.name: copy.copy(getattr(parent, f.name)) for f in fields(parent) if f.name != "name"
         }
         for k, v in definition.items():
             if k != "_extends" and not k.startswith("__"):
@@ -1067,6 +1167,7 @@ def load_embodiment(embodiment: str | EmbodimentMap | dict) -> EmbodimentMap:
 __all__ = [
     "EmbodimentMap",
     "EMBODIMENT_MAP",
+    "UNIT_FRAMES",
     "ZeroActionMonitor",
     "diagnose_action_dim",
     "load_embodiment",
