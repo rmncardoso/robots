@@ -10,7 +10,10 @@ IID=$(python3 -c "import json;print(json.load(open('$STATE_FILE'))['instance_id'
 REGION=$(python3 -c "import json;print(json.load(open('$STATE_FILE'))['region'])")
 REPO_ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-BUCKET="strands-isaac-example-$ACCOUNT-$REGION"
+# Overridable so the refusal below has an actionable remedy: S3 bucket names are
+# ONE GLOBAL NAMESPACE, so this derived name can already be held by a stranger and
+# the only fix available to the operator is to pick a different one.
+BUCKET="${BUCKET:-strands-isaac-example-$ACCOUNT-$REGION}"
 
 # One private directory for everything this run stages through the filesystem,
 # removed however the script ends. Two things make that necessary rather than
@@ -39,9 +42,52 @@ tar czf "$TARBALL" -C "$REPO_ROOT" \
   --exclude '.git' --exclude '__pycache__' --exclude '.venv' \
   strands_robots examples pyproject.toml README.md
 
-aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || \
-  aws s3 mb "s3://$BUCKET" --region "$REGION" >/dev/null
-aws s3 cp "$TARBALL" "s3://$BUCKET/payload.tgz" --region "$REGION" >/dev/null
+# --expected-bucket-owner on BOTH S3 legs, because the bucket name is derived from
+# the account id and the region and is therefore PREDICTABLE, while S3 bucket names
+# are one global namespace. Account ids are not secrets - they appear in ARNs, in
+# error messages and in shared CloudTrail - so a stranger can pre-create this exact
+# name and attach a policy granting the operator access. A bare `head-bucket` then
+# answers 200 for a bucket THEY own, and the rest of this pipeline proceeds into it:
+#
+#   * the upload hands over the whole packed working tree, uncommitted changes and
+#     all;
+#   * the presigned URL embedded in the staging document points into their bucket,
+#     and root on the instance curls it, untars it into /opt/strands and executes
+#     the inner.sh it contains inside the GPU container.
+#
+# That is the same command-injection-into-a-root-channel the $WORKDIR change above
+# closed on the local-filesystem leg of this pipeline, reached over S3 instead.
+#
+# Asserted on the upload as well as on the check, because a check alone leaves a
+# window: a bucket appearing between the two would be written to unchecked. That
+# forces `s3api put-object` rather than `s3 cp` - ExpectedBucketOwner is modelled on
+# the s3api operations (HeadBucket, PutObject, GetObject) and does not exist on the
+# high-level `s3` commands. `create-bucket` does not model it and needs it least: it
+# fails outright when the name is taken.
+#
+# The download leg needs no flag of its own. Both legs above establish that the
+# bucket is ours, and a bucket `s3 mb` just created is private, so no third party
+# can substitute the object between the upload and the instance's fetch.
+if aws s3api head-bucket --bucket "$BUCKET" --expected-bucket-owner "$ACCOUNT" 2>/dev/null; then
+  :
+elif aws s3 mb "s3://$BUCKET" --region "$REGION" >/dev/null 2>&1; then
+  :
+else
+  # Both failing means the name is unusable rather than merely absent: almost
+  # always another account already holds it, which is exactly what
+  # --expected-bucket-owner exists to refuse. Stop instead of falling through to an
+  # upload, and say what to do - a raw BucketAlreadyExists here reads as a transient
+  # AWS problem and invites a retry that cannot succeed.
+  echo "refusing to use s3://$BUCKET" >&2
+  echo "  head-bucket did not confirm account $ACCOUNT owns it, and it could not be created." >&2
+  echo "  S3 bucket names are globally unique, so the usual cause is that another AWS" >&2
+  echo "  account already holds this name. Uploading there would hand it this machine's" >&2
+  echo "  packed source tree and let it choose what root runs on the instance." >&2
+  echo "  Re-run with BUCKET=<a name you own> to continue." >&2
+  exit 1
+fi
+aws s3api put-object --bucket "$BUCKET" --key payload.tgz --body "$TARBALL" \
+  --expected-bucket-owner "$ACCOUNT" --region "$REGION" >/dev/null
 URL=$(aws s3 presign "s3://$BUCKET/payload.tgz" --region "$REGION" --expires-in 3600)
 rm -f "$TARBALL"
 
