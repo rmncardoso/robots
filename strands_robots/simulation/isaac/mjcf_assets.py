@@ -135,7 +135,17 @@ def _referenced_files(mjcf_path: str) -> list[str]:
     include path is relative to the *including* file, while ``<compiler>`` and
     ``<asset>`` are model-global so a mesh directory declared in an included
     fragment still resolves against the *entry* file's directory, and the last
-    declaration in document order wins with ``meshdir`` beating ``assetdir``.
+    declaration in document order wins - per ATTRIBUTE.
+
+    The base is per asset KIND, which is the part that is easy to get wrong:
+    MuJoCo resolves ``mesh`` / ``hfield`` / ``skin`` against ``meshdir`` and
+    ``texture`` against ``texturedir``, with ``assetdir`` the fallback for both and
+    the model file's own directory the fallback for that. Collapsing the three into
+    one "last directory seen" made ``texturedir`` beat ``meshdir`` inside a single
+    ``<compiler meshdir=... texturedir=...>``, so every mesh resolved into the
+    texture directory, missed, and contributed ``<unreadable>`` instead of its
+    bytes - the digest then did not move when the geometry PhysX simulates changed,
+    which is exactly the staleness this closure exists to prevent.
 
     A missing, unreadable, malformed or cyclic reference contributes its path and
     no bytes rather than raising: this is a cache key, and refusing to compute one
@@ -147,8 +157,19 @@ def _referenced_files(mjcf_path: str) -> list[str]:
     entry_dir = os.path.dirname(entry)
 
     includes: list[str] = []
-    compiler_dirs: list[str] = []
-    asset_files: list[str] = []
+    # One slot per attribute, NOT one list of every directory seen. Flattening
+    # them into a single list and keeping the last entry made ``texturedir`` beat
+    # ``meshdir`` whenever one ``<compiler>`` carried both - the reverse of
+    # MuJoCo's rule and of this function's own docstring - so a mesh resolved into
+    # the texture directory, contributed no bytes, and left the real geometry out
+    # of the key. ``<compiler meshdir=... texturedir=...>`` is an ordinary
+    # Menagerie shape, so that is the common case rather than a corner.
+    declared_dirs: dict[str, str] = {}
+    # Paired with its tag, because the base to resolve against is per KIND:
+    # MuJoCo reads ``mesh`` / ``hfield`` / ``skin`` against ``meshdir`` and
+    # ``texture`` against ``texturedir``. One shared base cannot be right for both
+    # whenever a model declares them separately.
+    asset_files: list[tuple[str, str]] = []
 
     def _walk(path: str, base_dir: str, seen: frozenset[str]) -> None:
         try:
@@ -157,14 +178,16 @@ def _referenced_files(mjcf_path: str) -> list[str]:
             return
         for element in root.iter():
             if element.tag == "compiler":
+                # Last declaration in document order wins, per attribute, which is
+                # what ``_parse_mjcf_mesh_assets`` does for the pair it reads.
                 for attr in ("meshdir", "assetdir", "texturedir"):
                     value = element.get(attr)
                     if value:
-                        compiler_dirs.append(value)
+                        declared_dirs[attr] = value
             elif element.tag in _ASSET_FILE_TAGS:
                 value = element.get("file")
                 if value:
-                    asset_files.append(value)
+                    asset_files.append((element.tag, value))
             elif element.tag == "include":
                 value = element.get("file")
                 if not value:
@@ -179,19 +202,26 @@ def _referenced_files(mjcf_path: str) -> list[str]:
 
     _walk(entry, entry_dir, frozenset({entry}))
 
-    # ``meshdir`` wins over ``assetdir`` within one element and the last element
-    # wins overall, so the effective base is the last directory collected; with
-    # none declared, MuJoCo resolves a relative asset against the model file's
-    # own directory.
-    asset_base = entry_dir
-    for declared in compiler_dirs:
-        asset_base = declared if os.path.isabs(declared) else os.path.join(entry_dir, declared)
+    def _base_for(tag: str) -> str:
+        """The directory MuJoCo resolves a ``tag`` asset's relative file against.
+
+        ``meshdir`` / ``texturedir`` are the kind-specific declarations and
+        ``assetdir`` is the fallback for both; with none declared, a relative
+        asset resolves against the model file's own directory. Resolved against
+        ``entry_dir`` rather than the including file's directory because
+        ``<compiler>`` is model-global - a mesh directory declared in an included
+        fragment still resolves from the entry file.
+        """
+        specific = "texturedir" if tag == "texture" else "meshdir"
+        declared = declared_dirs.get(specific) or declared_dirs.get("assetdir")
+        if not declared:
+            return entry_dir
+        return declared if os.path.isabs(declared) else os.path.join(entry_dir, declared)
 
     resolved = list(includes)
-    for name in asset_files:
-        resolved.append(
-            os.path.normpath(os.path.abspath(name if os.path.isabs(name) else os.path.join(asset_base, name)))
-        )
+    for tag, name in asset_files:
+        base = _base_for(tag)
+        resolved.append(os.path.normpath(os.path.abspath(name if os.path.isabs(name) else os.path.join(base, name))))
     return resolved
 
 
