@@ -11,6 +11,7 @@ import re
 from collections.abc import Collection, Mapping
 from typing import Any
 
+from ..utils import URL_SCHEME_RE
 from .loader import _load
 
 logger = logging.getLogger(__name__)
@@ -340,12 +341,6 @@ def list_policy_aliases() -> dict[str, str]:
     return {alias: canonical for alias, canonical in _build_alias_map().items() if alias != canonical}
 
 
-#: A leading URL scheme, e.g. the ``ws`` in ``ws://gpu-box:8765``. The scheme
-#: grammar is RFC 3986 section 3.1: an ALPHA followed by ALPHA / DIGIT / "+" /
-#: "-" / ".".
-_URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
-
-
 def _url_scheme_refusal(policy: str) -> str | None:
     """Why :func:`resolve_policy` refuses ``policy`` as an address, or ``None``.
 
@@ -362,7 +357,7 @@ def _url_scheme_refusal(policy: str) -> str | None:
         declared pattern matches it.
     """
     url = _with_lowercase_url_scheme(policy.strip())
-    scheme = _URL_SCHEME_RE.match(url)
+    scheme = URL_SCHEME_RE.match(url)
     if scheme is None:
         return None
     if _matches_declared_url_pattern(url):
@@ -405,7 +400,7 @@ def _with_lowercase_url_scheme(policy: str) -> str:
     Returns:
         ``policy`` with any leading scheme lowercased.
     """
-    return _URL_SCHEME_RE.sub(lambda m: f"{m.group(1).lower()}://", policy, count=1)
+    return URL_SCHEME_RE.sub(lambda m: f"{m.group(1).lower()}://", policy, count=1)
 
 
 def _scheme_spellings(pattern: str) -> set[str]:

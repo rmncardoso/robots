@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -784,6 +785,43 @@ def test_start_recording_refuses_a_target_that_holds_the_working_directory(
     assert f"repo_id={repo_id!r}" in r["content"][0]["text"]
     assert (cwd / "my_code.py").read_text() == "keep"
     assert not sim_with_two_robots._world._backend_state.get("recording")
+
+
+@pytest.mark.parametrize("root", ["s3://probe-bucket/datasets/run1", "hf://buckets/org/collection/run1"], ids=repr)
+def test_start_recording_refuses_a_url_root_rather_than_a_folder_named_for_the_scheme(
+    sim_with_two_robots, monkeypatch, tmp_path, root
+):
+    """A root that names a remote store is refused before the session arms.
+
+    ``Path("s3://bucket/run1")`` is the relative path ``s3:/bucket/run1``, so a
+    bucket URI armed the session and LeRobot created a folder named ``s3:``
+    under the working directory, whose first save then failed: the episodes
+    never reached the store.
+    """
+    import strands_robots.dataset_recorder as dr
+
+    def _create_like_lerobot(cls, **kw):
+        # LeRobotDataset.create makes its root with mkdir(parents=True), so a
+        # URL that got this far leaves a folder named after the scheme behind.
+        Path(kw["root"]).mkdir(parents=True)
+        return object()
+
+    monkeypatch.setattr(dr, "has_lerobot_dataset", lambda: True)
+    monkeypatch.setattr(dr.DatasetRecorder, "create", classmethod(_create_like_lerobot))
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    r = sim_with_two_robots.start_recording(repo_id="local/ok", root=root, overwrite=True, cameras=[])
+
+    # Nothing was created and nothing armed; then the envelope says why.
+    assert not (cwd / f"{root.split('://', 1)[0]}:").exists()
+    assert not sim_with_two_robots._world._backend_state.get("recording")
+    assert r["status"] == "error"
+    text = r["content"][0]["text"]
+    # The envelope names the input that carried the URL and the remedy.
+    assert f"root={root!r}" in text
+    assert "sync_to_bucket()" in text
 
 
 def test_start_recording_recorder_init_failure_clears_recording_flag(sim_with_two_robots, monkeypatch, tmp_path):

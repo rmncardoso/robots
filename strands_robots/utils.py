@@ -500,6 +500,15 @@ def redact_config_pairs(config: Mapping[str, Any]) -> str:
     )
 
 
+#: A leading URL scheme - the ``s3`` in ``s3://bucket/key``, the ``ws`` in
+#: ``ws://gpu-box:8765`` - per RFC 3986 section 3.1: an ALPHA followed by ALPHA /
+#: DIGIT / "+" / "-" / ".". Group 1 is the scheme. The policy resolver's
+#: unknown-scheme refusal (``strands_robots.registry.policies``) and the dataset
+#: writers' URL refusal (``strands_robots.dataset_source``) both read it, so the
+#: two cannot disagree on what a URL is.
+URL_SCHEME_RE: Final[re.Pattern[str]] = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
+
+
 def refusal_repr(value: Any) -> str:
     """``repr(value)`` for a refusal message, or a description when it cannot be built.
 

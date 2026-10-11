@@ -306,6 +306,28 @@ def test_build_record_command_respects_explicit_dataset_root() -> None:
     assert cmd[cmd.index("--dataset.root") + 1] == "/data/lerobot/cubes"
 
 
+@pytest.mark.parametrize("dataset_root", ["s3://probe-bucket/datasets/run1", "hf://buckets/org/run1"], ids=repr)
+def test_build_record_command_refuses_a_dataset_root_that_names_a_remote_store(dataset_root: str) -> None:
+    """``lerobot-record`` writes to a local directory, so a URL is refused here.
+
+    ``--dataset.root`` is pinned from this resolution (the stamping fix above),
+    and ``Path("s3://bucket/run1")`` is the relative path ``s3:/bucket/run1``:
+    an unrefused bucket URI pinned the recording to a local folder named
+    ``s3:`` under the operator's working directory. The dispatcher turns this
+    into an error envelope, so the sentence a caller reads is this one.
+    """
+    with pytest.raises(ValueError, match="opens with the URL scheme"):
+        build_lerobot_command(
+            action="start",
+            robot_type="so101_follower",
+            robot_port="/dev/ttyACM0",
+            teleop_type="so101_leader",
+            teleop_port="/dev/ttyACM1",
+            dataset_repo_id="user/cubes",
+            dataset_root=dataset_root,
+        )
+
+
 def test_build_record_command_emits_resume_flag_when_requested() -> None:
     """record_resume=True must emit lerobot-record's --resume true for appending."""
     cmd = build_lerobot_command(
@@ -1022,6 +1044,35 @@ def test_dagger_dispatch_starts_session(monkeypatch: pytest.MonkeyPatch) -> None
     _assert_ascii(_texts(result))
     listed = lerobot_teleoperate(action="list")
     assert "dagger_test" in tool_json(listed)["sessions"]
+
+
+def test_dagger_dispatch_refuses_a_dataset_root_that_names_a_remote_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DAgger run records corrections, so a URL root is refused before anything launches.
+
+    Its argv forwards ``--dataset.root`` as given; the refusal comes from the
+    dispatcher's own ``resolve_dataset_dir`` call, which runs ahead of ``Popen``.
+    """
+    launched: list[Any] = []
+
+    def popen(*args: Any, **kwargs: Any) -> _FakeProc:
+        launched.append(args)
+        return _FakeProc(pid=os.getpid())
+
+    monkeypatch.setattr(tele_mod.subprocess, "Popen", popen)
+    result = lerobot_teleoperate(
+        action="dagger",
+        session_name="dagger_url_root",
+        robot_type="so101_follower",
+        teleop_type="so101_leader",
+        policy_path="user/act_fold",
+        dataset_repo_id="user/fold_corrections",
+        dataset_root="s3://probe-bucket/datasets/fold",
+        dataset_single_task="fold the towel",
+        auto_accept_calibration=False,
+    )
+    assert result["status"] == "error"
+    assert "opens with the URL scheme s3://" in _texts(result)
+    assert launched == []
 
 
 # ---------------------------------------------------------------------------

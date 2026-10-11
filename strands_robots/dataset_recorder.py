@@ -878,7 +878,9 @@ class DatasetRecorder(Recorder):
                 ``(height, width)`` pair of positive integers, or
                 ``video_width`` / ``video_height`` is not a positive integer;
                 or ``fps`` is not a positive whole number; or ``use_videos``,
-                ``streaming_encoding`` or ``overwrite`` is not a boolean.
+                ``streaming_encoding`` or ``overwrite`` is not a boolean; or
+                :func:`~strands_robots.dataset_source.resolve_dataset_dir`
+                refuses the ``repo_id`` or ``root``, a URL among them.
                 Refused before the on-disk target is touched, so an
                 ``overwrite=True`` call that is refused leaves an existing
                 dataset intact.
@@ -1144,7 +1146,9 @@ class DatasetRecorder(Recorder):
         Raises:
             ValueError: ``streaming_encoding`` is not a boolean. Refused before
                 the lerobot extra is probed, so the same caller mistake reports
-                identically on every install.
+                identically on every install. Also raised when
+                :func:`~strands_robots.dataset_source.resolve_dataset_dir`
+                refuses the ``repo_id`` or ``root``, a URL among them.
             RuntimeError: The installed LeRobot has no ``LeRobotDataset.resume``
                 (append needs ``lerobot>=0.5.2``).
         """
