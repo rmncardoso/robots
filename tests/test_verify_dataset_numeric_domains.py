@@ -22,9 +22,17 @@ the length check, and ``expected=0`` asks that a dataset be empty - and rejects
 ``True`` passed ``isinstance(value, int) and value >= 0`` and became a silent
 threshold, or a silent episode count, of one.
 
+``min_std``, the threshold of the near-constant-column advice, is the third
+value this gate compares and the only continuous one. It is read the same way
+(``min_std > 0``), so it has the same "a refused value switches it off" shape,
+and it is held to the same rule here - with its own domain, because a spread is
+not a count: a fractional threshold is exactly what it is for. Its numeric rule
+is the shared :func:`~strands_robots.utils.finite_number_error`, so a refused
+value reads as it does wherever that guard runs; only the floor is the gate's.
+
 Fixtures are pyarrow-only (no lerobot, no mujoco) and every assertion is on
-observable behaviour: the report's ``status`` / ``problems``, whether the
-zero-length episode was actually named, and the CLI exit code.
+observable behaviour: the report's ``status`` / ``problems`` / ``warnings``,
+whether the zero-length episode was actually named, and the CLI exit code.
 """
 
 from __future__ import annotations
@@ -33,16 +41,17 @@ import types
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 pytest.importorskip("pyarrow")
 
 from strands_robots.simulation.base import SimEngine
-from strands_robots.utils import non_negative_count_error
+from strands_robots.utils import finite_number_error, non_negative_count_error, refusal_repr
 from strands_robots.verify_dataset import main as verify_main
 from strands_robots.verify_dataset import verify_dataset
 
-from .test_verify_dataset import _write_dataset
+from .test_verify_dataset import _flat_action_dataset, _write_dataset
 
 # Values no episode-count threshold can be honored as. ``-5`` is refused by the
 # sibling ``expected`` on both surfaces, so it also measures the divergence
@@ -212,3 +221,82 @@ class TestTheCliGateFailsOnARefusedThreshold:
         code = verify_main([str(_corrupt(tmp_path))])
         assert code == 1
         assert "frame(s)" in capsys.readouterr().out
+
+
+# Values no spread threshold can be honored as. ``min_std`` is continuous where
+# the two counts above are discrete, so a fractional value is usable here and
+# what cannot be honored is a non-number, a negative, a non-finite one, or an
+# integer no float stands for (``10**400``, on which ``math.isfinite`` raises).
+# ``False`` is listed for the hole its siblings had: as an ``int`` subclass it
+# would pass a bare ``>= 0`` test and become a silent "advise on nothing".
+UNUSABLE_SPREADS: list[Any] = [
+    -1.0,
+    -1e-9,
+    True,
+    False,
+    float("nan"),
+    float("inf"),
+    pytest.param(10**400, id="10**400"),
+    "1e-3",
+    [1e-3],
+    {"s": 1e-3},
+    None,
+]
+
+# Usable: the documented "skip this advice" spelling, two real thresholds, the
+# int spelling of one (the annotation is ``float``, and ``5`` is one), and the
+# NumPy scalars a threshold computed from an array arrives as.
+USABLE_SPREADS: list[Any] = [0, 0.0, 1e-6, 1e-3, 5, np.float32(1e-3), np.int64(0)]
+
+
+class TestTheSpreadThresholdIsRefusedNotApplied:
+    """``min_std`` is the gate's third threshold, and the only continuous one.
+
+    It shares the failure mode that put the two counts here: it is read as
+    ``min_std > 0`` before the stats are inspected, so a value that fails that
+    comparison does not fail loudly - it switches the advice off. A disabled
+    ``min_frames`` certifies a corrupt dataset ``success``, while a disabled
+    ``min_std`` only withholds advice, so the refusal is what has to be
+    reported rather than the verdict changing.
+    """
+
+    @pytest.mark.parametrize("value", UNUSABLE_SPREADS, ids=repr)
+    def test_an_unusable_spread_is_reported_before_the_dataset_is_read(self, tmp_path: Path, value: Any) -> None:
+        report = _verify(root=_flat_action_dataset(tmp_path), min_std=value)
+        assert isinstance(report, dict) and isinstance(report["problems"], list)
+        assert report["status"] == "error" and report["ok"] is False
+        # In the shared numeric guard's words, or the floor's when only the
+        # floor refuses it: the floor is the one rule this gate adds.
+        refusal = finite_number_error(value, "min_std", "verify_dataset") or (
+            f"verify_dataset: min_std must be >= 0, got {refusal_repr(value)}."
+        )
+        assert refusal in report["problems"], report["problems"]
+        # A caller error, not a dataset verdict: nothing was read, and no advice
+        # was invented from a threshold that was never usable.
+        assert report["total_episodes"] == 0
+        assert report["warnings"] == []
+
+    @pytest.mark.parametrize("value", USABLE_SPREADS, ids=repr)
+    def test_a_usable_spread_is_accepted(self, tmp_path: Path, value: Any) -> None:
+        report = _verify(root=_flat_action_dataset(tmp_path), min_std=value, check_videos=False)
+        assert not any("min_std" in p for p in report["problems"]), report["problems"]
+        assert report["status"] == "success", report
+
+    def test_the_threshold_decides_which_columns_are_flat(self, tmp_path: Path) -> None:
+        """Non-vacuity: the accepted values above are a real comparison.
+
+        The fixture's column has a dataset-wide std of 1e-5, so a threshold below
+        that is met and one above it is not - and ``0`` withholds the advice
+        whatever the column did, which is the documented skip spelling.
+        """
+        advised = _verify(root=_flat_action_dataset(tmp_path / "advised"), min_std=1e-3, check_videos=False)
+        assert len(advised["warnings"]) == 1, advised["warnings"]
+        assert "near-constant" in advised["warnings"][0]
+        assert _verify(root=_flat_action_dataset(tmp_path / "met"), min_std=1e-6, check_videos=False)["warnings"] == []
+        assert _verify(root=_flat_action_dataset(tmp_path / "off"), min_std=0, check_videos=False)["warnings"] == []
+
+    def test_a_negative_min_std_exits_nonzero_on_the_cli(self, tmp_path: Path, capsys: Any) -> None:
+        """A shell-invoked CI gate must not exit 0 on a refused argument."""
+        code = verify_main([str(_flat_action_dataset(tmp_path)), "--no-check-videos", "--min-std", "-1"])
+        assert code == 1
+        assert "min_std must be >= 0, got -1.0" in capsys.readouterr().out

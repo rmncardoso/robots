@@ -47,6 +47,7 @@ Exit code 0 on success, 1 on any problem. Flags:
 | `--min-frames K` | every episode must hold at least K frames (default 1; `0` disables) |
 | `--no-check-videos` | skip the per-episode video file checks |
 | `--no-check-stats` | skip the dead-control-column check |
+| `--min-std X` | advise on control columns whose dataset-wide std is below X (default 0.001; `0` disables) |
 | `--json` | the report as JSON |
 
 ## What it checks
@@ -66,6 +67,6 @@ The parquet is the ground truth; the checker never trusts an agent's "recorded 2
 
 ## The report
 
-`verify_dataset()` returns a dict: `status`, `ok`, `root`, `total_episodes`, `total_frames`, `episode_indices`, `frames_per_episode`, `expected`, `info_total_episodes`, `info_total_frames`, `video_files_checked`, `problems`. A partially corrupt dataset reports the readable files and names each broken one in `problems`.
+`verify_dataset()` returns a dict: `status`, `ok`, `root`, `total_episodes`, `total_frames`, `episode_indices`, `frames_per_episode`, `expected`, `info_total_episodes`, `info_total_frames`, `video_files_checked`, `problems`, `warnings`. A partially corrupt dataset reports the readable files and names each broken one in `problems`; `warnings` holds advice, which never changes `ok`.
 
 Next: [label and judge](label-and-judge.md).
