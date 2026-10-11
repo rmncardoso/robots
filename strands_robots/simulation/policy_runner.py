@@ -239,6 +239,164 @@ def pass_hat_k(n_completed: int, n_success: int, k_max: int = _PASS_HAT_K_MAX) -
     }
 
 
+#: Two-sided coverage of the interval :func:`success_interval` reports. It travels in
+#: the payload as well, because a pair of bounds with no level attached is unreadable.
+_CI_CONFIDENCE = 0.95
+#: Standard normal quantile at 97.5%, the level above. Written out rather than derived:
+#: the standard library has no inverse normal CDF, and one constant is not a reason for
+#: this module to want SciPy.
+_CI_Z = 1.959963984540054
+#: Halvings of ``[0, 1]`` used to invert the binomial tail. Sixty take the bracket below
+#: double precision, so the bound is exact to the digits anyone rounds it to.
+_CI_BISECTIONS = 60
+
+
+def wilson_interval(n_completed: int, n_success: int, z: float = _CI_Z) -> tuple[float, float]:
+    """Wilson score interval for a success rate, as ``(low, high)``.
+
+    The textbook ``p +/- z * sqrt(p(1-p)/n)`` form is the wrong one for an evaluation:
+    its width collapses to zero at ``p`` of 0 or 1, so a policy that failed all five
+    attempts reports 0% with no uncertainty whatever, and near 0/n and n/n its
+    bounds leave ``[0, 1]``. Inverting the score test instead
+    pulls the centre toward 1/2 by an amount that shrinks with ``n``, keeps both
+    bounds inside ``[0, 1]``, and still says something at 0/n and n/n.
+
+    Args:
+        n_completed: Attempts that ran to a verdict.
+        n_success: Attempts among them that succeeded.
+        z: Standard normal quantile for the coverage wanted. The default is 95%.
+
+    Returns:
+        ``(low, high)``, inside ``[0.0, 1.0]``. The low bound is exactly ``0.0`` at
+        ``n_success == 0`` and the high bound exactly ``1.0`` at
+        ``n_success == n_completed``, which is where the score equation puts them -
+        taken from the count rather than from the arithmetic, because ``centre`` and
+        ``half`` are equal there and subtracting them left ``5.6e-17`` as the floor
+        under a run that never succeeded. ``(0.0, 1.0)`` when no attempt completed -
+        nothing was measured, and the whole range is what that says.
+    """
+    if n_completed <= 0:
+        return (0.0, 1.0)
+    p = n_success / n_completed
+    z2 = z * z
+    denominator = 1.0 + z2 / n_completed
+    centre = (p + z2 / (2 * n_completed)) / denominator
+    half = z * math.sqrt(p * (1.0 - p) / n_completed + z2 / (4 * n_completed * n_completed)) / denominator
+    return (
+        0.0 if n_success == 0 else max(0.0, centre - half),
+        1.0 if n_success == n_completed else min(1.0, centre + half),
+    )
+
+
+def _binomial_tail_at_least(k: int, n: int, p: float) -> float:
+    """``P(X >= k)`` for ``X ~ Binomial(n, p)``, which rises monotonically with ``p``.
+
+    Summed through :func:`math.lgamma` rather than :func:`math.comb`, because
+    ``comb(n, i) * p**i`` raises ``OverflowError`` from 1,030 trials up
+    (``comb(1030, 515)`` is already past the largest float) - the coefficient leaves
+    float range while the product it belongs to stays a probability in ``[0, 1]``.
+    """
+    if k <= 0:
+        return 1.0
+    if k > n or p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    log_p, log_q, log_n = math.log(p), math.log1p(-p), math.lgamma(n + 1)
+    return min(
+        1.0,
+        math.fsum(
+            math.exp(log_n - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * log_p + (n - i) * log_q)
+            for i in range(k, n + 1)
+        ),
+    )
+
+
+def clopper_pearson_interval(
+    n_completed: int, n_success: int, alpha: float = 1.0 - _CI_CONFIDENCE
+) -> tuple[float, float]:
+    """Clopper-Pearson (exact) interval for a success rate, as ``(low, high)``.
+
+    Each bound is the ``p`` at which the observed count sits exactly at the
+    ``alpha / 2`` binomial tail, so it invokes no normal approximation and holds at
+    least its nominal coverage for every ``p`` - where :func:`wilson_interval`'s true
+    coverage dips below the level it claims. Reporting the pair is what says how much
+    of the width is approximation rather than data: wherever both ends are interior
+    this interval is the wider of the two, by several points over an evaluation's
+    handful of episodes, so the score interval alone understates what the run left
+    open. At 0/n and n/n it is the narrower one from n=46 up - the score interval's
+    single open end then reaches further than the exact tail does - which is why
+    neither is reported as the conservative one by construction.
+
+    Found by bisection, since the standard library has no inverse beta function. The
+    tail is monotone in ``p``, so the root is unique and the bracket cannot straddle
+    a second one.
+
+    Args:
+        n_completed: Attempts that ran to a verdict.
+        n_success: Attempts among them that succeeded.
+        alpha: Total probability mass outside the interval. The default is 95%
+            coverage, matching :func:`wilson_interval`'s default ``z``.
+
+    Returns:
+        ``(low, high)``. Exactly ``0.0`` low at ``n_success == 0`` and exactly ``1.0``
+        high at ``n_success == n_completed``: that side is then no tail to invert, so
+        it is the endpoint itself and not a number bisection crept up on.
+        ``(0.0, 1.0)`` when no attempt completed.
+    """
+    if n_completed <= 0:
+        return (0.0, 1.0)
+
+    def invert(k: int, target: float) -> float:
+        low, high = 0.0, 1.0
+        for _ in range(_CI_BISECTIONS):
+            middle = 0.5 * (low + high)
+            if _binomial_tail_at_least(k, n_completed, middle) < target:
+                low = middle
+            else:
+                high = middle
+        return 0.5 * (low + high)
+
+    return (
+        0.0 if n_success == 0 else invert(n_success, alpha / 2.0),
+        1.0 if n_success == n_completed else invert(n_success + 1, 1.0 - alpha / 2.0),
+    )
+
+
+def success_interval(n_completed: int, n_success: int) -> dict[str, float]:
+    """Both 95% intervals around a measured success rate, shaped for the JSON payload.
+
+    A success rate is a count over however many episodes ran, and reported alone it
+    reads as a measurement with no width: 4/5 and 400/500 both print as 80%, while
+    the first is consistent with anything from 38% to 96% and the second only with
+    76% to 83%. So a reader comparing two checkpoints cannot tell a difference the
+    run demonstrated from one it was too short to see, which is the question a
+    promotion decision turns on - the same gap :func:`pass_hat_k` fills for repeated
+    attempts.
+
+    Args:
+        n_completed: Attempts that ran to a verdict.
+        n_success: Attempts among them that succeeded.
+
+    Returns:
+        The coverage, so the bounds are readable on their own, and both intervals'
+        bounds, each rounded to 4 decimals like ``success_rate`` and ``pass_hat_k``.
+        Empty when no attempt completed, since there is then no rate to put bounds
+        on - the rule that leaves :func:`pass_hat_k` empty there too.
+    """
+    if n_completed <= 0:
+        return {}
+    wilson_low, wilson_high = wilson_interval(n_completed, n_success)
+    exact_low, exact_high = clopper_pearson_interval(n_completed, n_success)
+    return {
+        "confidence": _CI_CONFIDENCE,
+        "wilson_low": round(wilson_low, 4),
+        "wilson_high": round(wilson_high, 4),
+        "clopper_pearson_low": round(exact_low, 4),
+        "clopper_pearson_high": round(exact_high, 4),
+    }
+
+
 def action_commands_robot(action: Mapping[str, Any]) -> bool:
     """Report whether one action from a policy's chunk commands the robot at all.
 
@@ -4168,6 +4326,17 @@ class PolicyRunner:
             altogether when no success criterion was in force, since every attempt
             then counts as a failure for a reason unrelated to the policy.
 
+            ``success_rate_ci`` carries 95% bounds on ``success_rate`` -
+            ``confidence`` plus ``wilson_low`` / ``wilson_high`` and
+            ``clopper_pearson_low`` / ``clopper_pearson_high``, see
+            :func:`success_interval`. It says how much of the rate is the episode
+            count: 4 of 5 is 80% and also anything from 38% to 96%. Two
+            checkpoints whose intervals do not overlap were separated by the run;
+            overlapping ones may still differ, which takes a two-sample test. Both
+            intervals are reported because their difference is the cost of the
+            normal approximation, which at these counts is not negligible. Gated and
+            empty on the same conditions as ``pass_hat_k``.
+
             ``episodes_successful_at_reset`` (int) counts episodes whose success
             criterion already held at reset, before any action was applied. The
             criterion is sampled only after an applied action, so such an episode
@@ -4731,6 +4900,11 @@ class PolicyRunner:
                             if success_measured
                             else {}
                         ),
+                        # Gated on ``success_measured`` for the same reason as the row
+                        # above: bounds around a rate nobody measured would read as a
+                        # measured range. Derived from the same two counts, so it is
+                        # reported on both routes.
+                        **({"success_rate_ci": success_interval(n_completed, n_success)} if success_measured else {}),
                         "avg_steps": round(avg_steps, 1),
                         "max_steps": max_steps,
                         "policy_load_time_s": round(float(getattr(policy, "load_time_s", 0.0)), 3),
@@ -5330,6 +5504,10 @@ class PolicyRunner:
                         "avg_reward": round(avg_reward, 4),
                         "avg_max_step_reward": avg_max_step_reward,
                         "pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()},
+                        # A benchmark always measures success, so this is unconditional
+                        # here; it is empty when no episode completed, the same shape
+                        # ``pass_hat_k`` takes above it.
+                        "success_rate_ci": success_interval(n_completed, n_success),
                         "max_steps": max_steps,
                         "seed": seed,
                         "benchmark_class": spec_name,
