@@ -43,6 +43,7 @@ _GATE_FIELDS: dict[str, tuple[str, ...]] = {
     "_checkpoint_cadence_problems": ("save_freq",),
     "_rl_checkpoint_interval_problems": ("log_interval",),
     "_validation_episodes_problems": ("val_episodes",),
+    "_min_std_problems": ("min_std",),
     "_resume_problems": ("resume",),
     "_streaming_problems": ("streaming",),
     "_observation_normalization_problems": ("normalize_obs",),

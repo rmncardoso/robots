@@ -191,6 +191,134 @@ class TestQuantileHelpers:
         assert _dataset_quantile_stats_present(root) is True
 
 
+def _write_control_stats(dataset_root, action_std, **features):
+    """Write a v3 ``meta/stats.json`` whose ``action`` carries ``action_std``.
+
+    Keyword features are merged in as given, so a test can add an image feature
+    (whose ``std`` is a nested per-channel array) or a second control feature
+    without this helper knowing their shapes.
+    """
+    import os
+
+    stats = {"action": {"mean": [0.0] * len(action_std), "std": list(action_std)}}
+    stats.update(features)
+    with open(os.path.join(dataset_root, "meta", "stats.json"), "w", encoding="utf-8") as fh:
+        json.dump(stats, fh)
+
+
+_MIN_STD_HINT = "whose std is below min_std"
+
+
+class TestMinStdPreflight:
+    """``min_std`` refuses a dataset whose control columns barely move.
+
+    MEAN_STD normalization divides by ``std + 1e-8``, so a near-constant column
+    is scaled far past the range the policy's input layer is fitted for - and
+    nothing fails: the run trains to completion and reports success. The
+    refusal is opt-in because the statistic alone cannot tell a dead joint from
+    one held still on purpose, and it changes nothing in the dataset.
+    """
+
+    def test_a_flat_column_refuses_the_run_naming_it(self, spec):
+        _write_control_stats(spec.dataset_root, [1e-5, 0.2, 4e-4])
+        spec.min_std = 0.05
+        problems = LerobotTrainer().validate(spec)
+        offending = [p for p in problems if _MIN_STD_HINT in p]
+        assert len(offending) == 1, problems
+        assert "action[0]" in offending[0] and "action[2]" in offending[0]
+        assert "action[1]" not in offending[0]
+        assert "min_std=0.05" in offending[0]
+        assert "lower min_std" in offending[0]
+
+    def test_a_dataset_that_clears_the_threshold_is_clean(self, spec):
+        _write_control_stats(spec.dataset_root, [0.2, 0.3])
+        spec.min_std = 0.05
+        assert LerobotTrainer().validate(spec) == []
+
+    def test_the_default_refuses_nothing(self, spec):
+        # None is "train on whatever the data holds": even a dataset whose every
+        # column is flat must stay launchable for a caller who asked nothing.
+        _write_control_stats(spec.dataset_root, [1e-5, 1e-5])
+        assert spec.min_std is None
+        assert LerobotTrainer().validate(spec) == []
+
+    def test_a_refused_threshold_never_grades_the_dataset(self, spec):
+        """Which values are refused, in which words, is the shared table in
+        ``tests/training/test_train_spec_field_domains.py``. What a refused one
+        must not do is reach the stats: compared with a column, ``"0.05"`` or
+        ``[0.05]`` raises out of a preflight documented to return problems, and
+        ``inf`` or ``True`` would call this dataset's flat column - and its
+        moving one - flat."""
+        _write_control_stats(spec.dataset_root, [1e-5, 0.2])
+        for value in (float("inf"), True, "0.05", [0.05]):
+            spec.min_std = value
+            problems = LerobotTrainer().validate(spec)
+            assert any("min_std must be a positive finite number" in p for p in problems), (value, problems)
+            assert not any(_MIN_STD_HINT in p for p in problems), (value, problems)
+
+    @pytest.mark.parametrize("document", [None, "[1, 2]", '"text"', "{not json"])
+    def test_stats_this_cannot_read_leave_the_question_open(self, spec, document):
+        """An absent, non-object or unreadable ``meta/stats.json`` is the unknown
+        case its sibling quantile probe already declines to flag: a run must not
+        be refused on evidence nobody gathered."""
+        import os
+
+        if document is not None:
+            path = os.path.join(spec.dataset_root, "meta", "stats.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(document)
+        spec.min_std = 0.05
+        assert LerobotTrainer().validate(spec) == []
+
+    def test_an_image_feature_is_not_graded(self, spec):
+        # A camera's std is a nested per-channel array, not one value per control
+        # column, and a flat channel is not the failure this looks for. Reading
+        # it as a column vector compared a list to a float and raised out of a
+        # preflight documented as read-only.
+        _write_control_stats(
+            spec.dataset_root,
+            [0.2],
+            **{"observation.images.cam": {"std": [[[1e-9]], [[1e-9]], [[1e-9]]]}},
+        )
+        spec.min_std = 0.05
+        assert LerobotTrainer().validate(spec) == []
+
+    def test_a_hub_source_with_no_local_root_is_not_refused(self, spec):
+        spec.dataset_root = ""
+        spec.dataset_repo_id = "lerobot/svla_so101_pickplace"
+        spec.min_std = 0.05
+        assert not any(_MIN_STD_HINT in p for p in LerobotTrainer().validate(spec)), spec
+
+    def test_the_helper_reads_the_aggregate_stats_of_every_control_feature(self, spec):
+        from strands_robots.training.lerobot import _columns_below_min_std
+
+        _write_control_stats(
+            spec.dataset_root,
+            [0.2, 1e-5],
+            **{
+                "observation.state": {"std": [1e-5, 0.4]},
+                "observation.state.left": {"std": [1e-5]},
+                # A corrupt stat, not a flat one: ``bool`` is an ``int``, so a
+                # JSON false would read as 0.0 and name a column this gate has
+                # nothing true to say about.
+                "observation.state.right": {"std": [False]},
+                # Not a control feature, whatever its spread.
+                "observation.images.cam": {"std": [1e-9]},
+            },
+        )
+        found = _columns_below_min_std(spec.dataset_root, 0.05)
+        assert sorted(found) == ["action[1]", "observation.state.left[0]", "observation.state[0]"]
+
+    def test_the_threshold_reaches_the_managed_job_as_a_hyperparameter(self):
+        """SageMaker is transport: the caller's image packages a local trainer
+        (this one, for a LeRobot job), so a threshold it dropped would train the
+        dataset the submitter asked it to refuse."""
+        from strands_robots.training.sagemaker import build_hyperparameters
+
+        spec = TrainSpec(dataset_root="s3://b/ds", output_dir="s3://b/out", min_std=0.05)
+        assert json.loads(build_hyperparameters(spec)["min_std"]) == 0.05
+
+
 class TestBuildCommand:
     def test_single_gpu_core_flags(self, spec):
         spec.base_model = "lerobot/act_aloha_sim"  # argv-parity only; no load

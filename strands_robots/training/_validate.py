@@ -382,6 +382,14 @@ def validation_episodes_problems(spec: TrainSpec, *, context: str) -> list[str]:
     return [] if error is None else [error]
 
 
+def min_std_problems(spec: TrainSpec, *, context: str) -> list[str]:
+    """Report ``min_std`` when supplied: a positive finite spread. Empty when ``None``."""
+    if spec.min_std is None:
+        return []
+    error = positive_finite_number_error(spec.min_std, "min_std", context)
+    return [] if error is None else [error]
+
+
 def _posture_flag_problems(spec: TrainSpec, fields: Sequence[str], *, context: str) -> list[str]:
     """One problem per field in *fields* that is not a ``bool``, in that order."""
     problems: list[str] = []

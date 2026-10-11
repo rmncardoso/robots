@@ -65,6 +65,7 @@ FIELD_SCOPED_GATES: dict[str, tuple[str, ...]] = {
     "_checkpoint_cadence_problems": ("save_freq",),
     "_seed_problems": ("seed",),
     "_validation_episodes_problems": ("val_episodes",),
+    "_min_std_problems": ("min_std",),
     "_lora_hyperparameter_problems": ("lora_r", "lora_alpha"),
     # The two posture gates: the only field-scoped domains that are not numeric.
     # The forwarding provider passes both fields on, so they are graded on the
@@ -325,6 +326,7 @@ class TestTheForwardingProviderIsInScopeForEveryGateItReads:
             "_checkpoint_cadence_problems",
             "_launch_topology_problems",
             "_lora_hyperparameter_problems",
+            "_min_std_problems",
             "_resume_problems",
             "_seed_problems",
             "_streaming_problems",

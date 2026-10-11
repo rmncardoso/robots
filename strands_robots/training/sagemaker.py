@@ -113,6 +113,7 @@ _FORWARDED_FIELDS: tuple[str, ...] = (
     "lora_target_modules",
     "tune",
     "val_episodes",
+    "min_std",
     "augmentation",
     "fps",
     "streaming",
@@ -340,6 +341,7 @@ class SagemakerTrainer(Trainer):
         problems.extend(self._launch_topology_problems(spec))
         problems.extend(self._seed_problems(spec))
         problems.extend(self._validation_episodes_problems(spec))
+        problems.extend(self._min_std_problems(spec))
         problems.extend(self._lora_hyperparameter_problems(spec))
         problems.extend(self._resume_problems(spec))
         problems.extend(self._streaming_problems(spec))

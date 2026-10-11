@@ -55,7 +55,7 @@ One name owns both halves: `create_policy("lerobot_local")` runs what `create_tr
 
 ## TrainSpec
 
-One dataclass for every supervised backend: `dataset_root`, `dataset_repo_id`, `streaming`, `base_model`, `output_dir`, `embodiment`, `steps=10_000`, `global_batch_size=32`, `learning_rate`, `save_freq=1_000`, `num_gpus=1`, `num_nodes=1`, `resume`, `seed`, `method="full"` (`lora`, `expert_only`), `lora_r`, `lora_alpha`, `lora_target_modules`, `tune` (component toggles), `val_episodes`, `augmentation`, `fps`, `extra` (backend-native passthrough). `RLTrainSpec` adds the reward-driven fields ([rl](rl.md)).
+One dataclass for every supervised backend: `dataset_root`, `dataset_repo_id`, `streaming`, `base_model`, `output_dir`, `embodiment`, `steps=10_000`, `global_batch_size=32`, `learning_rate`, `save_freq=1_000`, `num_gpus=1`, `num_nodes=1`, `resume`, `seed`, `method="full"` (`lora`, `expert_only`), `lora_r`, `lora_alpha`, `lora_target_modules`, `tune` (component toggles), `val_episodes`, `min_std`, `augmentation`, `fps`, `extra` (backend-native passthrough). `RLTrainSpec` adds reward-driven fields ([rl](rl.md)).
 
 ## Lifecycle
 

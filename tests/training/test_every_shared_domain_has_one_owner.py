@@ -191,6 +191,7 @@ DOMAINS: tuple[SharedDomain, ...] = (
         # relation against another quantity, which the gate cannot see.
         comparisons=("0 < spec.val_episodes < effective",),
     ),
+    _domain("_min_std_problems", ("min_std",), "lerobot.py", "sagemaker.py"),
     _domain("_resume_problems", ("resume",), "lerobot.py", "rsl_rl.py", "sagemaker.py", "isaaclab.py"),
     _domain("_streaming_problems", ("streaming",), "lerobot.py", "sagemaker.py"),
     _domain("_observation_normalization_problems", ("normalize_obs",), "ppo.py", "fast_sac.py", "fast_td3.py"),

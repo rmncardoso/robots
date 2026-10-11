@@ -485,6 +485,44 @@ def _dataset_quantile_stats_present(dataset_root: str) -> bool | None:
     return _stats_have_quantiles(stats)
 
 
+def _columns_below_min_std(dataset_root: str, min_std: float) -> list[str]:
+    """Control columns of a local dataset whose aggregate ``std`` is under ``min_std``.
+
+    Reads the ``meta/stats.json`` normalization divides by; per-episode stats
+    cannot answer this, since a column held still within each episode and moved
+    between them has a healthy aggregate spread. Only ``action`` and
+    ``observation.state*`` entries that are real numbers are graded.
+
+    Args:
+        dataset_root: LeRobotDataset v3 root (the dir that contains ``meta/``).
+        min_std: The spread each column must reach; the caller grades it.
+
+    Returns:
+        One ``"<feature>[<index>]"`` label per column under ``min_std``. Empty
+        when ``meta/stats.json`` is absent, unreadable or not an object: a run
+        is not refused on evidence nobody gathered.
+    """
+    try:
+        with open(os.path.join(dataset_root, "meta", "stats.json"), encoding="utf-8") as fh:
+            stats = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(stats, dict):
+        return []
+    flat: list[str] = []
+    for feature, values in stats.items():
+        if feature not in ("action", "observation.state") and not feature.startswith("observation.state."):
+            continue
+        stds = values.get("std") if isinstance(values, dict) else None
+        if isinstance(stds, list):
+            flat.extend(
+                f"{feature}[{index}]"
+                for index, std in enumerate(stds)
+                if isinstance(std, (int, float)) and not isinstance(std, bool) and std < min_std
+            )
+    return flat
+
+
 def _format_version_major(version: str) -> int | None:
     """MAJOR component of a ``vN.M`` / ``N.M`` dataset format version, or None.
 
@@ -1070,7 +1108,8 @@ class LerobotTrainer(Trainer):
         ``streaming`` ahead of the pair check it gates), a ``val_episodes``
         split below the dataset total and not asked for alongside ``streaming``
         (lerobot's split path is map-style only), a local dataset format version
-        the installed lerobot can read, usable LoRA hyperparameters when
+        the installed lerobot can read, no control column flatter than
+        ``min_std`` when one is asked for, usable LoRA hyperparameters when
         ``method == "lora"``, that ``lerobot.scripts.lerobot_train``
         is importable, and that the packages its ``train()`` requires at call
         time (``accelerate`` always, ``peft`` for ``method == "lora"``) are
@@ -1191,8 +1230,10 @@ class LerobotTrainer(Trainer):
                     problems.append(split_err)
 
         # Shared by BOTH run types: policy and reward-model training load the
-        # same dataset, so an unreadable format version refuses either one.
+        # same dataset, so an unreadable format version - or a control column
+        # flatter than the ``min_std`` the operator asked for - refuses either one.
         problems.extend(self._dataset_codebase_version_problems(spec))
+        problems.extend(self._near_constant_column_problems(spec))
         problems.extend(self._lora_hyperparameter_problems(spec))
 
         # lerobot must be importable to actually train.
@@ -1467,6 +1508,30 @@ class LerobotTrainer(Trainer):
             "lerobot would mis-normalize or fail at train time. Add quantile stats first: "
             f"python -m lerobot.scripts.augment_dataset_quantile_stats --repo-id={repo_id} "
             f"--root={spec.dataset_root} (datasets recorded with current lerobot already include them)."
+        ]
+
+    def _near_constant_column_problems(self, spec: TrainSpec) -> list[str]:
+        """Refuse a local dataset with a control column flatter than ``min_std``.
+
+        ``MEAN_STD`` normalization divides by ``std + 1e-8``, so a column flat to
+        a thousandth of its unit scales what deviation remains by a thousand,
+        and the run still reports success. Opt-in, because a joint held still on
+        purpose reads the same; nothing is clamped. No local root, or stats that
+        cannot be read, leave the question open.
+        """
+        problems = self._min_std_problems(spec)
+        if problems or spec.min_std is None or not spec.dataset_root:
+            return problems
+        flat = _columns_below_min_std(spec.dataset_root, spec.min_std)
+        if not flat:
+            return []
+        shown = ", ".join(flat[:6]) + (", ..." if len(flat) > 6 else "")
+        return [
+            f"the dataset at '{spec.dataset_root}' has {len(flat)} control column(s) whose std is below "
+            f"min_std={spec.min_std:g} in meta/stats.json: {shown}. MEAN_STD normalization divides by "
+            "std + 1e-8, so these columns would be scaled far past the range the policy's input layer is "
+            "fitted for, and the run would report success anyway. Re-record with those joints actuated, "
+            "drop them from the recorded features, or lower min_std if they are meant to be still."
         ]
 
     def _dataset_codebase_version_problems(self, spec: TrainSpec) -> list[str]:

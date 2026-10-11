@@ -1,12 +1,12 @@
 """Every ``TrainSpec`` field is refused by exactly the backends that read it, in the shared words.
 
 The spec fields every trainer may read - the run size, the rate, the seed, the
-checkpoint cadence, the held-out split, the launch topology, the posture flags and
-the LoRA adapter shape - are each read by only some backends: Cosmos and Isaac Lab
-never stream a dataset, the mock backend seeds nothing, the RL trainers size a run
-in timesteps rather than steps. Each backend's preflight gate is a one-liner over a
-shared rule in :mod:`strands_robots.utils`, so the contract every field shares is
-one table here:
+checkpoint cadence, the held-out split, the launch topology, the posture flags, the
+LoRA adapter shape and the ``min_std`` spread threshold - are each read by only
+some backends: Cosmos and Isaac Lab never stream a dataset, the mock backend seeds
+nothing, the RL trainers size a run in timesteps rather than steps. Each backend's
+preflight gate is a one-liner over a shared rule in :mod:`strands_robots.utils`, so
+the contract every field shares is one table here:
 
 * every backend that reads the field reports, for every probe value, exactly the
   shared rule's verdict - one problem in the rule's own words, prefixed with the
@@ -126,6 +126,14 @@ DOMAINS = {
         COUNT_USABLE,
         unset_is_none=True,
         method="lora",
+    ),
+    "min_std": FieldDomain(
+        ("min_std",),
+        positive_finite_number_error,
+        ("lerobot_local", "sagemaker"),
+        [v for v in RATE_UNUSABLE if v is not None],
+        RATE_USABLE,
+        unset_is_none=True,
     ),
 }
 
