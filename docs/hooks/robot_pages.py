@@ -133,7 +133,7 @@ DRIVERS: dict[str, dict[str, object]] = {
         "port": "the robot's IP, recorded for logging; DDS binds to `network_interface`",
         "example": '"192.168.123.164", network_interface="eth0"',
         "sdk": "`pip install 'strands-robots[ros2]'` then `git clone https://github.com/unitreerobotics/unitree_sdk2_python` and `pip install --no-deps -e ./unitree_sdk2_python`",
-        "kwargs": '`network_interface="eth0"`, `battery_floor_pct=15.0`',
+        "kwargs": '`network_interface="eth0"`, `domain_id=0`, `battery_floor_pct=15.0`',
         "units": "radians, keyed by the 29 joint names of the `unitree_g1` model",
         "checks": (
             "`send_action` refuses unless the high-level FSM id is one of `500`, `501`, `801` (`HANDSHAKE_FSMS`)",
@@ -147,7 +147,7 @@ DRIVERS: dict[str, dict[str, object]] = {
         "port": "the robot's IP, recorded for logging; DDS binds to `network_interface`",
         "example": '"192.168.123.161", network_interface="eth0"',
         "sdk": "`pip install 'strands-robots[ros2]'` then `git clone https://github.com/unitreerobotics/unitree_sdk2_python` and `pip install --no-deps -e ./unitree_sdk2_python`",
-        "kwargs": '`network_interface="eth0"`, `battery_floor_pct=15.0`',
+        "kwargs": '`network_interface="eth0"`, `domain_id=0`, `battery_floor_pct=15.0`',
         "units": "radians, keyed by joint name (`GO2_JOINT_INDEX`, `H1_JOINT_INDEX`, `H1_2_JOINT_INDEX`); an index is never accepted, because the SDK's motor order differs from the model's",
         "checks": (
             "`send_action` refuses until `release_sport_mode()` has confirmed the onboard sport service is released",

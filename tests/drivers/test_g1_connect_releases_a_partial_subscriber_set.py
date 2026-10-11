@@ -93,7 +93,7 @@ def _bring_up(
     if refuse_topic is not None:
         endpoint_class = type("_Refusing", (_RefusingEndpoint,), {"refuse_topic": refuse_topic})
     built = _install_channel(monkeypatch, "ChannelSubscriber", endpoint_class)
-    monkeypatch.setattr(engine_module, "ensure_dds", lambda _interface: dds_error)
+    monkeypatch.setattr(engine_module, "ensure_dds", lambda _interface, domain_id=0: dds_error)
 
     # Stand in for the IDL lookup unconditionally.  The real one imports the
     # SDK's generated message modules, which a headless runner does not have,

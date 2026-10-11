@@ -112,7 +112,7 @@ def bus(monkeypatch: pytest.MonkeyPatch) -> None:
     on one without, and would leave SDK submodules in ``sys.modules`` that a
     sibling file pins the absence of.
     """
-    monkeypatch.setattr(uu, "ensure_dds", lambda _iface: None)
+    monkeypatch.setattr(uu, "ensure_dds", lambda _iface, domain_id=0: None)
     monkeypatch.setattr(uu, "_CLIENTS", {"loco": _Loco(), "motion_switcher": _MotionSwitcher()})
     monkeypatch.setattr(uu, "_import_client_class", lambda qualname: STAND_INS[qualname])
     # Every mutative op now stops for operator approval before the RPC (F-001).
@@ -130,7 +130,7 @@ def _failure_rows() -> list[tuple[str, dict[str, Any]]]:
     outcome" a measured claim rather than a sampled one.
     """
     return [
-        ("dds_unavailable", {"ensure_dds": lambda _i: "cyclonedds is not installed"}),
+        ("dds_unavailable", {"ensure_dds": lambda _i, domain_id=0: "cyclonedds is not installed"}),
         ("client_init_failed", {"_CLIENTS": {}, "_import_client_class": _raise_import}),
         ("rpc_raised", {"_CLIENTS": {"loco": _Raises(), "motion_switcher": _Raises()}}),
     ]
@@ -256,7 +256,7 @@ def test_the_danger_warning_is_logged_even_when_the_call_then_fails(
     The log record is written before the call is attempted, which is the only
     ordering that records an attempt whose outcome is unknown.
     """
-    monkeypatch.setattr(uu, "ensure_dds", lambda _i: "cyclonedds is not installed")
+    monkeypatch.setattr(uu, "ensure_dds", lambda _i, domain_id=0: "cyclonedds is not installed")
 
     with caplog.at_level("WARNING", logger="strands_robots.tools.g1.use_unitree"):
         res = _payload(uu.use_unitree("loco", "ZeroTorque", {}))

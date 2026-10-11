@@ -4,13 +4,16 @@ Two things need to be true across the driver and (later, issue #358) the
 agent tools:
 
 * ``ChannelFactoryInitialize`` is called exactly once per process, with a
-  known network interface. Calling it never leaves subscribers with no bus;
-  calling it a second time is *not* an error the SDK reports -
-  ``ChannelFactory.Init`` short-circuits on ``if __initialized: return True``
-  and ignores its ``networkInterface`` argument, so a re-init is a silent
-  no-op that is indistinguishable from a successful bind.
-  :func:`ensure_dds` runs it under a lock, records the interface it actually
-  bound, and is idempotent for callers with the same choice.
+  known network interface and a known DDS domain. Calling it never leaves
+  subscribers with no bus; calling it a second time is *not* an error the SDK
+  reports - ``ChannelFactory.Init`` short-circuits on
+  ``if __initialized: return True`` and ignores its ``networkInterface``
+  argument, so a re-init is a silent no-op that is indistinguishable from a
+  successful bind. :func:`ensure_dds` runs it under a lock, records the
+  interface and domain it actually bound, and is idempotent for callers with
+  the same choice. The domain is a property of that one bind rather than of a
+  caller - ``Init`` takes it beside the interface - so a second caller naming
+  a different domain is refused for the same reason a second interface is.
 * A ``ChannelSubscriber`` and a ``ChannelPublisher`` cannot be constructed
   concurrently: the CycloneDDS bindings segfault. :data:`_DDS_INIT_LOCK` is
   the *shared* lock the driver and the tools (issue #358) both hold while
@@ -32,6 +35,7 @@ from collections.abc import Callable
 from typing import Any
 
 from strands_robots.drivers.base import refuse
+from strands_robots.utils import dds_domain_id_error
 
 logger = logging.getLogger(__name__)
 
@@ -185,11 +189,12 @@ def _bound_elsewhere_error(network_interface: str) -> str:
 
 
 # Recorded once by :func:`ensure_dds` for a running process. A second call
-# with a different interface is a bug worth catching, not a silent no-op.
-_dds_state: dict[str, object] = {"initialized": False, "interface": None}
+# with a different interface or domain is a bug worth catching, not a silent
+# no-op.
+_dds_state: dict[str, object] = {"initialized": False, "interface": None, "domain": None}
 
 
-def ensure_dds(network_interface: str = "eth0") -> str | None:
+def ensure_dds(network_interface: str = "eth0", domain_id: int = 0) -> str | None:
     """Initialise the DDS channel factory, at most once per process.
 
     Returns ``None`` on success. Returns a named error string when the SDK is
@@ -201,10 +206,24 @@ def ensure_dds(network_interface: str = "eth0") -> str | None:
 
     Args:
         network_interface: The interface to bind CycloneDDS to.
+        domain_id: The DDS domain to bind, ``0`` to
+            :data:`~strands_robots.utils.MAX_DDS_DOMAIN_ID`. ``0`` is the
+            domain the robot ships on and what the vendor's own examples pass;
+            name another to reach a bus that is not on it, a simulator or a
+            bench rig kept off the robots' domain. Held to the shared domain
+            rule (:func:`~strands_robots.utils.dds_domain_id_error`) the
+            telemetry bridges and the Booster driver use, because an id this
+            bus accepts and those refuse is a robot publishing where nothing
+            subscribes.
 
     Returns:
         ``None`` on success. An error string otherwise; never raises.
     """
+    # Ahead of the lock, so an unusable domain reports identically with and
+    # without the vendor SDK installed: the refusal is about the value, not
+    # about what the transport made of it.
+    if reason := dds_domain_id_error(domain_id, "domain_id", "ensure_dds"):
+        return reason
     with _DDS_INIT_LOCK:
         if _dds_state["initialized"]:
             recorded = _dds_state["interface"]
@@ -214,6 +233,16 @@ def ensure_dds(network_interface: str = "eth0") -> str | None:
                 return (
                     f"ChannelFactoryInitialize was called with interface "
                     f"{recorded!r}; refusing to re-initialise on {network_interface!r}"
+                )
+            recorded_domain = _dds_state["domain"]
+            if recorded_domain != domain_id:
+                # Same silence, one argument over: the factory binds one
+                # participant per process, so the second domain never reaches
+                # the SDK and its subscribers would sit on the first one,
+                # reading topics nobody publishes there.
+                return (
+                    f"ChannelFactoryInitialize was called with domain "
+                    f"{recorded_domain}; refusing to re-initialise on domain {domain_id}"
                 )
             return None
         try:
@@ -234,7 +263,7 @@ def ensure_dds(network_interface: str = "eth0") -> str | None:
             # for - the silent re-bind the refusal below exists to prevent.
             return _bound_elsewhere_error(network_interface)
         try:
-            sdk_channel.ChannelFactoryInitialize(0, network_interface)
+            sdk_channel.ChannelFactoryInitialize(domain_id, network_interface)
         except Exception as exc:  # noqa: BLE001 - SDK raises bare Exception
             message = str(exc).lower()
             if "already" in message or "initialized" in message:
@@ -251,7 +280,8 @@ def ensure_dds(network_interface: str = "eth0") -> str | None:
             return f"ChannelFactoryInitialize failed: {exc}"
         _dds_state["initialized"] = True
         _dds_state["interface"] = network_interface
-        logger.info("ChannelFactoryInitialize(0, %r) succeeded", network_interface)
+        _dds_state["domain"] = domain_id
+        logger.info("ChannelFactoryInitialize(%d, %r) succeeded", domain_id, network_interface)
         return None
 
 
@@ -265,6 +295,7 @@ def reset_dds_state() -> None:
     with _DDS_INIT_LOCK:
         _dds_state["initialized"] = False
         _dds_state["interface"] = None
+        _dds_state["domain"] = None
 
 
 def live_handle_refusal(

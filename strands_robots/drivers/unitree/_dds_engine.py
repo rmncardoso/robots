@@ -26,6 +26,7 @@ from collections.abc import Callable
 from typing import Any
 
 from strands_robots.drivers.unitree._common import _DDS_INIT_LOCK, ensure_dds, sdk_missing
+from strands_robots.utils import dds_domain_id_error
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +77,26 @@ class DDSSubscriberSet:
     imports.
     """
 
-    def __init__(self, network_interface: str) -> None:
-        """Record the interface; :meth:`start` does the DDS work.
+    def __init__(self, network_interface: str, *, domain_id: int = 0) -> None:
+        """Record the interface and domain; :meth:`start` does the DDS work.
 
         Args:
             network_interface: The interface to bind subscribers to. Passed
                 through to :func:`~strands_robots.drivers.unitree._common.ensure_dds`.
+            domain_id: The DDS domain to bind, ``0`` to
+                :data:`~strands_robots.utils.MAX_DDS_DOMAIN_ID`. Passed through
+                to the same call, and refused here through the shared domain
+                rule rather than only at the bind: a surface that takes a
+                domain id owes the caller that refusal.
+
+        Raises:
+            ValueError: If ``domain_id`` does not name a DDS domain
+                (:func:`~strands_robots.utils.dds_domain_id_error`).
         """
+        if reason := dds_domain_id_error(domain_id, "domain_id", type(self).__name__):
+            raise ValueError(reason)
         self._interface = network_interface
+        self._domain_id = domain_id
         self._subs: list[Any] = []
         self._lock = threading.Lock()
         self._started = False
@@ -99,7 +112,7 @@ class DDSSubscriberSet:
         with self._lock:
             if self._started:
                 return None
-            err = ensure_dds(self._interface)
+            err = ensure_dds(self._interface, domain_id=self._domain_id)
             if err is not None:
                 return err
             self._started = True
@@ -206,7 +219,7 @@ class DDSPublisher:
     Sibling of :class:`DDSSubscriberSet` and shares the same construction lane:
     ``ChannelPublisher(...)`` under :data:`_DDS_INIT_LOCK`, lazy SDK import,
     idempotent :meth:`start` (a second call is a no-op if the same interface
-    was already initialised).
+    and domain were already initialised).
 
     A ``ChannelPublisher`` is constructed once per ``(topic, message_class)``
     pair and cached, because re-constructing a publisher on every write costs
@@ -220,14 +233,26 @@ class DDSPublisher:
     control loop (issue #361). One process, one publisher per topic.
     """
 
-    def __init__(self, network_interface: str) -> None:
-        """Record the interface; :meth:`start` does the DDS work.
+    def __init__(self, network_interface: str, *, domain_id: int = 0) -> None:
+        """Record the interface and domain; :meth:`start` does the DDS work.
 
         Args:
             network_interface: The interface to bind publishers to. Passed
                 through to :func:`~strands_robots.drivers.unitree._common.ensure_dds`.
+            domain_id: The DDS domain to bind, ``0`` to
+                :data:`~strands_robots.utils.MAX_DDS_DOMAIN_ID`. Passed through
+                to the same call, and refused here through the shared domain
+                rule rather than only at the bind: a surface that takes a
+                domain id owes the caller that refusal.
+
+        Raises:
+            ValueError: If ``domain_id`` does not name a DDS domain
+                (:func:`~strands_robots.utils.dds_domain_id_error`).
         """
+        if reason := dds_domain_id_error(domain_id, "domain_id", type(self).__name__):
+            raise ValueError(reason)
         self._interface = network_interface
+        self._domain_id = domain_id
         self._pubs: dict[tuple[str, type], Any] = {}
         self._lock = threading.Lock()
         self._started = False
@@ -243,7 +268,7 @@ class DDSPublisher:
         with self._lock:
             if self._started:
                 return None
-            err = ensure_dds(self._interface)
+            err = ensure_dds(self._interface, domain_id=self._domain_id)
             if err is not None:
                 return err
             self._started = True

@@ -101,7 +101,9 @@ _BUDGET: int = _hook().LIMIT
 #: Raised by 194 to 69,737 when learn/mesh/index.md gained the "Signed wire identity" section (200
 #: words: the knob, the verb@peer allowlist spelling and what an unsigned peer can still do); the
 #: 6 words of slack left after the microduck trim paid for the rest. Banked to the exact total.
-_SITE_BUDGET = 69_737
+#: Raised by 31 to 69,768 for the Unitree page's line on the `domain_id` keyword (the knob, its range and
+#: the one-bind-per-process pairing); the 2 words of slack paid for the rest. Banked to the exact total.
+_SITE_BUDGET = 69_768
 
 #: How far :data:`_SITE_BUDGET` may sit above the real total before it is stale.
 #: A cut larger than this has to be banked by lowering the ceiling.

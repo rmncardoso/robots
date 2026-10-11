@@ -106,11 +106,11 @@ def dds_ready(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """
     monkeypatch.setattr(
         "strands_robots.drivers.unitree._common.ensure_dds",
-        lambda interface: None,
+        lambda interface, domain_id=0: None,
     )
     monkeypatch.setattr(
         "strands_robots.drivers.unitree._dds_engine.ensure_dds",
-        lambda interface: None,
+        lambda interface, domain_id=0: None,
     )
     yield
     reset_dds_state()

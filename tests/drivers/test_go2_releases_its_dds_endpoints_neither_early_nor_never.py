@@ -125,7 +125,9 @@ def _bring_up(
     built = _install_channel(monkeypatch, "ChannelSubscriber", endpoint_class)
 
     pending = list(dds_errors)
-    monkeypatch.setattr(engine_module, "ensure_dds", lambda _interface: pending.pop(0) if pending else None)
+    monkeypatch.setattr(
+        engine_module, "ensure_dds", lambda _interface, domain_id=0: pending.pop(0) if pending else None
+    )
 
     # Stand in for the IDL lookup unconditionally. The real one imports the SDK's
     # generated ``unitree_go`` modules, which an ordinary runner does not have,

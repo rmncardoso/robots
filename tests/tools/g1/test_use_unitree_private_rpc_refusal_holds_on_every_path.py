@@ -85,7 +85,7 @@ def _ctx(response: object) -> MagicMock:
 def robot(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> _RpcClient:
     """A reachable bus with a recording client and a clean gate environment."""
     rec = _RpcClient()
-    monkeypatch.setattr(uu, "ensure_dds", lambda _iface: None)
+    monkeypatch.setattr(uu, "ensure_dds", lambda _iface, domain_id=0: None)
     monkeypatch.setattr(uu, "_CLIENTS", {"loco": rec})
     monkeypatch.setenv("STRANDS_MESH_AUDIT_DIR", str(tmp_path / "audit"))
     for name in ("BYPASS_TOOL_CONSENT", uu.COMMAND_ALLOW_ENV):

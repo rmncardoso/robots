@@ -79,7 +79,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 @pytest.fixture
 def robot(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
     rec = _Recorder()
-    monkeypatch.setattr(uu, "ensure_dds", lambda _iface: None)
+    monkeypatch.setattr(uu, "ensure_dds", lambda _iface, domain_id=0: None)
     monkeypatch.setattr(uu, "_CLIENTS", {"loco": rec, "arm": rec})
     return rec
 

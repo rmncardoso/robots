@@ -179,7 +179,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, attribute: str, factory: _Factory)
 @pytest.fixture
 def dds_ready(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Let ``start()`` succeed without touching a real interface."""
-    monkeypatch.setattr(f"{_ENGINE_LOGGER}.ensure_dds", lambda interface: None)
+    monkeypatch.setattr(f"{_ENGINE_LOGGER}.ensure_dds", lambda interface, domain_id=0: None)
     yield
     reset_dds_state()
 

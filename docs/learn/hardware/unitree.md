@@ -16,6 +16,8 @@ go2 = Robot("unitree_go2", mode="real", port="192.168.123.161", network_interfac
 print(g1.connect_eagerly())          # None, or a reason string
 ```
 
+`domain_id=` names the DDS domain, default `0`, an `int` in `[0, 232]`; the bind is once per process, interface and domain together, so a second, different pair is refused naming what is bound.
+
 ## Install the SDK
 
 `unitree_sdk2py` is not an extra: the PyPI `unitree-sdk2` wheel lacks its `g1` and `comm` packages and pins `cyclonedds==0.10.2`, with no Python 3.12 wheel. The `[ros2]` extra carries the `cyclonedds` binding; the SDK comes from the vendor checkout. On macOS arm64 and x86_64 Linux:

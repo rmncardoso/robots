@@ -77,7 +77,7 @@ def _ctx(response: object) -> MagicMock:
 def robot(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
     """A reachable bus with recording clients and a clean gate environment."""
     rec = _Recorder()
-    monkeypatch.setattr(uu, "ensure_dds", lambda _iface: None)
+    monkeypatch.setattr(uu, "ensure_dds", lambda _iface, domain_id=0: None)
     monkeypatch.setattr(uu, "_CLIENTS", {"loco": rec, "motion_switcher": rec, "audio": rec})
     for name in ("BYPASS_TOOL_CONSENT", uu.COMMAND_ALLOW_ENV):
         monkeypatch.delenv(name, raising=False)

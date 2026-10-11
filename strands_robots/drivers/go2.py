@@ -107,6 +107,7 @@ from strands_robots.drivers.unitree._common import _DDS_INIT_LOCK, sdk_missing
 from strands_robots.drivers.unitree._dds_engine import DDSPublisher, DDSSubscriberSet
 from strands_robots.registry import resolve_name
 from strands_robots.utils import (
+    dds_domain_id_error,
     finite_number_error,
     positive_count_error,
     positive_finite_number_error,
@@ -696,6 +697,7 @@ class Go2Driver:
         *,
         port: str | None = None,
         network_interface: str = "eth0",
+        domain_id: int = 0,
         model: str | None = None,
         battery_floor_pct: float = _BATTERY_FLOOR_PCT,
         motion_switcher_client_factory: Callable[[str], Any] | None = None,
@@ -718,6 +720,14 @@ class Go2Driver:
                 binds to a NIC, not an address. Kept for logging and for
                 SSH-side helpers.
             network_interface: The interface CycloneDDS binds to.
+            domain_id: The DDS domain CycloneDDS binds to, ``0`` to
+                :data:`~strands_robots.utils.MAX_DDS_DOMAIN_ID`. ``0`` is the
+                domain the robot ships on and the one the vendor's examples
+                pass; name another to reach a bus that is not on it, a
+                simulator or a bench rig kept off the robots' domain. The
+                bind is once per process, so the whole process shares it: a
+                second domain is refused rather than silently ignored, which
+                is how the SDK's own re-init behaves.
             model: Which robot's :class:`WireProfile` to drive, when
                 ``tool_name`` does not name one - a renamed mesh peer, or a
                 driver built directly. ``None`` reads the model off
@@ -740,7 +750,9 @@ class Go2Driver:
                 set the driver-base contract fixes.
 
         Raises:
-            ValueError: If ``battery_floor_pct`` is not a finite number, or
+            ValueError: If ``battery_floor_pct`` is not a finite number, if
+                ``domain_id`` does not name a DDS domain
+                (:func:`~strands_robots.utils.dds_domain_id_error`), or
                 ``model`` names a robot this driver has no profile for. A
                 ``nan`` floor would compare False against every reading, so the
                 driver would report a floor in :meth:`get_status` and enforce
@@ -758,6 +770,13 @@ class Go2Driver:
         self._tool_name = tool_name
         self._port = port
         self._network_interface = network_interface
+        # Through the shared domain rather than a local test: a domain id
+        # indexes the RTPS port map, so it has a ceiling as well as a floor,
+        # and the id this bus binds must not be one the telemetry bridges
+        # advertising this robot's topics would refuse.
+        if reason := dds_domain_id_error(domain_id, "domain_id", type(self).__name__):
+            raise ValueError(reason)
+        self._domain_id = domain_id
         self._battery_floor_pct = float(battery_floor_pct)
         self._motion_switcher_client_factory = motion_switcher_client_factory
 
@@ -962,7 +981,7 @@ class Go2Driver:
         if self._connected:
             logger.debug("%s already connected; connect_eagerly() is a no-op", self._tool_name)
             return None
-        subs = DDSSubscriberSet(self._network_interface)
+        subs = DDSSubscriberSet(self._network_interface, domain_id=self._domain_id)
         err = subs.start()
         if err is not None:
             return self._abort_connect(subs, err)
@@ -973,7 +992,7 @@ class Go2Driver:
             err = subs.subscribe(topic, message_class, decoder)
             if err is not None:
                 return self._abort_connect(subs, err)
-        pubs = DDSPublisher(self._network_interface)
+        pubs = DDSPublisher(self._network_interface, domain_id=self._domain_id)
         err = pubs.start()
         if err is not None:
             # Readers are up, the writer failed. Roll back so the driver
@@ -1005,6 +1024,7 @@ class Go2Driver:
                         "connect_error": self._connect_error,
                         "port": self._port,
                         "network_interface": self._network_interface,
+                        "domain_id": self._domain_id,
                         "battery_pct": (self._battery or {}).get("pct"),
                         "battery_floor_pct": self._battery_floor_pct,
                         # Gate diagnostics. ``sport_mode_released`` is what the

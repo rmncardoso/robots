@@ -1,12 +1,12 @@
 """The DDS domain id every ROS 2 surface publishes on is one shared domain.
 
 A ROS 2 / DDS domain id is an index into the RTPS port map, so only an ``int``
-in ``[0, MAX_DDS_DOMAIN_ID]`` names a domain. Six surfaces take one - the
+in ``[0, MAX_DDS_DOMAIN_ID]`` names a domain. Eight surfaces take one - the
 hardware ``Robot``'s ``ros2_domain``, a simulation backend's ``ros2_domain``,
 and the ``domain_id`` of the rclpy telemetry bridge, its hardware subclass, the
-pure-RTPS bridge and the Booster T1 native driver - and they must not disagree
-about which values name a domain, because those transports exist to advertise
-the same topics.
+pure-RTPS bridge and the Booster T1, G1 and Go2 native drivers - and they must
+not disagree about which values name a domain, because those transports exist
+to advertise the same topics.
 
 A native driver belongs on that list for the reason the bridges do: it opens a
 DDS participant of its own (``ChannelFactory.Init(domain_id, ip)``), so a
@@ -37,6 +37,8 @@ import pytest
 import strands_robots
 import strands_robots.hardware_rtps_bridge as rtps_mod
 from strands_robots.drivers.booster import BoosterDriver
+from strands_robots.drivers.g1 import G1Driver
+from strands_robots.drivers.go2 import Go2Driver
 from strands_robots.hardware_ros_bridge import HardwareRosBridge
 from strands_robots.hardware_rtps_bridge import HardwareRtpsBridge
 from strands_robots.ros_telemetry import RosTelemetryBridge
@@ -130,9 +132,11 @@ SURFACES: list[tuple[str, Any]] = [
     ("Robot._init_ros_bridge(ros2_domain=)", _hardware_robot),
     ("SimEngine._init_ros_bridge(ros2_domain=)", _sim_engine),
     # A native driver opens its own participant, so it is a domain surface in
-    # the same sense as the bridges - and the only one whose transport is a
+    # the same sense as the bridges - and the only kind whose transport is a
     # vendor wheel, which the constructor never touches.
     ("BoosterDriver(domain_id=)", lambda v: BoosterDriver(domain_id=v)),
+    ("G1Driver(domain_id=)", lambda v: G1Driver(domain_id=v)),
+    ("Go2Driver(domain_id=)", lambda v: Go2Driver(domain_id=v)),
 ]
 SURFACE_IDS = [name.split("(")[0] for name, _ in SURFACES]
 

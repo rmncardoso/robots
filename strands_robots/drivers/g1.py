@@ -69,6 +69,7 @@ from strands_robots.drivers.unitree._common import (
 from strands_robots.drivers.unitree._dds_engine import DDSPublisher, DDSSubscriberSet
 from strands_robots.drivers.unitree._motion_switcher import FSMReading, read_fsm_id
 from strands_robots.utils import (
+    dds_domain_id_error,
     finite_number_error,
     positive_count_error,
     positive_finite_number_error,
@@ -395,6 +396,7 @@ class G1Driver:
         *,
         port: str | None = None,
         network_interface: str = "eth0",
+        domain_id: int = 0,
         battery_floor_pct: float = _BATTERY_FLOOR_PCT,
         motion_switcher_client_factory: Callable[[str], Any] | None = None,
     ) -> None:
@@ -417,6 +419,14 @@ class G1Driver:
                 logging and future SSH-side helpers.
             network_interface: The interface CycloneDDS binds to. Passed to
                 :func:`~strands_robots.drivers.unitree._common.ensure_dds`.
+            domain_id: The DDS domain CycloneDDS binds to, ``0`` to
+                :data:`~strands_robots.utils.MAX_DDS_DOMAIN_ID`, passed to the
+                same call. ``0`` is the domain the robot ships on and the one
+                the vendor's examples pass; name another to reach a bus that
+                is not on it, a simulator or a bench rig kept off the robots'
+                domain. The bind is once per process, so the whole process
+                shares it: a second domain is refused rather than silently
+                ignored, which is how the SDK's own re-init behaves.
             battery_floor_pct: Percentage below which :meth:`send_action`
                 refuses to write. The floor is separate from the FSM gate so
                 a caller can see which check refused.
@@ -435,12 +445,21 @@ class G1Driver:
                 the driver-base contract fixes.
 
         Raises:
-            ValueError: If ``battery_floor_pct`` is not a finite number.
+            ValueError: If ``battery_floor_pct`` is not a finite number, or
+                ``domain_id`` does not name a DDS domain
+                (:func:`~strands_robots.utils.dds_domain_id_error`).
         """
         del cameras, data_config  # accepted for parity; unused here
         self._tool_name = tool_name
         self._port = port
         self._network_interface = network_interface
+        # Through the shared domain rather than a local test: a domain id
+        # indexes the RTPS port map, so it has a ceiling as well as a floor,
+        # and the id this bus binds must not be one the telemetry bridges
+        # advertising this robot's topics would refuse.
+        if reason := dds_domain_id_error(domain_id, "domain_id", type(self).__name__):
+            raise ValueError(reason)
+        self._domain_id = domain_id
         # The floor is the only constructor value the safety gate compares a
         # reading against, so it is held to the same shared domain
         # ``run_policy`` holds ``duration`` to.  A bare ``float()`` accepted
@@ -736,7 +755,7 @@ class G1Driver:
         if self._connected:
             logger.debug("%s already connected; connect_eagerly() is a no-op", self._tool_name)
             return None
-        subs = DDSSubscriberSet(self._network_interface)
+        subs = DDSSubscriberSet(self._network_interface, domain_id=self._domain_id)
         err = subs.start()
         if err is not None:
             return self._abort_connect(subs, err)
@@ -747,11 +766,13 @@ class G1Driver:
             err = subs.subscribe(topic, message_class, decoder)
             if err is not None:
                 return self._abort_connect(subs, err)
-        # Start the publisher on the same interface.  The subscriber set has
-        # already run ``ensure_dds`` once, so :meth:`DDSPublisher.start`
+        # Start the publisher on the same interface and domain.  The subscriber
+        # set has already run ``ensure_dds`` once, so :meth:`DDSPublisher.start`
         # returns ``None`` without a second SDK init - the shared lock keeps
-        # both halves on the same construction lane.
-        pubs = DDSPublisher(self._network_interface)
+        # both halves on the same construction lane, and passing the driver's
+        # own pair is what keeps the idempotent return rather than the refusal
+        # a differing one earns.
+        pubs = DDSPublisher(self._network_interface, domain_id=self._domain_id)
         err = pubs.start()
         if err is not None:
             # The subscriber set is up; publisher failed.  Roll back so the
@@ -782,6 +803,7 @@ class G1Driver:
                         "connect_error": self._connect_error,
                         "port": self._port,
                         "network_interface": self._network_interface,
+                        "domain_id": self._domain_id,
                         "fsm_id": self._fsm_id,
                         "mode_machine": self._mode_machine,
                         "battery_pct": (self._battery or {}).get("pct"),
@@ -931,13 +953,11 @@ class G1Driver:
                 # driver's own NIC.  ``ChannelFactoryInitialize`` has already
                 # been called by :class:`DDSSubscriberSet.start` (which
                 # :meth:`connect_eagerly` runs before any motion write), so
-                # opening the client does not double-init the bus.  The
-                # actual argument ``MotionSwitcherClient()`` takes is
-                # ``domain_id`` on the current SDK; the network interface is
-                # bound at ``ChannelFactoryInitialize`` time rather than per
-                # client, so it is not forwarded here.  Kept as a positional
-                # ``()`` call to match the SDK's own example, and to leave
-                # room for a domain-id kwarg if the SDK adds one.
+                # opening the client does not double-init the bus.
+                # ``MotionSwitcherClient()`` takes no arguments; the network
+                # interface and the domain are both bound at
+                # ``ChannelFactoryInitialize`` time, so neither is forwarded
+                # here.
                 import importlib
 
                 # The import creates no endpoint, so it stays outside the lock:

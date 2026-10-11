@@ -131,7 +131,7 @@ def dds_ready(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     process-wide channel factory. Short-circuiting it means these cells drive
     the real ``start`` success path rather than assigning ``_started``.
     """
-    monkeypatch.setattr(f"{_ENGINE_LOGGER}.ensure_dds", lambda interface: None)
+    monkeypatch.setattr(f"{_ENGINE_LOGGER}.ensure_dds", lambda interface, domain_id=0: None)
     yield
     reset_dds_state()
 
