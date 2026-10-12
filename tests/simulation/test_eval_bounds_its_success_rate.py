@@ -323,6 +323,42 @@ class TestThePayloadShape:
         )
 
 
+#: Counts no success rate can be read from, each beside the refusal it earns. A float or
+#: ``True`` is refused even when it holds a whole value: a count is an integer, and the
+#: shared guard the package's other counts go through says so in the same words.
+_UNREADABLE_COUNTS = (
+    ((5, 6), "n_success must be at most n_completed (5), got 6."),
+    ((0, 1), "n_success must be at most n_completed (0), got 1."),
+    ((5, -1), "n_success must be a non-negative integer, got -1."),
+    ((-1, 0), "n_completed must be a non-negative integer, got -1."),
+    ((5, 2.0), "n_success must be a non-negative integer, got 2.0."),
+    ((5.0, 2), "n_completed must be a non-negative integer, got 5.0."),
+    ((5, True), "n_success must be a non-negative integer, got True."),
+)
+
+
+class TestCountsNoRateCanBeReadFromAreRefused:
+    """``0 <= n_success <= n_completed``, as integers, or a ``ValueError`` naming the count.
+
+    Unchecked, the arithmetic answered instead: 6 of 5 raised a bare ``math domain
+    error`` from Wilson's square root and came back from Clopper-Pearson as ``(1.0,
+    1.0)``, and -1 completed read as a run that measured nothing. The ends the domain
+    keeps - 0 of 0, 0 of n and n of n - are the ones the sweeps above already run on.
+    """
+
+    def test_each_public_function_refuses_them_by_name(self) -> None:
+        for function in (wilson_interval, clopper_pearson_interval, success_interval):
+            for counts, reason in _UNREADABLE_COUNTS:
+                try:
+                    answer = function(*counts)
+                except ValueError as refusal:
+                    assert str(refusal) == f"{function.__name__}: {reason}", (
+                        f"{function.__name__}{counts} is refused as {str(refusal)!r}"
+                    )
+                else:
+                    pytest.fail(f"{function.__name__}{counts} answered {answer!r} for counts no rate has")
+
+
 @pytest.fixture
 def sim():
     pytest.importorskip("mujoco")

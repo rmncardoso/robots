@@ -67,12 +67,14 @@ from strands_robots.simulation.observers import (
     StoppedReason,
 )
 from strands_robots.utils import (
+    non_negative_count_error,
     non_negative_whole_number_error,
     optional_callable_error,
     positive_count_error,
     positive_finite_number_error,
     process_rss_mb,
     refusal_container_repr,
+    refusal_repr,
 )
 
 if TYPE_CHECKING:
@@ -251,6 +253,36 @@ _CI_Z = 1.959963984540054
 _CI_BISECTIONS = 60
 
 
+def _interval_counts_error(n_completed: int, n_success: int, context: str) -> str | None:
+    """Why two counts are not a success rate's, or ``None`` when they are.
+
+    Each is a count, so each takes the shared non-negative integer guard, and a rate
+    needs ``n_success <= n_completed``. Unchecked, the arithmetic answered instead:
+    6 of 5 raised a bare ``math domain error`` from Wilson's square root and came back
+    from Clopper-Pearson as ``(1.0, 1.0)``, and -1 completed read as a run that
+    measured nothing, ``(0.0, 1.0)``.
+
+    Args:
+        n_completed: Attempts that ran to a verdict.
+        n_success: Attempts among them that succeeded.
+        context: The public function that received them, as the message prefix.
+
+    Returns:
+        An error message, or ``None`` when both are integers with
+        ``0 <= n_success <= n_completed``.
+    """
+    if error := non_negative_count_error(n_completed, "n_completed", context) or non_negative_count_error(
+        n_success, "n_success", context
+    ):
+        return error
+    if n_success > n_completed:
+        return (
+            f"{context}: n_success must be at most n_completed ({refusal_repr(n_completed)}), "
+            f"got {refusal_repr(n_success)}."
+        )
+    return None
+
+
 def wilson_interval(n_completed: int, n_success: int, z: float = _CI_Z) -> tuple[float, float]:
     """Wilson score interval for a success rate, as ``(low, high)``.
 
@@ -274,7 +306,13 @@ def wilson_interval(n_completed: int, n_success: int, z: float = _CI_Z) -> tuple
         ``half`` are equal there and subtracting them left ``5.6e-17`` as the floor
         under a run that never succeeded. ``(0.0, 1.0)`` when no attempt completed -
         nothing was measured, and the whole range is what that says.
+
+    Raises:
+        ValueError: When either count is not a non-negative integer, or
+            ``n_success`` exceeds ``n_completed``.
     """
+    if error := _interval_counts_error(n_completed, n_success, "wilson_interval"):
+        raise ValueError(error)
     if n_completed <= 0:
         return (0.0, 1.0)
     p = n_success / n_completed
@@ -343,7 +381,13 @@ def clopper_pearson_interval(
         high at ``n_success == n_completed``: that side is then no tail to invert, so
         it is the endpoint itself and not a number bisection crept up on.
         ``(0.0, 1.0)`` when no attempt completed.
+
+    Raises:
+        ValueError: When either count is not a non-negative integer, or
+            ``n_success`` exceeds ``n_completed``.
     """
+    if error := _interval_counts_error(n_completed, n_success, "clopper_pearson_interval"):
+        raise ValueError(error)
     if n_completed <= 0:
         return (0.0, 1.0)
 
@@ -383,7 +427,13 @@ def success_interval(n_completed: int, n_success: int) -> dict[str, float]:
         bounds, each rounded to 4 decimals like ``success_rate`` and ``pass_hat_k``.
         Empty when no attempt completed, since there is then no rate to put bounds
         on - the rule that leaves :func:`pass_hat_k` empty there too.
+
+    Raises:
+        ValueError: When either count is not a non-negative integer, or
+            ``n_success`` exceeds ``n_completed``.
     """
+    if error := _interval_counts_error(n_completed, n_success, "success_interval"):
+        raise ValueError(error)
     if n_completed <= 0:
         return {}
     wilson_low, wilson_high = wilson_interval(n_completed, n_success)
