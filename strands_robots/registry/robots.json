@@ -932,7 +932,7 @@
       }
     },
     "unitree_g1": {
-      "description": "Unitree G1 Humanoid (29-DOF + dexterous hands)",
+      "description": "Unitree G1 Humanoid (29-DOF)",
       "category": "humanoid",
       "joints": 29,
       "asset": {
@@ -955,6 +955,20 @@
         "unitree_g1_real",
         "unitree_g1_sonic",
         "unitree_g1_wbc"
+      ]
+    },
+    "unitree_g1_with_hands": {
+      "description": "Unitree G1 Humanoid with hands (43-DOF: 29 body + 7 per hand)",
+      "category": "humanoid",
+      "joints": 43,
+      "asset": {
+        "dir": "unitree_g1_with_hands",
+        "model_xml": "g1_with_hands.xml",
+        "scene_xml": "scene_with_hands.xml",
+        "robot_descriptions_module": "g1_mj_description"
+      },
+      "aliases": [
+        "g1_with_hands"
       ]
     },
     "unitree_h1": {

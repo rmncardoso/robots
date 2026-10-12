@@ -95,6 +95,10 @@ _DESCRIPTION_REPOS: dict[str, tuple[str, str, str]] = {
     "unitree_a1": ("unitreerobotics/unitree_mujoco", "f3300ff1bf0ab9efbea0162717353480d9b05d73", "data/a1"),
     # robot_descriptions 1.23.0 pins google-deepmind/mujoco (model/humanoid) to this commit.
     "mujoco_humanoid": ("google-deepmind/mujoco", "ad0dc0de5e10a075a2c65be629e9a8d557d383a6", "model/humanoid"),
+    # The menagerie ships both G1 variants in ONE directory, and no two registry entries
+    # may share an asset cache dir, so this entry's dir is not a menagerie path. Same ref
+    # as every other menagerie robot, so a bump moves both G1s together.
+    "unitree_g1_with_hands": ("google-deepmind/mujoco_menagerie", MENAGERIE_REF, "unitree_g1"),
 }
 
 

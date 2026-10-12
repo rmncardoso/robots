@@ -2643,7 +2643,7 @@
    ],
    "base_url": "https://cdn.jsdelivr.net/gh/google-deepmind/mujoco_menagerie@c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",
    "category": "humanoid",
-   "description": "Unitree G1 Humanoid (29-DOF + dexterous hands)",
+   "description": "Unitree G1 Humanoid (29-DOF)",
    "driver": "strands",
    "joints": 29,
    "lfs_url": "https://media.githubusercontent.com/media/google-deepmind/mujoco_menagerie/c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",
@@ -2656,6 +2656,28 @@
    "sim": true,
    "source": "curated",
    "thumbnail": "assets/img/robots/unitree_g1.webp",
+   "viewer": true,
+   "viewer_note": null
+  },
+  "unitree_g1_with_hands": {
+   "aliases": [
+    "g1_with_hands"
+   ],
+   "base_url": "https://cdn.jsdelivr.net/gh/google-deepmind/mujoco_menagerie@c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",
+   "category": "humanoid",
+   "description": "Unitree G1 Humanoid with hands (43-DOF: 29 body + 7 per hand)",
+   "driver": null,
+   "joints": 43,
+   "lfs_url": "https://media.githubusercontent.com/media/google-deepmind/mujoco_menagerie/c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",
+   "model": "g1_with_hands.xml",
+   "name": "unitree_g1_with_hands",
+   "palette": null,
+   "raw_url": "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",
+   "real": false,
+   "scene": "scene_with_hands.xml",
+   "sim": true,
+   "source": "curated",
+   "thumbnail": null,
    "viewer": true,
    "viewer_note": null
   },

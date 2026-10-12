@@ -799,10 +799,13 @@ def card(name: str, prefix: str) -> str:
     entry = manifest().get(name, {})
     cov = _load_coverage().row(name)
     thumb = entry.get("thumbnail")
+    # A thumbnail is rendered by a sweep (docs/hooks/render_thumbnails.py), not by this
+    # build, so a robot added between two sweeps has a simulation asset and no picture of
+    # it. Saying "no simulation asset" there contradicts the card's own `sim` chip.
     figure = (
         f'<img src="{prefix}{thumb}" alt="{html.escape(name)} rendered from its MuJoCo model" loading="lazy" width="640" height="480">'
         if thumb
-        else '<span class="sr-robot-nothumb">no simulation asset</span>'
+        else f'<span class="sr-robot-nothumb">{"not yet rendered" if entry.get("sim") else "no simulation asset"}</span>'
     )
     badges = ""
     if entry.get("sim"):

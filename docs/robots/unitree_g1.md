@@ -1,11 +1,11 @@
 ---
 title: unitree_g1
-description: "Unitree G1 Humanoid (29-DOF + dexterous hands)"
+description: "Unitree G1 Humanoid (29-DOF)"
 ---
 
 <!-- generated: docs/hooks/robot_pages.py -->
 
-# Unitree G1 Humanoid (29-DOF + dexterous hands)
+# Unitree G1 Humanoid (29-DOF)
 
 {{robot_chips:unitree_g1}}
 

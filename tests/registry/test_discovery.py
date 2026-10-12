@@ -193,18 +193,26 @@ def test_a_description_short_name_resolves_to_the_curated_robot_that_ships_it() 
     if ``so101`` ships that module but does not claim the short name,
     ``Robot("so_arm101")`` falls through to discovery and loads the same MJCF
     without the curated joint labels, so a labelled ``send_action`` is dropped.
+
+    One description may be shipped by SEVERAL entries - ``g1_mj_description``
+    holds both of the menagerie's G1 models, so ``unitree_g1`` and
+    ``unitree_g1_with_hands`` name it - and resolving to any one of them is
+    enough, because discovery is then not consulted at all. Hence a set of
+    owners per module: keyed one-to-one, which entry the short name was expected
+    to resolve to would be decided by the order ``robots.json`` happens to list
+    them in.
     """
     from strands_robots.registry.loader import _load
     from strands_robots.registry.robots import resolve_name
 
     robots = _load("robots")["robots"]
-    shipped = {
-        info["asset"]["robot_descriptions_module"].removesuffix("_mj_description"): name
-        for name, info in robots.items()
-        if info.get("asset", {}).get("robot_descriptions_module", "").endswith("_mj_description")
-    }
+    shipped: dict[str, set[str]] = {}
+    for name, info in robots.items():
+        module = info.get("asset", {}).get("robot_descriptions_module", "")
+        if module.endswith("_mj_description"):
+            shipped.setdefault(module.removesuffix("_mj_description"), set()).add(name)
     assert len(shipped) >= 5
-    unclaimed = {short: owner for short, owner in shipped.items() if resolve_name(short) != owner}
+    unclaimed = {short: sorted(owners) for short, owners in shipped.items() if resolve_name(short) not in owners}
     assert unclaimed == {}
 
 

@@ -82,6 +82,27 @@ def test_cards_reference_only_thumbnails_that_exist() -> None:
         assert (_REPO / "docs" / src).is_file(), src
 
 
+def test_a_card_with_no_thumbnail_yet_does_not_deny_the_simulation_asset() -> None:
+    """A thumbnail comes from a render sweep, not from the build, so the two differ.
+
+    ``docs/hooks/render_thumbnails.py`` is run by hand against a built site, so a
+    robot added between two sweeps has an asset and no picture of it. The card's
+    placeholder read "no simulation asset" for every missing thumbnail, which on
+    such a robot contradicts the ``sim`` chip beside it and the "Model:" link on
+    its own page.
+    """
+    hook = _hook()
+    for name, spec in hook.registry().items():
+        card = hook.card(name, "")
+        if '<img src="' in card:
+            continue
+        denies = "no simulation asset" in card
+        assert denies is not bool(hook.manifest().get(name, {}).get("sim")), (
+            f"the {name} card says {'it has no simulation asset' if denies else 'nothing about its absence'}, "
+            f"but the registry {'declares' if spec.get('asset') else 'declares no'} asset for it"
+        )
+
+
 def test_each_native_driver_is_described_once_and_every_robot_page_links_there() -> None:
     """The drivers page renders every ``DRIVERS`` entry once; a robot page links to it instead of restating it."""
     hook = _hook()
