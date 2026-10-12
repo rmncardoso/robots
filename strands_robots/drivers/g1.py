@@ -32,8 +32,8 @@ What the driver actually does:
   the provider registry (ACT / SmolVLA / GR00T N1.7 through lerobot_local) is not yet plumbed
   here - a caller with an already-built policy uses :meth:`run_policy`
   today.  Locomotion and arm-SDK-shaped verbs arrive with the ``g1_tools``
-  motion verbs; the driver's job in issue #354 was the transport, and the
-  control loop that closes issue #361 lives here now.
+  motion verbs; the driver's job was the transport, and the control loop
+  lives here now.
 
 Nothing in this module imports ``unitree_sdk2py`` at module load. Every SDK
 touch is inside a function body, so the module can be imported on Thor, on CI,
@@ -633,7 +633,7 @@ class G1Driver:
         ``lidar_snapshot``) arrives with the vendored neon tools that
         the agent gets in addition to the driver-as-tool; the transport
         primitive those verbs will call - :meth:`send_action` publishing on
-        ``rt/lowcmd`` - already ships (issue #361).
+        ``rt/lowcmd`` - already ships.
         """
         del kwargs  # forward-compat only
         del invocation_state
@@ -1657,8 +1657,8 @@ class G1Driver:
 
         A full ``PointCloud2_`` from the MID-360 is ~30k points at 10 Hz - way
         too much to publish unpaced. The summary is what the mesh's health
-        chip reads; the 3D tile (issue #356) subscribes the raw cloud itself
-        through a paced publisher and does its own downsampling.
+        chip reads; a view that wants the raw cloud subscribes it itself,
+        through a paced publisher, and does its own downsampling.
 
         What bounds this record is that every field is read from the message
         *header* - ``width``, ``height``, ``point_step``, ``row_step`` - so its
@@ -1921,8 +1921,8 @@ def _build_zero_torque_lowcmd(
     """Return a ``LowCmd_`` with every motor's gains and effort zeroed.
 
     A zero-kp/kd/tau motor holds no position and applies no torque - the
-    softest wire frame the SDK protocol accepts.  Used by :meth:`G1Driver.stop`
-    (issue #361 follow-up: the control loop uses the same helper on shutdown).
+    softest wire frame the SDK protocol accepts.  :meth:`G1Driver.stop` reaches
+    it through the control loop it halts, which publishes it on shutdown.
 
     Kept as a free function so a test can compare the produced envelope
     slot-by-slot without a driver instance, and so the ``stop`` and control

@@ -6,7 +6,7 @@ The mesh publishes those caches at its own cadence, so the DDS callback stays
 fast: parse, drop into a slot, return.
 
 The driver also holds one :class:`DDSPublisher` for the ``rt/lowcmd`` write
-path (and any other topic the control loop grows in issue #361). Publishers
+path (and any other topic the control loop grows). Publishers
 are cached per ``(topic, message_class)`` and constructed under the shared
 :data:`_DDS_INIT_LOCK`; that is the same lock the subscriber set holds, so a
 reader and a writer never construct concurrently on the CycloneDDS bindings
@@ -217,7 +217,7 @@ class DDSPublisher:
     The engine deliberately exposes ``get_publisher`` too so a caller that
     wants to build its own message and call ``Write`` directly (a future
     arm-SDK client would be that caller) can share the cache with the driver's
-    control loop (issue #361). One process, one publisher per topic.
+    control loop. One process, one publisher per topic.
     """
 
     def __init__(self, network_interface: str) -> None:
@@ -365,9 +365,9 @@ class DDSPublisher:
         it caches, and each publisher is closed under its own ``try`` so one
         failure cannot strand the rest.
 
-        The driver holds no :class:`DDSPublisher` yet - the control loop that
-        owns one lands with issue #361 - so today this is reached only by a
-        caller that built its own.
+        The G1 and Go2 drivers each hold one and call this from ``cleanup``
+        once their control loop has joined, so the loop's zero-torque frame
+        goes out first.
         """
         with self._lock:
             pubs, self._pubs = list(self._pubs.values()), {}

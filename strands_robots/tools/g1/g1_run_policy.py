@@ -248,8 +248,7 @@ def g1_run_policy(
             "already-built policy - either a Policy instance with a "
             "`.step(obs)` method or a bare callable that returns a "
             "joint-name-keyed action dict per step - see "
-            "G1Driver.run_policy for the shape "
-            "(refs strands-labs/robots#361)."
+            "G1Driver.run_policy for the shape."
         )
     step_fn = getattr(policy_object, "step", None)
     if not callable(step_fn) and not callable(policy_object):
@@ -259,8 +258,7 @@ def g1_run_policy(
             "exposes a callable `.step()`. Pass an already-built policy "
             "- either a Policy instance with a `.step(obs)` method or a "
             "bare callable that returns a joint-name-keyed action dict "
-            "per step - see G1Driver.run_policy for the shape "
-            "(refs strands-labs/robots#361)."
+            "per step - see G1Driver.run_policy for the shape."
         )
 
     return driver.run_policy(

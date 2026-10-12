@@ -28,6 +28,14 @@ entry.
   #2928 is the issue opened for the tools port once that was noticed. The `refs` clauses under
   `tools/g1/` cite #2928 now, and the driver-layer prose that deferred to "later, issue #358" for
   tools that have since landed names those tools instead.
+- **#354, #356 and #361.** Twelve more lines carried three more numbers from the same tracker: the
+  driver (#354), a point-cloud view (#356) and the write path with its control loop (#361), which
+  landed here as #2757, #2767 and #2779. Here each is another merged pull request about the mesh,
+  and that tracker is not one a reader of this repository can open, so the lines now name what
+  they meant. Four are the `g1_send_action` and `g1_run_policy` refusals, which keep pointing at
+  the driver method for the shape. Two of the reworded sentences were also out of date:
+  `DDSPublisher.close` said the driver held no publisher yet, and `_build_zero_torque_lowcmd` said
+  `G1Driver.stop` used it, when `stop` reaches it only through the control loop it halts.
 - **Approval on `docs/learn/hardware/unitree.md`.** The page said the `g1_*` motion verbs execute
   and that "each motion pauses for your approval". Only `use_unitree` asks: no other module under
   `tools/g1/` reaches `gate_motion`. The thirteen `g1_actions` verbs call methods `G1Driver` does
@@ -39,5 +47,6 @@ entry.
 Pinned by two new tests (five cells) in `tests/drivers/test_g1_handshake_fsms_docstring_names_the_topic_it_gates.py`
 (no module in the package spells the topic `rt/armsdk`; none of the four descriptions of the FSM
 sets calls an id in them a sitting mode, one cell per description), which replace the cell that
-pinned the old 7400 text, and by `tests/tools/g1/test_g1_sources_cite_the_tools_port_issue.py`.
-Each fails on `03b9cfd1` and passes after this change.
+pinned the old 7400 text, and by `tests/tools/g1/test_g1_sources_cite_the_tools_port_issue.py`
+(no G1 source cites #358; none cites #354, #356 or #361). Each fails on `03b9cfd1` and passes after
+this change.

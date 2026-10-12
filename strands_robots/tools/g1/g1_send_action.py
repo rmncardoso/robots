@@ -189,15 +189,14 @@ def g1_send_action(driver: Any, action: dict[str, Any] | None = None) -> dict[st
         return _refusal_envelope(
             "g1_send_action: `action` is required. Pass a joint-name-keyed "
             "dict of target positions (radians) or per-joint {q, kp, kd, dq, "
-            "tau} dicts - see G1Driver.send_action for the shape "
-            "(refs strands-labs/robots#361)."
+            "tau} dicts - see G1Driver.send_action for the shape."
         )
     if not isinstance(action, dict):
         return _refusal_envelope(
             f"g1_send_action: `action` of type {type(action).__name__!r} is "
             "not a dict. Pass a joint-name-keyed dict of target positions "
             "(radians) or per-joint {q, kp, kd, dq, tau} dicts - see "
-            "G1Driver.send_action for the shape (refs strands-labs/robots#361)."
+            "G1Driver.send_action for the shape."
         )
     if not action:
         return _refusal_envelope(
