@@ -230,6 +230,38 @@ class TestMinStdPreflight:
         assert "min_std=0.05" in offending[0]
         assert "lower min_std" in offending[0]
 
+    @pytest.mark.parametrize("std", [float("nan"), float("inf"), float("-inf")], ids=["nan", "inf", "-inf"])
+    def test_a_non_finite_std_refuses_the_run_even_as_the_only_bad_column(self, spec, std):
+        # ``nan < min_std`` and ``inf < min_std`` are False, so a bare comparison
+        # passed the stat that harms normalization most: dividing by a nan std
+        # makes every normalized value nan. ``-inf`` was refused, but named as a
+        # column below the threshold rather than as one that is not finite.
+        _write_control_stats(spec.dataset_root, [std, 0.5])
+        spec.min_std = 0.05
+        offending = [p for p in LerobotTrainer().validate(spec) if "min_std" in p]
+        assert len(offending) == 1, offending
+        assert "1 control column(s) whose std is below min_std=0.05 or not finite" in offending[0]
+        assert f"action[0] (std is {std})" in offending[0]
+        assert "action[1]" not in offending[0]
+        assert "no min_std passes a nan or infinite std" in offending[0]
+
+    def test_a_non_finite_std_is_named_beside_a_flat_one(self, spec):
+        # The review's case: ``[nan, 0.0, 0.5]`` was refused for column 1 alone.
+        _write_control_stats(spec.dataset_root, [float("nan"), 0.0, 0.5])
+        spec.min_std = 0.05
+        offending = [p for p in LerobotTrainer().validate(spec) if "min_std" in p]
+        assert len(offending) == 1, offending
+        assert "has 2 control column(s)" in offending[0]
+        assert "in meta/stats.json: action[0] (std is nan), action[1] (std is 0.0)." in offending[0]
+
+    def test_an_integer_too_large_for_a_float_is_compared_not_raised(self, spec):
+        # ``json`` reads a long literal as an ``int``, and ``math.isfinite`` raises
+        # ``OverflowError`` on one too large for a float, so only a float is asked
+        # whether it is finite: every ``int`` is.
+        _write_control_stats(spec.dataset_root, [10**400, 0.5])
+        spec.min_std = 0.05
+        assert LerobotTrainer().validate(spec) == []
+
     def test_a_dataset_that_clears_the_threshold_is_clean(self, spec):
         _write_control_stats(spec.dataset_root, [0.2, 0.3])
         spec.min_std = 0.05
@@ -307,7 +339,11 @@ class TestMinStdPreflight:
             },
         )
         found = _columns_below_min_std(spec.dataset_root, 0.05)
-        assert sorted(found) == ["action[1]", "observation.state.left[0]", "observation.state[0]"]
+        assert sorted(found) == [
+            "action[1] (std is 1e-05)",
+            "observation.state.left[0] (std is 1e-05)",
+            "observation.state[0] (std is 1e-05)",
+        ]
 
     def test_the_threshold_reaches_the_managed_job_as_a_hyperparameter(self):
         """SageMaker is transport: the caller's image packages a local trainer

@@ -11,10 +11,13 @@ the dataset was unusable.
 `std` a run accepts. When it is set, `LerobotTrainer.validate` reads the
 dataset's `meta/stats.json` - the aggregate stats lerobot's own `load_stats`
 feeds to normalization - and refuses the run with the number of columns below
-it, the first six by name, and the three remedies. It is a refusal, not a
-floor: nothing in the dataset or in normalization changes. An absent,
-unreadable or non-object `meta/stats.json` (a Hub dataset with no local cache)
-leaves the question open, and image features are not graded.
+it, the first six by name with their `std`, and the three remedies. A column
+whose `std` is nan or infinite is refused at any threshold, even when it is the
+only one: `nan < min_std` is False, and dividing by a nan `std` turns the column
+to nan. It is a refusal, not a floor: nothing in the dataset or in normalization
+changes. An absent, unreadable or non-object `meta/stats.json` (a Hub dataset
+with no local cache) leaves the question open, and image features are not
+graded.
 
 Opt-in, and `None` by default, because a joint held still on purpose produces
 the same statistic. The value's domain is a new shared field-scoped gate,

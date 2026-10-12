@@ -232,9 +232,10 @@ def train_policy(
             without one.
         min_std: Smallest aggregate std an action / observation.state column
             may have, or None (the default) to train on whatever the dataset
-            holds. A positive finite number; a flatter column is refused, not
-            changed, because MEAN_STD normalization divides by std + 1e-8.
-            Opt-in: a joint held still on purpose reads the same.
+            holds. A positive finite number; a flatter column, or one whose std
+            is nan or infinite, is refused, not changed, because MEAN_STD
+            normalization divides by std + 1e-8. Opt-in: a joint held still on
+            purpose reads the same.
         augmentation: Backend-specific augmentation dict.
         fps: Dataset control rate (when a backend needs it).
         extra: Backend-specific passthrough. lerobot: ``policy_type``,
