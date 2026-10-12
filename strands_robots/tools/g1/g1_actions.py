@@ -1,12 +1,14 @@
 """g1_actions - the G1's driver-gated execution verbs, one table-driven module.
 
-Thirteen ``@tool`` verbs ported from ``cagataycali/neon-the-g1`` (refs #358)
+Thirteen ``@tool`` verbs ported from ``cagataycali/neon-the-g1`` (refs #2928)
 that each make exactly one call on a live
 :class:`~strands_robots.drivers.g1.G1Driver` handle and return the driver's
 envelope verbatim. They are a different rail from
 :mod:`~strands_robots.tools.g1.use_unitree`: the dispatcher reaches the raw
 SDK clients, while these verbs reach the *driver's* SDK-facing write path so
-its motion gates, rc decoding and refusal shapes apply.
+its motion gates, rc decoding and refusal shapes apply. The shipped
+:class:`~strands_robots.drivers.g1.G1Driver` defines none of the thirteen
+accessors, so against it every verb returns the live-handle refusal.
 
 Every verb holds the package's four ``@tool`` invariants (envelope not
 exception; names the verb; names the parameter; names the received type) via
@@ -39,9 +41,9 @@ def _refusal(text: str) -> dict[str, Any]:
 _ACTIONS: dict[str, tuple[str, str, str]] = {
     "g1_arm_action": (
         "arm_action",
-        "the verb publishes one arm-gesture ExecuteAction call on rt/armsdk "
-        "through the driver's own SDK-facing write path and reads back the "
-        "envelope the driver produced",
+        "the verb makes one arm-gesture ExecuteAction call to the SDK's arm "
+        "action service through the driver's own SDK-facing write path and "
+        "reads back the envelope the driver produced",
         "a callable ``arm_action(action, action_id)`` returning the driver's "
         "write envelope - pass the live G1Driver handle the orchestrator "
         "constructed",
@@ -175,8 +177,8 @@ def g1_arm_action(driver: Any, action: str = "", action_id: int | None = None) -
     """Execute one built-in G1 arm gesture (clap, heart, shake hand, ...).
 
     Calls ``G1Driver.arm_action(action, action_id)`` once - the driver
-    resolves the name or numeric id, publishes the SDK's ExecuteAction call
-    on ``rt/armsdk`` and produces the envelope this verb returns verbatim.
+    resolves the name or numeric id, makes the SDK's ExecuteAction call to
+    the arm action service and produces the envelope this verb returns verbatim.
 
     Args:
         driver: The live G1Driver handle the orchestrator constructed.
@@ -226,7 +228,7 @@ def g1_balance_stand(driver: Any, balance_mode: int | None = None) -> dict[str, 
         balance_mode,
         "integer mode id",
         "Pass an integer mode id (neon-bundle-observed admitted set {0, 3}; 0 = static, 3 = dynamic)",
-        "use_unitree's describe_operation for the SDK side (refs strands-labs/robots#358)",
+        "use_unitree's describe_operation for the SDK side (refs strands-labs/robots#2928)",
     )
     if error is not None:
         return _refusal(error)
@@ -380,14 +382,14 @@ def g1_set_fsm(driver: Any, fsm_id: int | None = None, wait: float = 3.0) -> dic
         return _refusal(
             "g1_set_fsm: `fsm_id` is required. Pass an integer id from the "
             "SDK's SetFsmId admission set - see strands_robots.tools.g1 for "
-            "the dispatcher that documents it (refs strands-labs/robots#358)."
+            "the dispatcher that documents it (refs strands-labs/robots#2928)."
         )
     if isinstance(fsm_id, bool) or not isinstance(fsm_id, int):
         return _refusal(
             f"g1_set_fsm: `fsm_id` of type {type(fsm_id).__name__!r} is not an "
             "int. Pass an integer id from the SDK's SetFsmId admission set - "
             "see strands_robots.tools.g1 for the dispatcher that documents it "
-            "(refs strands-labs/robots#358)."
+            "(refs strands-labs/robots#2928)."
         )
     error = positive_finite_number_error(wait, "wait", "the seconds to wait between SetFsmId and the fsm-after read")
     if error is not None:
@@ -401,7 +403,7 @@ def _set_height(verb: str, driver: Any, height: float | None, required: str) -> 
     if refusal is not None:
         return refusal
     if height is None:
-        return _refusal(f"{verb}: `height` is required. {required} (refs strands-labs/robots#358).")
+        return _refusal(f"{verb}: `height` is required. {required} (refs strands-labs/robots#2928).")
     error = finite_number_error(height, "height", verb)
     if error is not None:
         return _refusal(error)
@@ -484,7 +486,7 @@ def g1_shake_hand_loco(driver: Any, stage: int | None = None) -> dict[str, Any]:
         "integer stage id",
         "Pass an integer stage id (SDK-observed admitted set {-1, 0, 1}; -1 = "
         "toggle SDK's internal counter, 0 = reach out, 1 = shake)",
-        "use_unitree's describe_operation for the SDK side (refs strands-labs/robots#358)",
+        "use_unitree's describe_operation for the SDK side (refs strands-labs/robots#2928)",
     )
     if error is not None:
         return _refusal(error)
@@ -533,13 +535,13 @@ def g1_wave_hand_loco(driver: Any, turn_flag: bool | None = None) -> dict[str, A
             "g1_wave_hand_loco: `turn_flag` is required. Pass a bool (False = "
             "wave in place, True = wave and turn around) - use_unitree's "
             "describe_operation documents the SDK side (refs "
-            "strands-labs/robots#358)."
+            "strands-labs/robots#2928)."
         )
     if not isinstance(turn_flag, bool):
         return _refusal(
             "g1_wave_hand_loco: `turn_flag` must be a bool (True = wave and "
             "turn around, False = wave in place), got "
             f"{type(turn_flag).__name__!r}. use_unitree's describe_operation "
-            "documents the SDK side (refs strands-labs/robots#358)."
+            "documents the SDK side (refs strands-labs/robots#2928)."
         )
     return driver.wave_hand_loco(turn_flag)

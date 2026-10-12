@@ -94,7 +94,7 @@ def test_the_import_pulls_no_sdk_module() -> None:
     assert leaked == set(), (
         f"strands_robots.tools.g1.g1_send_action imports pulled SDK submodules: "
         f"{leaked}. The rule for this package is that the SDK loads only "
-        "inside function bodies (refs strands-labs/robots#358)."
+        "inside function bodies (refs strands-labs/robots#2928)."
     )
 
 

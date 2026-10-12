@@ -3,7 +3,7 @@
 The Unitree G1 speaks raw Unitree IDL over CycloneDDS: ``rt/lowstate`` for IMU
 and joints, ``rt/lf/bmsstate`` for battery, ``rt/utlidar/cloud_livox_mid360``
 and ``rt/utlidar/lidar_state`` for the Livox Mid-360, ``rt/lowcmd`` and
-``rt/armsdk`` for motion. Neither ROS 2 nor the lerobot serial bus can reach
+``rt/arm_sdk`` for motion. Neither ROS 2 nor the lerobot serial bus can reach
 those topics, so the driver owns its own subscriber layer, which lives with the
 other Unitree-protocol drivers in :mod:`strands_robots.drivers.unitree` and is
 read back here for the verbs that need it.

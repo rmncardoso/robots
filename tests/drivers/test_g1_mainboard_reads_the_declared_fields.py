@@ -254,7 +254,7 @@ class TestEveryNameReadIsDeclared:
             f"_on_mainboard reads {sorted(undeclared)} which MainBoardState_ does "
             "not declare on the current firmware layout. Either add the field to "
             "_DECLARED_MAINBOARD_FIELDS (and to the double) or drop the read. "
-            "Refs strands-labs/robots#358."
+            "Refs strands-labs/robots#2928."
         )
 
     def test_at_least_one_declared_field_is_read(self) -> None:

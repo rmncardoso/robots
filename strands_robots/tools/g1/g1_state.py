@@ -29,14 +29,14 @@ import. The verb is duck-typed on ``get_status`` (any object with an
 also how the tests hand it a hand-rolled double. ``import
 strands_robots.tools.g1.g1_state`` still pulls no ``unitree_sdk2py``
 submodule (the package's SDK-load-hygiene contract, refs
-strands-labs/robots#358).
+strands-labs/robots#2928).
 
 What this module does not do.
 
 * Subscribe DDS. The driver's own subscribers deliver every field this
   verb returns; adding a second subscriber path would compete for the
-  same topic and duplicate the bus load ``strands-labs/robots#358``'s
-  singleton lock is meant to prevent.
+  same topic and duplicate the bus load the singleton ``_DDS_INIT_LOCK``
+  is meant to prevent.
 * Rebuild a wedged loco RPC client. ``get_status`` reports what the
   driver's FSM refresher already read; a wedged RPC surfaces here as an
   ``fsm_id`` of ``None`` and an ``fsm_refusal`` string, decidably, and

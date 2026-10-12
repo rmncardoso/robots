@@ -259,15 +259,14 @@ def test_the_import_pulls_no_sdk_module() -> None:
 
     Every SDK touch lives inside a function body, so the module imports on CI and
     on a dev box before any bring-up. A module-level import would break every
-    headless runner (refs strands-labs/robots#358).
+    headless runner.
     """
     before = set(sys.modules)
     importlib.import_module("strands_robots.drivers.go2")
     leaked = {name for name in set(sys.modules) - before if "unitree" in name.lower()}
     assert leaked == set(), (
         f"strands_robots.drivers.go2 imports pulled SDK submodules: {leaked}. The rule "
-        "for this package is that the SDK loads only inside function bodies "
-        "(refs strands-labs/robots#358)."
+        "for this package is that the SDK loads only inside function bodies."
     )
 
 

@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Constants surfaced for tests and for issue #358 to share.
+# Constants surfaced for tests and for the agent tools to share.
 # ---------------------------------------------------------------------------
 _BATTERY_FLOOR_PCT: float = 15.0
 
@@ -1051,12 +1051,12 @@ class G1Driver:
     def _check_motion_gates(self, scope: str, *, refresh: bool = True) -> dict[str, Any] | None:
         """Return a refusal envelope if a motion write is not safe, else ``None``.
 
-        Two FSM sets are enforced separately because the G1 documents them
-        separately: :data:`HANDSHAKE_FSMS` covers arm-SDK-shaped writes (which
-        the driver publishes on ``rt/lowcmd`` today; the ``rt/armsdk`` topic
-        is future work for the ``g1_tools`` client) and
-        :data:`WALK_FSMS` is narrower - sitting (500) accepts arm gestures
-        but not walking. ``scope`` is the caller's declared kind of write:
+        Two FSM sets are enforced separately: :data:`HANDSHAKE_FSMS` covers
+        arm-SDK-shaped writes (which the driver publishes on ``rt/lowcmd``
+        today; the ``rt/arm_sdk`` topic is future work for the ``g1_tools``
+        client) and :data:`WALK_FSMS` is narrower - it leaves out 500, which
+        Unitree's FSM table names regular locomotion. ``scope`` is the
+        caller's declared kind of write:
 
         * ``"arm"`` - test :data:`HANDSHAKE_FSMS` and phrase the refusal as
           "refuses arm writes".

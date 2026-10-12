@@ -58,7 +58,7 @@ What this module does not do.
 here would close a cycle, and ``@tool`` resolves annotations at decoration
 time. The verb is duck-typed on the accessor its action names; importing this
 module pulls no ``unitree_sdk2py`` submodule (the package's SDK-load-hygiene
-contract, refs strands-labs/robots#358).
+contract, refs strands-labs/robots#2928).
 """
 
 from __future__ import annotations

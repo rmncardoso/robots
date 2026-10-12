@@ -80,7 +80,7 @@ def test_the_import_pulls_no_sdk_module() -> None:
     assert leaked == set(), (
         f"strands_robots.tools.g1.g1_state imports pulled SDK submodules: {leaked}. "
         "The rule for this package is that the SDK loads only inside function "
-        "bodies (refs strands-labs/robots#358)."
+        "bodies (refs strands-labs/robots#2928)."
     )
 
 
@@ -147,11 +147,11 @@ def test_the_admission_sets_are_read_off_the_driver_constants() -> None:
 
 
 def test_fsm_500_admits_arm_but_not_loco() -> None:
-    """FSM 500 (sitting) admits arm gestures but refuses walking.
+    """FSM 500 admits arm writes but refuses locomotion writes.
 
-    :data:`HANDSHAKE_FSMS` carries 500 because the arm-SDK gate opens on
-    sitting; :data:`WALK_FSMS` does not, because the robot cannot walk
-    from a sit. The verb's two admits booleans must reflect that split.
+    :data:`HANDSHAKE_FSMS` carries 500 (Unitree's FSM table names it regular
+    locomotion) and :data:`WALK_FSMS` leaves it out. The verb's two admits
+    booleans must reflect that split.
     """
     inner: dict[str, Any] = {
         "tool_name": "g1",

@@ -57,14 +57,14 @@ Both refuse rather than warn: `rt/lowcmd` beside the onboard controller is two c
 
 `use_unitree(service_name, operation_name, parameters)` wraps every SDK client (`loco`, `arm`, `audio`, `motion_switcher`, `vui`, `robot_state`) with dynamic discovery: `list_services`, `list_operations`, `describe_operation` work without the SDK by reading its source. Every write, and every `HIGH_DANGER_OPS` entry (`ZeroTorque`, `SetFsmId`, `SetVelocity`, `Move`, `ReleaseMode`), stops for operator approval; `STRANDS_UNITREE_COMMAND_ALLOW` takes `service.operation` entries or `*`. Private SDK names (`_Call`) are refused outright.
 
-Beyond one RPC: `g1_get_state` and `g1_sensor` read the driver's caches (battery, imu, lidar_state, lidar_summary, mainboard, pressure); `g1_send_action`, `g1_run_policy`, `g1_task` drive the gated control loop; `g1_set_fsm`, `g1_move_velocity`, `g1_stop_move`, `g1_set_stand_height`, `g1_set_swing_height`, `g1_balance_stand`, the `g1_safe_*` postures and gestures execute; `g1_joints`, `g1_motion_gates`, `g1_arm_actions`, `g1_error_codes` are reference tables (`7401` is "Arm is holding - release first").
+Beyond one RPC: `g1_get_state` and `g1_sensor` read the driver's caches (battery, imu, lidar_state, lidar_summary, mainboard, pressure); `g1_send_action`, `g1_run_policy`, `g1_task` drive the gated control loop; `g1_set_fsm`, `g1_move_velocity`, `g1_stop_move`, `g1_set_stand_height`, `g1_set_swing_height`, `g1_balance_stand`, the `g1_safe_*` postures and gestures refuse (`G1Driver` lacks them); `g1_joints`, `g1_motion_gates`, `g1_arm_actions`, `g1_error_codes` are reference tables. No `g1_*` verb asks for approval; all but the tables take a live driver no model can send.
 
 ```python title="sketch"
 from strands import Agent
-from strands_robots.tools.g1 import g1_get_state, g1_move_velocity, g1_stop_move, use_unitree
+from strands_robots.tools.g1 import use_unitree
 
-agent = Agent(tools=[g1_get_state, g1_move_velocity, g1_stop_move, use_unitree])
-agent("Stand up, walk forward half a metre, stop.")   # each motion pauses for your approval
+agent = Agent(tools=[use_unitree])
+agent("Stand up, walk forward half a metre, stop.")
 ```
 
 ## On the mesh

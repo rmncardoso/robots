@@ -275,7 +275,7 @@ class TestEveryNameReadIsDeclared:
             f"_on_pressure reads {sorted(undeclared)} which PressSensorState_ does "
             "not declare on the current firmware layout. Either add the field to "
             "_DECLARED_PRESSURE_FIELDS (and to the double) or drop the read. "
-            "Refs strands-labs/robots#358."
+            "Refs strands-labs/robots#2928."
         )
 
     def test_at_least_one_declared_field_is_read(self) -> None:

@@ -1,7 +1,7 @@
 """Shared DDS init and safety helpers for the G1 hardware layer.
 
-Two things need to be true across the driver and (later, issue #358) the
-agent tools:
+Two things need to be true across the driver and the agent tools in
+:mod:`strands_robots.tools.g1`:
 
 * ``ChannelFactoryInitialize`` is called exactly once per process, with a
   known network interface. Calling it never leaves subscribers with no bus;
@@ -13,7 +13,7 @@ agent tools:
   bound, and is idempotent for callers with the same choice.
 * A ``ChannelSubscriber`` and a ``ChannelPublisher`` cannot be constructed
   concurrently: the CycloneDDS bindings segfault. :data:`_DDS_INIT_LOCK` is
-  the *shared* lock the driver and the tools (issue #358) both hold while
+  the *shared* lock the driver and the tools both hold while
   creating readers or writers. One lock; two consumers.
 
 The ``unitree_sdk2py`` import is lazy - the module attribute stays ``None`` and
@@ -87,10 +87,14 @@ def sdk_missing(exc: BaseException | str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Error decoder shared with agent tools (issue #358) so the same numeric code
+# Error decoder shared with agent tools so the same numeric code
 # renders the same text everywhere. Values sourced from ``unitree_sdk2py``
 # response codes observed against the real G1; ``0`` is the SDK's success
-# marker and always present.
+# marker and always present. 7400 to 7404 are the arm action service's codes,
+# described on the arm action interface page of Unitree's G1 developer docs;
+# 7400 names the topic ``rt/arm_sdk`` as Unitree's arm examples spell it;
+# the G1 header of its C++ SDK drops the underscore in that message, and the
+# H2 header does not.
 # ---------------------------------------------------------------------------
 ERR_CODES: dict[int, str] = {
     0: "OK",
@@ -100,7 +104,7 @@ ERR_CODES: dict[int, str] = {
     7301: "LocoState not available",
     7302: "Invalid FSM id (loco)",
     7303: "Invalid task id (loco)",
-    7400: "rt/armsdk topic is occupied",
+    7400: "rt/arm_sdk topic is occupied - an action is executing",
     7401: "Arm is holding - release first (id=99)",
     7402: "Invalid action id",
     7404: "Invalid FSM id - need FSM in {500, 501, 801}",
@@ -110,14 +114,15 @@ ERR_CODES: dict[int, str] = {
 #: arm refuses to move at all - so
 #: :meth:`~strands_robots.drivers.g1.G1Driver.send_action` checks membership
 #: before publishing its ``LowCmd_`` on ``rt/lowcmd``. The set is defined
-#: against the motion-switcher FSM (arm-SDK, sit, sit-down), not against a
-#: topic name; the ``rt/armsdk`` topic itself is future work for the
-#: ``g1_tools`` client (issue #358) and this driver does not write it.
+#: against the motion-switcher FSM, not against a topic name. Unitree's FSM
+#: table (the sport services interface page of its G1 developer docs) names
+#: 500 regular locomotion, 501 the same with the 3-DoF waist and 801 walk-run
+#: locomotion. The ``rt/arm_sdk`` topic itself is future work for the
+#: ``g1_tools`` client and this driver does not write it.
 HANDSHAKE_FSMS: frozenset[int] = frozenset({500, 501, 801})
 
-#: FSM ids where locomotion velocity commands are honoured. Narrower than
-#: :data:`HANDSHAKE_FSMS` because sitting (500) accepts arm gestures but not
-#: walking.
+#: FSM ids this driver admits locomotion velocity commands in:
+#: :data:`HANDSHAKE_FSMS` without 500.
 WALK_FSMS: frozenset[int] = frozenset({501, 801})
 
 
@@ -137,7 +142,7 @@ def decode_code(code: object) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DDS init lock - held by both driver and agent tools (issue #358) around
+# DDS init lock - held by both driver and agent tools around
 # every subscriber/publisher construction, because the CycloneDDS bindings
 # segfault under concurrent creation. One lock, shared.
 # ---------------------------------------------------------------------------

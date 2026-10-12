@@ -132,7 +132,7 @@ class TestTheImportIsSdkFree:
 
         The driver holds itself to the same rule -
         :func:`~strands_robots.drivers.unitree._common.ensure_dds` is the only
-        path that loads the SDK (refs strands-labs/robots#358).
+        path that loads the SDK (refs strands-labs/robots#2928).
         """
         before = set(sys.modules)
         importlib.import_module("strands_robots.tools.g1.g1_task")

@@ -3,7 +3,7 @@
 Every verb here answers from a module-level table and touches nothing else: no
 DDS, no driver instance, no SDK. ``import strands_robots.tools.g1.g1_reference``
 pulls no ``unitree_sdk2py`` submodule, the import-hygiene contract every other
-file in this package carries (refs strands-labs/robots#358), so a headless
+file in this package carries (refs strands-labs/robots#2928), so a headless
 runner with no robot resolves the same answers a bring-up host does.
 
 One rule covers all four: **no query lists the table, a query resolves one
@@ -34,7 +34,7 @@ that renumbers either one is a driver-side update both sides then read.
 What none of these decide:
 
 * Live driver state. Whether the robot's ``fsm_id`` currently sits inside a
-  gate, or whether ``rt/armsdk`` is already held by another writer
+  gate, or whether ``rt/arm_sdk`` is already held by another writer
   (``rc=7400`` at wire time), is a read on a running driver - ``g1_get_state``
   answers the first and only an execute answers the second.
 * Which joints a given G1 build physically has. Slots ``13`` / ``14`` (waist
@@ -67,7 +67,7 @@ from strands_robots.drivers.unitree._common import (
     as_tool_result,
 )
 
-_ISSUE = "Refs strands-labs/robots#358."
+_ISSUE = "Refs strands-labs/robots#2928."
 _JOINT_ISSUE = "Refs strands-labs/robots#2765."
 
 # --------------------------------------------------------------------------
@@ -258,10 +258,10 @@ def g1_motion_gates(fsm_id: int | None = None, scope: str = "") -> dict[str, Any
             a caller writing ``True`` would otherwise be told the robot is not
             ready when they never asked a valid question.
         scope: Which admission set to read. ``arm`` is the set arm-SDK-shaped
-            writes need, ``loco`` the narrower set locomotion needs (it
-            excludes ``500``, since sitting accepts arm gestures but not
-            walking). Empty lists both scopes, and on a membership query means
-            the arm gate.
+            writes need, ``loco`` the narrower set the driver admits
+            locomotion in (it leaves out ``500``, which Unitree's FSM table
+            names regular locomotion). Empty lists both scopes, and on a
+            membership query means the arm gate.
 
     Returns:
         For a listing, a dict with ``status``, a ``count`` of returned
@@ -365,8 +365,9 @@ def g1_arm_actions(query: str | int = "") -> dict[str, Any]:
     Read-only; every field is an SDK or driver constant and no channel is
     opened. A caller resolves an intended gesture against the SDK's set before
     an execute dispatches, rather than triggering the SDK's ``rc=7402`` at wire
-    time. Execution itself is not here: the gestures write ``rt/armsdk``,
-    which the driver does not yet front (refs strands-labs/robots#2765).
+    time. Execution itself is not here: a gesture is an ``ExecuteAction`` call
+    to the SDK's arm action service, which the driver does not yet front
+    (refs strands-labs/robots#2765).
 
     Args:
         query: Empty lists the whole table. A name asks whether the SDK admits

@@ -13,7 +13,7 @@ This verb does not subscribe DDS. The driver's subscribers already deliver
 every one of those topics under the singleton ``_DDS_INIT_LOCK`` from
 :mod:`~strands_robots.drivers.unitree._common`, and a second subscriber path on
 the same topic would compete for the wire and double the bus load that lock
-prevents (refs strands-labs/robots#358). It reads
+prevents (refs strands-labs/robots#2928). It reads
 ``driver._snapshot(attr)`` - the same accessor the driver's own
 ``stream(action="sensors")`` path reads through, which copies the cache under
 the driver's ``_cache_lock`` so a caller mutating the result does not race the

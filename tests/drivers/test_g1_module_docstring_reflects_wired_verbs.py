@@ -10,8 +10,8 @@ driver entirely as "not ready".
 Three of the four task/policy verbs (``run_policy``, ``stop_task``,
 ``get_task_status``) publish real work on the 500 Hz control loop today;
 only ``start_task`` still returns a "not wired yet" refusal, and it does
-so precisely because the provider registry lives behind issue #358 whose
-vendoring decision is separate from harness#361. This file pins the
+so precisely because the provider registry's vendoring decision is
+separate from harness#361. This file pins the
 docstring to that split so a caller reading the module can trust the line
 in it about which verb refuses.
 
@@ -47,7 +47,7 @@ What is graded, and by which cell:
    using the ``not wired yet`` phrase at all, so both hold trivially today
    and only bite if a future edit reintroduces the phrase.
 
-On the wiring day -- when #358's provider registry replaces
+On the wiring day -- when the provider registry replaces
 ``start_task``'s refusal -- the cell that fires is
 :func:`test_start_task_still_returns_the_not_wired_yet_refusal`, measured
 by planting that change. The text-shape cells do not fire, because the

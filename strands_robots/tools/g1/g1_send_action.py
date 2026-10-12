@@ -31,10 +31,10 @@ earlier - and the gate's refusal is the same three sentences the
 driver writes into every wire method (``send_action``, ``run_policy``,
 ``start_task``).  Restating any of that on this side would be a second
 source of truth for a rule the driver's own path already enforces
-(refs strands-labs/robots#358, strands-labs/robots#2916).  ``import
+(refs strands-labs/robots#2928, strands-labs/robots#2916).  ``import
 strands_robots.tools.g1.g1_send_action`` still pulls no
 ``unitree_sdk2py`` submodule (the package's SDK-load-hygiene contract,
-refs strands-labs/robots#358).
+refs strands-labs/robots#2928).
 
 The driver argument is typed :class:`~typing.Any` at runtime rather
 than as ``G1Driver`` for the same reason ``g1_task`` gives: the

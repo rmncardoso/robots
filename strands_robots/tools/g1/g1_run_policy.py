@@ -34,10 +34,10 @@ cache the driver's FSM refresher fills, and a caller who saw the first
 gate answer ``None`` and the second refuse could not tell which read it
 should trust.  Restating any of that on this side would be a second
 source of truth for a rule the driver's own path already enforces
-(refs strands-labs/robots#358, strands-labs/robots#2916).  ``import
+(refs strands-labs/robots#2928, strands-labs/robots#2916).  ``import
 strands_robots.tools.g1.g1_run_policy`` still pulls no
 ``unitree_sdk2py`` submodule (the package's SDK-load-hygiene contract,
-refs strands-labs/robots#358).
+refs strands-labs/robots#2928).
 
 The driver argument is typed :class:`~typing.Any` at runtime rather
 than as ``G1Driver`` for the same reason ``g1_task`` and

@@ -145,7 +145,7 @@ def test_the_import_pulls_no_sdk_module() -> None:
     Every module under :mod:`strands_robots.tools.g1` must import with the SDK
     absent - the rule is that it loads only inside function bodies, through
     :func:`~strands_robots.drivers.unitree._common.ensure_dds` (refs
-    strands-labs/robots#358).
+    strands-labs/robots#2928).
     """
     before = set(sys.modules)
     importlib.import_module("strands_robots.tools.g1.g1_sensors")

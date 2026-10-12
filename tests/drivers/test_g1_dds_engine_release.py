@@ -255,21 +255,21 @@ class TestClosingAPublisherReleasesEveryPublisher:
     """
 
     def test_close_closes_every_publisher_it_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        pubs, built = _published(monkeypatch, ("rt/lowcmd", "rt/armsdk"))
+        pubs, built = _published(monkeypatch, ("rt/lowcmd", "rt/arm_sdk"))
         pubs.close()
         assert [endpoint.closes for endpoint in built] == [1, 1]
 
     def test_a_failing_close_does_not_strand_the_publishers_behind_it(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        pubs, built = _published(monkeypatch, ("rt/lowcmd", "rt/armsdk", "rt/api/sport"), _RaisingEndpoint)
+        pubs, built = _published(monkeypatch, ("rt/lowcmd", "rt/arm_sdk", "rt/api/sport"), _RaisingEndpoint)
         _close_with_failing_endpoints(caplog, pubs)
         assert [endpoint.closes for endpoint in built] == [1, 1, 1]
 
     def test_every_close_failure_is_reported(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        pubs, _built = _published(monkeypatch, ("rt/lowcmd", "rt/armsdk"), _RaisingEndpoint)
+        pubs, _built = _published(monkeypatch, ("rt/lowcmd", "rt/arm_sdk"), _RaisingEndpoint)
         records = _close_with_failing_endpoints(caplog, pubs)
         assert len(records) == 2
         assert "publisher" in caplog.text
@@ -302,7 +302,7 @@ class TestCloseStillForgetsWhatItClosed:
         assert subs._subs == []
 
     def test_a_closed_publisher_cache_holds_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        pubs, _built = _published(monkeypatch, ("rt/lowcmd", "rt/armsdk"))
+        pubs, _built = _published(monkeypatch, ("rt/lowcmd", "rt/arm_sdk"))
         pubs.close()
         assert pubs._pubs == {}
 

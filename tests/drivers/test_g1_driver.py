@@ -357,9 +357,10 @@ def test_send_action_refuses_without_fsm_id_source_wired() -> None:
 def test_send_action_refuses_outside_handshake_fsm(fsm: int) -> None:
     """FSM outside :data:`HANDSHAKE_FSMS` is refused with the set named.
 
-    The refusal names the *arm* set specifically (``send_action`` writes to
-    ``rt/armsdk``), not the union with :data:`WALK_FSMS` - a message that
-    over-claims coverage would mislead a caller reading a log.
+    The refusal names the *arm* set specifically (``send_action`` is an
+    arm-scoped write, published on ``rt/lowcmd``), not the union with
+    :data:`WALK_FSMS` - a message that over-claims coverage would mislead a
+    caller reading a log.
     """
     driver = G1Driver(tool_name="g1", port="1.2.3.4")
     driver._connected = True
@@ -570,16 +571,16 @@ def test_walk_fsms_has_a_consumer_and_a_documented_boundary() -> None:
     """The :data:`WALK_FSMS` constant is not dead: a locomotion write at 500
     refuses even though 500 is in :data:`HANDSHAKE_FSMS`.
 
-    500 is sitting - the G1 accepts arm gestures there but not walking. A
-    ``run_policy`` at FSM 500 is a motion write (union-scoped), so it
-    passes; a hypothetical loco-scoped write at 500 would refuse. This
-    test pins the boundary WALK_FSMS exists to record: the day the write
-    lines land, the loco-scoped path can call ``_check_motion_gates("loco")``
-    and the sitting refusal is already correct.
+    500 is in the arm set but left out of the walk set (Unitree's FSM table
+    names it regular locomotion). A ``run_policy`` at FSM 500 is a motion
+    write (union-scoped), so it passes; a hypothetical loco-scoped write at
+    500 would refuse. This test pins the boundary WALK_FSMS exists to record:
+    the day the write lines land, the loco-scoped path can call
+    ``_check_motion_gates("loco")`` and the refusal at 500 is already there.
     """
     driver = G1Driver(tool_name="g1", port="1.2.3.4")
     driver._connected = True
-    driver._fsm_id = 500  # sitting: in HANDSHAKE_FSMS, not in WALK_FSMS
+    driver._fsm_id = 500  # in HANDSHAKE_FSMS, not in WALK_FSMS
     driver._mode_machine = 9  # uint8 layout id echoed from lowstate
     driver._battery = {"pct": 92.0, "current": 1.0, "cycle": 0, "t": 0.0}
 
@@ -593,7 +594,7 @@ def test_walk_fsms_has_a_consumer_and_a_documented_boundary() -> None:
 
     # Loco-scoped gate at 500 refuses. Calling the helper directly is the
     # narrow way to pin the boundary before any write verb classifies its
-    # scope; the write verbs land in issue #358.
+    # scope.
     loco_refusal = driver._check_motion_gates("loco")
     assert loco_refusal is not None
     text = loco_refusal["content"][0]["text"]
@@ -631,9 +632,9 @@ def test_walk_fsms_is_a_proper_subset_of_handshake_fsms() -> None:
     """
     assert WALK_FSMS, "WALK_FSMS must not be empty"
     assert WALK_FSMS < HANDSHAKE_FSMS, "WALK_FSMS must be strictly narrower"
-    # 500 is the boundary the scope split exists to record: sitting admits
-    # arm gestures but not walks. Naming it literally makes the intent
-    # readable from the assertion alone.
+    # 500 is the boundary the scope split exists to record: the arm gate
+    # admits it and the walk gate does not. Naming it literally makes the
+    # intent readable from the assertion alone.
     assert 500 in HANDSHAKE_FSMS - WALK_FSMS
 
 
@@ -799,7 +800,7 @@ def test_decode_code_names_known_and_unknown() -> None:
 
 
 def test_dds_init_lock_is_a_lock() -> None:
-    """:data:`_DDS_INIT_LOCK` is the shared lock the driver and issue #358 tools hold.
+    """:data:`_DDS_INIT_LOCK` is the shared lock the driver and the agent tools hold.
 
     A different lock object here and in the tools would allow a race between
     ``ChannelSubscriber(...)`` calls; the segfault CycloneDDS bindings

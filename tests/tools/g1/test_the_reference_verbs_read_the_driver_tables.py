@@ -67,7 +67,7 @@ def test_the_import_pulls_no_sdk_module() -> None:
 
     The SDK loads only inside function bodies in this package; a module that
     pulled a submodule at import time would break every runner with no robot
-    attached (refs strands-labs/robots#358).
+    attached (refs strands-labs/robots#2928).
     """
     before = set(sys.modules)
     importlib.import_module("strands_robots.tools.g1.g1_reference")
@@ -324,23 +324,23 @@ class TestTheErrorCodeCatalogue:
         ("g1_joints", {"query": "ThirdEye"}, ["ThirdEye", "left_knee", "#2765"]),
         ("g1_joints", {"query": -1}, ["[0, 28]", "#2765"]),
         ("g1_joints", {"query": _G1_NAMED_JOINTS}, ["[0, 28]", "#2765"]),
-        ("g1_motion_gates", {"scope": "teleport"}, ["teleport", "arm", "loco", "#358"]),
-        ("g1_motion_gates", {"fsm_id": 500, "scope": "teleport"}, ["teleport", "arm", "loco", "#358"]),
+        ("g1_motion_gates", {"scope": "teleport"}, ["teleport", "arm", "loco", "#2928"]),
+        ("g1_motion_gates", {"fsm_id": 500, "scope": "teleport"}, ["teleport", "arm", "loco", "#2928"]),
         # ``True`` is an ``int``; read as a slot, an FSM id or an action id it
         # would answer a question the caller never asked - and a live write
         # built on it would land at the left hip.
         ("g1_joints", {"query": True}, ["bool", "#2765"]),
-        ("g1_motion_gates", {"fsm_id": True}, ["bool", "#358"]),
-        ("g1_arm_actions", {"query": True}, ["bool", "#358"]),
-        ("g1_error_codes", {"code": True}, ["bool", "#358"]),
+        ("g1_motion_gates", {"fsm_id": True}, ["bool", "#2928"]),
+        ("g1_arm_actions", {"query": True}, ["bool", "#2928"]),
+        ("g1_error_codes", {"code": True}, ["bool", "#2928"]),
         # A wrong type names the type, so a caller with many parallel calls in
         # flight sees which one carried the wrong shape.
         ("g1_joints", {"query": ["left_knee"]}, ["list", "#2765"]),
         ("g1_joints", {"query": 5.0}, ["float", "#2765"]),
-        ("g1_motion_gates", {"fsm_id": "500"}, ["str", "#358"]),
-        ("g1_motion_gates", {"fsm_id": 500.0}, ["float", "#358"]),
-        ("g1_arm_actions", {"query": None}, ["NoneType", "#358"]),
-        ("g1_error_codes", {"code": "7302"}, ["str", "#358"]),
+        ("g1_motion_gates", {"fsm_id": "500"}, ["str", "#2928"]),
+        ("g1_motion_gates", {"fsm_id": 500.0}, ["float", "#2928"]),
+        ("g1_arm_actions", {"query": None}, ["NoneType", "#2928"]),
+        ("g1_error_codes", {"code": "7302"}, ["str", "#2928"]),
     ],
 )
 def test_a_refusal_names_the_value_the_domain_and_the_reference(

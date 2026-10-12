@@ -61,7 +61,7 @@ Safety rails:
       Meta and read-only ops are never gated, and neither is
       ``loco.StopMove`` - stopping must never get harder.
     * Prefer the FSM-gated verbs (``g1_send_action``, ``g1_run_policy``,
-      ``g1_set_stand_height``, ...) for routine motion - they route
+      ``g1_task``) for routine motion - they route
       through :meth:`~strands_robots.drivers.g1.G1Driver._check_motion_gates`.
       ``use_unitree`` is the raw escape hatch.
 """
@@ -239,7 +239,7 @@ def _get_client(service_name: str) -> Any:
     :data:`~strands_robots.drivers.unitree._common._DDS_INIT_LOCK` is the shared
     lock the driver and :mod:`~strands_robots.drivers.unitree._dds_engine` already
     hold while creating readers or writers, and these tools are the second
-    consumer that lock was introduced for (issue #358). Holding only the
+    consumer that lock was introduced for. Holding only the
     module-private ``_CLIENTS_LOCK`` would serialise this path against itself
     while leaving it racing the engine's subscribers - and the loss is a
     native segfault in the CycloneDDS bindings, which is not an exception the

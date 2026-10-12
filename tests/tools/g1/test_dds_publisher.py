@@ -203,7 +203,7 @@ def test_get_publisher_two_topics_two_publishers(
     pub_set = DDSPublisher("eth0")
     assert pub_set.start() is None
     p_low, _ = pub_set.get_publisher("rt/lowcmd", LowCmdStub)
-    p_arm, _ = pub_set.get_publisher("rt/armsdk", ArmSdkStub)
+    p_arm, _ = pub_set.get_publisher("rt/arm_sdk", ArmSdkStub)
     assert p_low is not p_arm
     assert len(fake_sdk.built) == 2
 

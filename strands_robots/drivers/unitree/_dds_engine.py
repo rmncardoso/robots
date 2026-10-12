@@ -115,7 +115,7 @@ class DDSSubscriberSet:
 
         The subscriber is constructed under :data:`_DDS_INIT_LOCK` because the
         CycloneDDS bindings segfault under concurrent
-        ``ChannelSubscriber(...)``. Same reason the agent tools (issue #358)
+        ``ChannelSubscriber(...)``. Same reason the agent tools
         share the lock: two consumers, one bus, one construction lane.
 
         Args:
@@ -215,8 +215,8 @@ class DDSPublisher:
     missing constructs it - one lane, one place.
 
     The engine deliberately exposes ``get_publisher`` too so a caller that
-    wants to build its own message and call ``Write`` directly (issue #358's
-    arm-SDK client is that caller) can share the cache with the driver's
+    wants to build its own message and call ``Write`` directly (a future
+    arm-SDK client would be that caller) can share the cache with the driver's
     control loop (issue #361). One process, one publisher per topic.
     """
 

@@ -3,7 +3,7 @@
 ``_common``'s module docstring states the contract this file grades: "A
 ``ChannelSubscriber`` and a ``ChannelPublisher`` cannot be constructed
 concurrently: the CycloneDDS bindings segfault. ``_DDS_INIT_LOCK`` is the
-*shared* lock the driver and the tools (issue #358) both hold while creating
+*shared* lock the driver and the tools both hold while creating
 readers or writers. One lock; two consumers." ``_dds_engine.subscribe``
 repeats it verbatim.
 
