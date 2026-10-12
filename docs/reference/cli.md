@@ -46,7 +46,7 @@ strands-robots verify-dataset ./my_dataset --json --no-check-videos
 | `--json` | off | print the report as JSON instead of the human summary |
 | `--no-check-videos` | videos checked | skip the per-episode video-file checks |
 | `--no-check-stats` | stats checked | skip the dead-control-column check (an all-zero action or state column) |
-| `--min-std X` | `0.001` | advise on control columns whose dataset-wide std is below X; `0` disables |
+| `--min-std X` | `0.001` | advise on control columns whose dataset-wide std is below X or not finite; `0` disables |
 
 The summary lists the episode count, frame totals and every problem, one per line, then every advisory (`!`); `strands_robots.verify_dataset.verify_dataset(root, ...)` returns the dict `--json` prints. [Verify](../learn/data/verify.md) says what each check catches.
 

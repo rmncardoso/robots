@@ -47,7 +47,7 @@ Exit code 0 on success, 1 on any problem. Flags:
 | `--min-frames K` | every episode must hold at least K frames (default 1; `0` disables) |
 | `--no-check-videos` | skip the per-episode video file checks |
 | `--no-check-stats` | skip the dead-control-column check |
-| `--min-std X` | advise on control columns whose dataset-wide std is below X (default 0.001; `0` disables) |
+| `--min-std X` | advise on control columns whose dataset-wide std is below X or not finite (default 0.001; `0` disables, while training's `TrainSpec.min_std` is off as `None`) |
 | `--json` | the report as JSON |
 
 ## What it checks
