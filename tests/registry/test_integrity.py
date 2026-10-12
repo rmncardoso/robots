@@ -79,7 +79,7 @@ def test_no_path_traversal_in_asset_paths(registry: dict) -> None:
     """Registry-sourced paths must not contain ``..`` (path-traversal defense in depth)."""
     for name, info in registry.items():
         asset = info.get("asset", {})
-        for key in ("dir", "model_xml", "scene_xml"):
+        for key in ("dir", "upstream_dir", "model_xml", "scene_xml"):
             value = asset.get(key, "")
             assert ".." not in str(value).split("/"), f"{name}.asset.{key} contains '..': {value!r}"
 

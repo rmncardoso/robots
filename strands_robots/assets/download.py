@@ -708,7 +708,14 @@ def _download_via_robot_descriptions(robots: dict[str, dict], dest_dir: Path) ->
 
 
 def _download_via_git(robots: dict[str, dict], dest_dir: Path) -> dict[str, str]:
-    """Fallback: shallow-clone Menagerie and copy robot directories."""
+    """Fallback: shallow-clone Menagerie and copy robot directories.
+
+    Each robot's menagerie directory is ``asset.upstream_dir`` when the entry
+    declares one, else ``asset.dir``; it is copied to ``<dest_dir>/<asset.dir>``.
+    The two differ when one menagerie directory ships the models of two entries
+    (``unitree_g1`` holds both G1 models), because no two entries may share a
+    cache ``dir``.
+    """
     results: dict[str, str] = {}
     if not robots:
         return results
@@ -723,12 +730,13 @@ def _download_via_git(robots: dict[str, dict], dest_dir: Path) -> dict[str, str]
 
         for name, info in robots.items():
             asset_dir = info["asset"]["dir"]
+            upstream_dir = info["asset"].get("upstream_dir") or asset_dir
             try:
                 # clone_dir holds a freshly cloned (untrusted) menagerie tree; resolve
                 # symlinks so an asset dir symlinked outside the clone cannot be copied out.
-                src = safe_join(Path(clone_dir), asset_dir, resolve_symlinks=True)
+                src = safe_join(Path(clone_dir), upstream_dir, resolve_symlinks=True)
                 if not src.exists():
-                    results[name] = f"failed: {asset_dir} not in menagerie"
+                    results[name] = f"failed: {upstream_dir} not in menagerie"
                     continue
                 dst = safe_join(dest_dir, asset_dir)
                 _copy_external_tree(src, dst)

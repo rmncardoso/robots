@@ -20,9 +20,14 @@ through the resolver already in the tree as one more symlink into the same cache
 description - no copied asset, and no new download path.
 
 The entry's asset cache dir cannot be the upstream directory's name, because no
-two entries may share one, so the viewer manifest carries the row that maps it
-back to the menagerie path - the same table `aliengo` and `unitree_h1_2` already
-use - and both G1s now stream from one URL at one pinned ref. A catalog card with
-no thumbnail yet also stops claiming the robot has no simulation asset: a
-thumbnail comes from a render sweep rather than from the build, so a robot added
-between two sweeps has an asset and no picture of it.
+two entries may share one, so the entry names that directory in a new optional
+`asset.upstream_dir`. The downloader's git fallback, which `download_robots`
+takes when `robot_descriptions` is not installed and to retry a fetch through it
+that failed, copies the menagerie's `upstream_dir` into the entry's own cache
+dir; read as `dir`, it answered "unitree_g1_with_hands not in menagerie". The
+viewer manifest builds its URL from the same field, so both G1s stream from one
+URL at one pinned ref.
+
+A catalog card with no thumbnail yet also stops claiming the robot has no
+simulation asset: a thumbnail comes from a render sweep rather than from the
+build, so a robot added between two sweeps has an asset and no picture of it.

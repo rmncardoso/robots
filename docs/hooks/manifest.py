@@ -95,11 +95,17 @@ _DESCRIPTION_REPOS: dict[str, tuple[str, str, str]] = {
     "unitree_a1": ("unitreerobotics/unitree_mujoco", "f3300ff1bf0ab9efbea0162717353480d9b05d73", "data/a1"),
     # robot_descriptions 1.23.0 pins google-deepmind/mujoco (model/humanoid) to this commit.
     "mujoco_humanoid": ("google-deepmind/mujoco", "ad0dc0de5e10a075a2c65be629e9a8d557d383a6", "model/humanoid"),
-    # The menagerie ships both G1 variants in ONE directory, and no two registry entries
-    # may share an asset cache dir, so this entry's dir is not a menagerie path. Same ref
-    # as every other menagerie robot, so a bump moves both G1s together.
-    "unitree_g1_with_hands": ("google-deepmind/mujoco_menagerie", MENAGERIE_REF, "unitree_g1"),
 }
+
+
+def _menagerie_dir(asset: dict) -> str:
+    """The asset's menagerie directory: ``upstream_dir`` where the entry declares one, else its ``dir``.
+
+    The two differ when one menagerie directory ships the models of two entries
+    (``unitree_g1`` holds both G1 models), because no two entries may share a cache
+    ``dir``. The downloader's git fallback reads the same field.
+    """
+    return asset.get("upstream_dir") or asset["dir"]
 
 
 def _lfs_url(name: str, asset: dict) -> str | None:
@@ -113,7 +119,7 @@ def _lfs_url(name: str, asset: dict) -> str | None:
         )
     source = asset.get("source") or {"type": "menagerie"}
     if source.get("type") == "menagerie":
-        return f"https://media.githubusercontent.com/media/google-deepmind/mujoco_menagerie/{MENAGERIE_REF}/{asset['dir']}/"
+        return f"https://media.githubusercontent.com/media/google-deepmind/mujoco_menagerie/{MENAGERIE_REF}/{_menagerie_dir(asset)}/"
     if source.get("type") == "github" and source.get("repo"):
         repo = _REPO_MOVES.get(source["repo"], source["repo"])
         ref = _GITHUB_REFS.get(name, source.get("ref") or "main")
@@ -133,7 +139,7 @@ def _base_url(name: str, asset: dict) -> str | None:
         return f"{_CDN}/{repo}@{commit}/{subdir}/" if subdir else f"{_CDN}/{repo}@{commit}/"
     source = asset.get("source") or {"type": "menagerie"}
     if source.get("type") == "menagerie":
-        return f"{_CDN}/google-deepmind/mujoco_menagerie@{MENAGERIE_REF}/{asset['dir']}/"
+        return f"{_CDN}/google-deepmind/mujoco_menagerie@{MENAGERIE_REF}/{_menagerie_dir(asset)}/"
     if source.get("type") == "github" and source.get("repo"):
         repo = _REPO_MOVES.get(source["repo"], source["repo"])
         ref = _GITHUB_REFS.get(name, source.get("ref") or "main")
