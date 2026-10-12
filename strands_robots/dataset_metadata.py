@@ -222,6 +222,21 @@ def _is_control_feature(name: str) -> bool:
     return name == "action" or name == "observation.state" or name.startswith("observation.state.")
 
 
+def _column_labels(feature_spec: Any, width: int) -> list[str]:
+    """A label per column: the ``names`` the feature declares, else ``[0]``, ``[1]``, ...
+
+    ``names`` is a list, or a dict of lists (``{"motors": [...]}``) read in
+    order. It is used only when it is all strings, one per column; anything
+    else cannot name this vector's columns one for one.
+    """
+    names = feature_spec.get("names") if isinstance(feature_spec, dict) else None
+    if isinstance(names, dict) and all(isinstance(group, list) for group in names.values()):
+        names = [name for group in names.values() for name in group]
+    if isinstance(names, list) and len(names) == width and all(isinstance(name, str) for name in names):
+        return names
+    return [f"[{index}]" for index in range(width)]
+
+
 def flat_control_columns(root: str | Path, min_std: float = NEAR_CONSTANT_STD) -> dict[str, list[tuple[str, str]]]:
     """The control columns mean-std normalization cannot scale, each with its reason.
 
@@ -241,30 +256,41 @@ def flat_control_columns(root: str | Path, min_std: float = NEAR_CONSTANT_STD) -
 
     Returns:
         ``{feature: [(column, reason), ...]}`` for each control feature with a
-        flagged column, in file order. ``column`` is ``"[<index>]"``, and
+        flagged column, in file order. ``column`` is the name ``meta/info.json``
+        declares for it (``features[feature]["names"]``, a list or a dict of
+        lists), or ``"[<index>]"`` when no declaration names every column, and
         ``reason`` is ``"std is <value>"`` (``"std is 0.0"``, ``"std is nan"``).
         Empty when ``meta/stats.json`` is absent, unreadable or not an object;
         an entry that is not a real number (a nested or ``bool`` stat) is never
         flagged.
     """
+    meta = Path(root) / "meta"
     try:
-        stats = json.loads((Path(root) / "meta" / "stats.json").read_text(encoding="utf-8"))
+        stats = json.loads((meta / "stats.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(stats, dict):
         return {}
+    # The column names, when declared. An absent or unusable ``meta/info.json``
+    # leaves the indices, which still locate every column.
+    try:
+        declared = json.loads((meta / "info.json").read_text(encoding="utf-8"))["features"]
+    except (OSError, ValueError, KeyError, TypeError):
+        declared = None
+    features = declared if isinstance(declared, dict) else {}
 
     flagged: dict[str, list[tuple[str, str]]] = {}
     for feat, values in stats.items():
         stds = values.get("std") if _is_control_feature(feat) and isinstance(values, dict) else None
         if not isinstance(stds, list):
             continue
+        labels = _column_labels(features.get(feat), len(stds))
         # ``nan < min_std`` is False, so a non-finite float is named by its own
         # test. Only a float can be one: ``math.isfinite`` raises on an integer
         # too large for a float, which ``json`` parses from a long literal.
         columns = [
-            (f"[{j}]", f"std is {std}")
-            for j, std in enumerate(stds)
+            (label, f"std is {std}")
+            for label, std in zip(labels, stds, strict=True)
             if isinstance(std, (int, float))
             and not isinstance(std, bool)
             and (std < min_std or isinstance(std, float) and not math.isfinite(std))

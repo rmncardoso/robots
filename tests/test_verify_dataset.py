@@ -1154,6 +1154,34 @@ class TestFlatControlColumnsIsTheSharedReader:
             assert warning.startswith(f"feature '{feat}' column(s) ")
             assert ", ".join(f"{column} ({reason})" for column, reason in columns) in warning
 
+    @pytest.mark.parametrize(
+        ("declared", "named"),
+        [
+            pytest.param({"names": ["shoulder_pan.pos", "gripper.pos"]}, "gripper.pos", id="list"),
+            pytest.param({"names": {"motors": ["shoulder_pan", "gripper"]}}, "gripper", id="dict-of-lists"),
+            pytest.param({"names": {"arm": ["shoulder_pan"], "hand": ["gripper"]}}, "gripper", id="dict-in-order"),
+            pytest.param({"names": ["gripper.pos"]}, "[1]", id="wrong-width"),
+            pytest.param({"names": [0, 1]}, "[1]", id="not-strings"),
+            pytest.param({"names": {"motors": "gripper"}}, "[1]", id="dict-not-of-lists"),
+            pytest.param({}, "[1]", id="no-names"),
+        ],
+    )
+    def test_a_column_is_named_as_info_json_declares_it(self, tmp_path: Path, declared: dict, named: str) -> None:
+        # ``gripper.pos`` is what an operator can act on; ``[1]`` is the fallback
+        # when the declaration cannot name this vector's columns one for one.
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40], info={"features": {"action": declared}})
+        _write_aggregate_stats(tmp_path, action={"std": [0.2, 0.0]})
+        assert flat_control_columns(tmp_path) == {"action": [(named, "std is 0.0")]}
+        [warning] = verify_dataset(tmp_path, check_videos=False)["warnings"]
+        assert f"column(s) {named} (std is 0.0) are" in warning, warning
+
+    @pytest.mark.parametrize("document", ["[1, 2]", '{"features": []}', '{"features": {"action": null}}', "{not json"])
+    def test_an_unusable_info_json_leaves_the_indices(self, tmp_path: Path, document: str) -> None:
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40])
+        (tmp_path / "meta" / "info.json").write_text(document, encoding="utf-8")
+        _write_aggregate_stats(tmp_path, action={"std": [0.2, 0.0]})
+        assert flat_control_columns(tmp_path) == {"action": [("[1]", "std is 0.0")]}
+
     def test_one_public_default_threshold_serves_the_reader_the_api_and_the_cli(self, tmp_path: Path, capsys) -> None:
         # The value both doc rows state.
         assert NEAR_CONSTANT_STD == 1e-3
