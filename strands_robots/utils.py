@@ -502,11 +502,30 @@ def redact_config_pairs(config: Mapping[str, Any]) -> str:
 
 #: A leading URL scheme - the ``s3`` in ``s3://bucket/key``, the ``ws`` in
 #: ``ws://gpu-box:8765`` - per RFC 3986 section 3.1: an ALPHA followed by ALPHA /
-#: DIGIT / "+" / "-" / ".". Group 1 is the scheme. The policy resolver's
-#: unknown-scheme refusal (``strands_robots.registry.policies``) and the dataset
-#: writers' URL refusal (``strands_robots.dataset_source``) both read it, so the
-#: two cannot disagree on what a URL is.
+#: DIGIT / "+" / "-" / ".". Group 1 is the scheme, which :func:`url_scheme`
+#: returns. The policy resolver's unknown-scheme refusal
+#: (``strands_robots.registry.policies``) and the dataset writers' URL refusal
+#: (``strands_robots.dataset_source``) both read it, so the two share one
+#: grammar of what a scheme is.
 URL_SCHEME_RE: Final[re.Pattern[str]] = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
+
+
+def url_scheme(text: str) -> str | None:
+    """The scheme ``text`` opens with, per :data:`URL_SCHEME_RE`, or ``None``.
+
+    RFC-general on purpose: ``C://data`` has the scheme ``C`` here, and a caller
+    that reads a single letter as a Windows drive letter says so itself.
+    ``text`` is read as given, so a caller strips it first.
+
+    Args:
+        text: The string a caller passed.
+
+    Returns:
+        The scheme as spelled - ``"s3"`` for ``s3://b/k`` - or ``None`` when
+        ``text`` does not open with ``scheme://``.
+    """
+    match = URL_SCHEME_RE.match(text)
+    return match.group(1) if match else None
 
 
 def refusal_repr(value: Any) -> str:

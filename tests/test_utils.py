@@ -655,3 +655,23 @@ class TestLogSafe:
 
         text = log_safe(_Bad())
         assert "\n" not in text and text
+
+
+class TestUrlScheme:
+    """``url_scheme`` reads the shared RFC 3986 scheme pattern, and nothing looser."""
+
+    def test_it_returns_the_scheme_as_spelled_or_none(self):
+        """One letter is still a scheme here, and input is read as given.
+
+        The policy resolver refuses ``C://`` as an unknown scheme, so a caller
+        that reads it as a Windows drive letter instead says so itself, and the
+        rule stays that caller's. Each caller strips its own input too.
+        """
+        from strands_robots.utils import url_scheme
+
+        assert url_scheme("s3://b/k") == "s3"
+        assert url_scheme("GRPC://gpu-box:8080") == "GRPC"
+        assert url_scheme("git+ssh://host/repo") == "git+ssh"
+        assert url_scheme("C://data/run") == "C"
+        for not_a_url in ("s3:/b/k", "s3:run1", "run_s3://x", "3d://x", " s3://b/k", "owner/name", ""):
+            assert url_scheme(not_a_url) is None, not_a_url

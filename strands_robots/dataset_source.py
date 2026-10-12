@@ -18,10 +18,11 @@ for, or re-derives -- and a re-derived dataset directory is a read that misses
 the write.
 
 They earn ``core`` by their dependencies: the standard library,
-:func:`~strands_robots._dyld.quiet_video_backend` and
-:func:`~strands_robots.utils.non_negative_whole_number_error`, plus LeRobot
-itself, imported inside the two functions that need it so a machine without it
-still resolves a local path.
+:func:`~strands_robots._dyld.quiet_video_backend`,
+:func:`~strands_robots.utils.non_negative_whole_number_error` and
+:func:`~strands_robots.utils.url_scheme`, plus LeRobot itself, imported inside
+the two functions that need it so a machine without it still resolves a local
+path.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from strands_robots._dyld import quiet_video_backend
-from strands_robots.utils import URL_SCHEME_RE, non_negative_whole_number_error
+from strands_robots.utils import non_negative_whole_number_error, url_scheme
 
 
 def _quiet_backend_kwargs(dataset_cls: Any) -> dict[str, Any]:
@@ -138,9 +139,9 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
         every local path and every ``owner/name`` Hub id.
     """
     text = os.fspath(value)
-    if (match := URL_SCHEME_RE.match(text)) is None:
+    scheme = url_scheme(text)
+    if scheme is None:
         return None
-    scheme = match.group(1)
     return (
         f"The dataset {what} {text!r} opens with the URL scheme {scheme}://, and a recording is "
         f"written to a local directory: Path() reads this value as the relative path "

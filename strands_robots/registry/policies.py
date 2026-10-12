@@ -11,7 +11,7 @@ import re
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from ..utils import URL_SCHEME_RE
+from ..utils import URL_SCHEME_RE, url_scheme
 from .loader import _load
 
 logger = logging.getLogger(__name__)
@@ -357,13 +357,13 @@ def _url_scheme_refusal(policy: str) -> str | None:
         declared pattern matches it.
     """
     url = _with_lowercase_url_scheme(policy.strip())
-    scheme = URL_SCHEME_RE.match(url)
+    scheme = url_scheme(url)
     if scheme is None:
         return None
     if _matches_declared_url_pattern(url):
         return None
     return (
-        f"No policy provider handles the URL scheme '{scheme.group(1)}://' "
+        f"No policy provider handles the URL scheme '{scheme}://' "
         f"(from {policy!r}). Declared schemes: "
         f"{', '.join(f'{s}://' for s in _declared_url_schemes())}."
     )
