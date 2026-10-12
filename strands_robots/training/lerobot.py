@@ -2307,8 +2307,6 @@ class LerobotTrainer(Trainer):
         if latest_epoch is not None:
             metrics["latest_epoch"] = latest_epoch
         if latest_loss is not None:
-            import math
-
             metrics["latest_loss"] = latest_loss
             metrics["learning"] = math.isfinite(latest_loss)
         metrics["liveness_ok"] = latest_step is not None
