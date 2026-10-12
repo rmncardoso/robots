@@ -2439,14 +2439,15 @@ def test_resolve_dataset_dir_keeps_a_hub_id_under_the_dataset_home(tmp_path, mon
 
 # A root or an id that names a remote store, one per scheme a caller reaches
 # for: the two object stores, the bucket URI ``sync_to_bucket`` itself prints,
-# and a plain web URL. Then one that reads as something else: a URL behind the
-# leading space a pasted value carries.
+# and a plain web URL. Then two that read as something else: a URL behind the
+# leading space a pasted value carries, and a file URL naming another host.
 DATASET_STORE_URLS = [
     "s3://probe-bucket/datasets/run1",
     "gs://probe-bucket/datasets/run1",
     "hf://buckets/org/collection/run1",
     "https://example.invalid/datasets/run1",
     " s3://b/k",
+    "file://gpu-box/datasets/run1",
 ]
 
 
@@ -2543,6 +2544,34 @@ def test_resolve_dataset_dir_keeps_a_local_path_that_merely_mentions_a_scheme(tm
     # An ``owner/name`` id and a local id are untouched by the new rule.
     assert dataset_source.resolve_dataset_dir("owner/name") == tmp_path / "home" / "owner" / "name"
     assert dataset_source.resolve_dataset_dir("my_local_dataset") == Path("my_local_dataset")
+
+
+def test_resolve_dataset_dir_refuses_a_file_url_naming_the_path_to_pass_instead(tmp_path, monkeypatch):
+    """A ``file://`` URL on this machine names a local directory, so its refusal names that directory.
+
+    ``file:///tmp/run1`` is ``/tmp/run1``, and the upload remedy the other
+    schemes get would send the caller to a store they never meant. It is
+    refused rather than converted: the readers take the same ``root`` as a
+    path, so a converted URL would record into ``/tmp/run1`` and read back from
+    ``file:/tmp/run1``. ``localhost`` is this machine too (RFC 8089); a file URL
+    naming another host is a remote store, one of ``DATASET_STORE_URLS``.
+    """
+    from strands_robots import dataset_source
+
+    monkeypatch.setattr(dataset_source, "_lerobot_home", lambda: tmp_path / "home")
+
+    # The space is percent-encoded in the URL, and decoded in the path named.
+    run = tmp_path / "my run"
+    for url in (run.as_uri(), run.as_uri().replace("file://", "file://localhost", 1)):
+        with pytest.raises(ValueError) as as_root:
+            dataset_source.resolve_dataset_dir("local/probe", url)
+        with pytest.raises(ValueError) as as_id:
+            dataset_source.resolve_dataset_dir(url)
+        for what, refusal in (("root", as_root), ("id", as_id)):
+            text = str(refusal.value)
+            assert text.startswith(f"The dataset {what} {url!r} is a file:// URL"), text
+            assert f"pass {str(run)!r} instead" in text, text
+            assert "sync_to_bucket()" not in text, text
 
 
 def test_create_raises_clear_error_on_existing_dataset_without_overwrite(tmp_path, monkeypatch):

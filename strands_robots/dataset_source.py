@@ -31,6 +31,7 @@ import inspect
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from strands_robots._dyld import quiet_video_backend
 from strands_robots.utils import non_negative_whole_number_error, url_scheme
@@ -135,7 +136,8 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
 
     Returns:
         The refusal - naming the value, the local path ``Path()`` reads it as,
-        and the remedy - or ``None`` for any value that is not a URL, which is
+        and the remedy, or for a ``file://`` URL on this machine the path to
+        pass instead - or ``None`` for any value that is not a URL, which is
         every local path (a Windows drive path such as ``C://data/run`` among
         them) and every ``owner/name`` Hub id.
     """
@@ -147,6 +149,17 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
     # A one-letter scheme is a Windows drive letter: C://data/run is a path.
     if scheme is None or len(scheme) == 1:
         return None
+    # Refused, not converted: the readers take this root as a path, so a
+    # converted URL would record into one directory and read back from another.
+    if scheme.lower() == "file" and (parts := urlsplit(stripped)).netloc in ("", "localhost"):
+        # Deferred: urllib.request pulls in http.client and hashlib, and only
+        # this refusal reads it.
+        from urllib.request import url2pathname
+
+        return (
+            f"The dataset {what} {text!r} is a file:// URL, and a recording takes a path: "
+            f"pass {url2pathname(parts.path)!r} instead."
+        )
     return (
         f"The dataset {what} {text!r} opens with the URL scheme {scheme}://, and a recording is "
         f"written to a local directory: Path() reads this value as the relative path "
@@ -228,9 +241,9 @@ def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
     Raises:
         ValueError: An empty or non-string ``repo_id``; a ``root`` that is
             neither ``None`` nor a path; a ``repo_id`` or ``root`` that is a URL
-            (:func:`dataset_url_error`), which names a store this writer cannot
-            write to and ``Path`` would read as a local directory; an
-            ``owner/name`` id whose segments would leave the dataset home
+            (:func:`dataset_url_error`), which ``Path`` would read as a local
+            directory the URL does not name; an ``owner/name`` id whose
+            segments would leave the dataset home
             (:data:`HUB_ID_OUTSIDE_HOME`); or a directory that is, or contains,
             the working or home directory (:data:`DATASET_DIR_HOLDS_CALLER_FILES`)
             - a writer replaces its target, so that would delete the caller's files.
