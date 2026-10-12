@@ -146,12 +146,12 @@ def test_the_admission_sets_are_read_off_the_driver_constants() -> None:
     assert result["walk_fsms"] == sorted(WALK_FSMS)
 
 
-def test_fsm_500_admits_arm_but_not_loco() -> None:
-    """FSM 500 admits arm writes but refuses locomotion writes.
+def test_fsm_500_admits_arm_and_loco() -> None:
+    """FSM 500 admits arm writes and locomotion writes.
 
-    :data:`HANDSHAKE_FSMS` carries 500 (Unitree's FSM table names it regular
-    locomotion) and :data:`WALK_FSMS` leaves it out. The verb's two admits
-    booleans must reflect that split.
+    :data:`HANDSHAKE_FSMS` and :data:`WALK_FSMS` both carry 500, which
+    Unitree's FSM table names regular locomotion and ``LocoClient.Start()``
+    enters. The verb's two admits booleans must both be ``True``.
     """
     inner: dict[str, Any] = {
         "tool_name": "g1",
@@ -169,15 +169,15 @@ def test_fsm_500_admits_arm_but_not_loco() -> None:
     result = _call(_StubG1Driver(inner))
     assert result["fsm_id"] == 500
     assert result["admits_arm"] is True
-    assert result["admits_loco"] is False
+    assert result["admits_loco"] is True
 
 
 def test_fsm_501_and_801_admit_both_scopes() -> None:
-    """The two shared ids in :data:`HANDSHAKE_FSMS` and :data:`WALK_FSMS` admit both.
+    """501 and 801 admit both scopes too.
 
-    :data:`WALK_FSMS` is the strict subset ``{501, 801}``; every id in it
-    is also in :data:`HANDSHAKE_FSMS`, so a live-walking robot admits arm
-    gestures too. The verb's booleans must both be ``True`` for either id.
+    Both are in :data:`HANDSHAKE_FSMS` and :data:`WALK_FSMS`, so a
+    live-walking robot admits arm gestures too. The verb's booleans must
+    both be ``True`` for either id.
     """
     for fsm_id in (501, 801):
         inner: dict[str, Any] = {

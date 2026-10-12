@@ -1054,9 +1054,9 @@ class G1Driver:
         Two FSM sets are enforced separately: :data:`HANDSHAKE_FSMS` covers
         arm-SDK-shaped writes (which the driver publishes on ``rt/lowcmd``
         today; the ``rt/arm_sdk`` topic is future work for the ``g1_tools``
-        client) and :data:`WALK_FSMS` is narrower - it leaves out 500, which
-        Unitree's FSM table names regular locomotion. ``scope`` is the
-        caller's declared kind of write:
+        client) and :data:`WALK_FSMS` covers locomotion. Both hold 500, which
+        Unitree's FSM table names regular locomotion and ``LocoClient.Start()``
+        enters. ``scope`` is the caller's declared kind of write:
 
         * ``"arm"`` - test :data:`HANDSHAKE_FSMS` and phrase the refusal as
           "refuses arm writes".

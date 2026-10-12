@@ -55,7 +55,7 @@ Wire-side invariants this decoder enforces.
   the gate might silently open on.
 
 Related: :mod:`._common` carries ``HANDSHAKE_FSMS = {500, 501, 801}`` and
-``WALK_FSMS = {501, 801}``; membership in those sets is the gate's admission
+``WALK_FSMS = {500, 501, 801}``; membership in those sets is the gate's admission
 question. This decoder does not evaluate membership -- that is the driver's
 job, and stays there -- it only produces the value the gate compares.
 """

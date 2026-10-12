@@ -224,8 +224,7 @@ _SCOPE_SETS: dict[str, frozenset[int]] = {
 }
 
 #: The scope a membership query answers for when the caller names none. The
-#: arm-SDK set is the broader of the two, and is the default the driver's own
-#: gate check reads.
+#: arm-SDK set is the default the driver's own gate check reads.
 _DEFAULT_SCOPE = "arm"
 
 #: The error-table entry the driver's write path quotes when it refuses on an
@@ -258,9 +257,9 @@ def g1_motion_gates(fsm_id: int | None = None, scope: str = "") -> dict[str, Any
             a caller writing ``True`` would otherwise be told the robot is not
             ready when they never asked a valid question.
         scope: Which admission set to read. ``arm`` is the set arm-SDK-shaped
-            writes need, ``loco`` the narrower set the driver admits
-            locomotion in (it leaves out ``500``, which Unitree's FSM table
-            names regular locomotion). Empty lists both scopes, and on a
+            writes need, ``loco`` the set the driver admits locomotion in
+            (today the same ids, ``500`` included: Unitree's FSM table names
+            it regular locomotion). Empty lists both scopes, and on a
             membership query means the arm gate.
 
     Returns:

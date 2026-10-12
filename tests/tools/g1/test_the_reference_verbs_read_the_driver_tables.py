@@ -146,8 +146,8 @@ class TestTheMotionGates:
         assert _SCOPE_SETS["loco"] is WALK_FSMS
         assert set(_SCOPE_SETS) == {"arm", "loco"}
 
-    def test_the_loco_gate_is_narrower_than_the_arm_gate(self) -> None:
-        """The driver's rule, not this verb's: FSM 500 takes arm gestures, not walking."""
+    def test_the_loco_gate_is_no_wider_than_the_arm_gate(self) -> None:
+        """The driver's rule, not this verb's: every FSM the walk gate admits takes arm gestures too."""
         assert WALK_FSMS <= HANDSHAKE_FSMS
         assert WALK_FSMS, "an empty loco gate would admit no locomotion write at all"
 
@@ -191,7 +191,7 @@ class TestTheMotionGates:
         assert result["refusal_text"] == ERR_CODES[_FSM_REFUSAL_CODE]
 
     def test_a_membership_query_with_no_scope_answers_for_the_arm_gate(self) -> None:
-        """An unnamed scope is the arm-SDK gate - the broader of the two the driver keeps."""
+        """An unnamed scope is the arm-SDK gate, the one ``send_action`` reads."""
         result = _payload(g1_motion_gates(fsm_id=next(iter(sorted(HANDSHAKE_FSMS)))))
         assert result["scope"] == "arm"
         assert result["fsm_ids"] == sorted(HANDSHAKE_FSMS)

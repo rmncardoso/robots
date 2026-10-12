@@ -375,7 +375,7 @@ def test_send_action_refuses_outside_handshake_fsm(fsm: int) -> None:
         assert str(handshake_fsm) in text
     # And the message must *not* name a set the arm gate does not test:
     # a locomotion-only FSM in the message would suggest a gate this call
-    # cannot enforce. The two sets overlap on {501, 801}, so the check is
+    # cannot enforce. The two sets hold the same three ids, so the check is
     # that any FSM in WALK_FSMS \ HANDSHAKE_FSMS is absent - which is the
     # empty set today, so the constructive check is on the wording.
     assert "loco" not in text  # message no longer over-claims scope
@@ -567,49 +567,46 @@ def test_send_action_admits_every_handshake_fsm(fsm: int) -> None:
     assert f"FSM {fsm} refuses" not in text
 
 
-def test_walk_fsms_has_a_consumer_and_a_documented_boundary() -> None:
-    """The :data:`WALK_FSMS` constant is not dead: a locomotion write at 500
-    refuses even though 500 is in :data:`HANDSHAKE_FSMS`.
+class _SwitcherReporting:
+    """A ``MotionSwitcherClient`` double whose ``CheckMode()`` reports ``fsm_id`` as the active mode."""
 
-    500 is in the arm set but left out of the walk set (Unitree's FSM table
-    names it regular locomotion). A ``run_policy`` at FSM 500 is a motion
-    write (union-scoped), so it passes; a hypothetical loco-scoped write at
-    500 would refuse. This test pins the boundary WALK_FSMS exists to record:
-    the day the write lines land, the loco-scoped path can call
-    ``_check_motion_gates("loco")`` and the refusal at 500 is already there.
+    def __init__(self, fsm_id: int) -> None:
+        self.fsm_id = fsm_id
+
+    def CheckMode(self) -> tuple[int, dict[str, Any]]:  # noqa: N802 - SDK spelling
+        return 0, {"name": "ai", "form": self.fsm_id}
+
+
+def test_a_move_after_loco_client_start_passes_the_walk_gate() -> None:
+    """Start, then Move: with FSM 500 reported, a locomotion write passes the walk gate.
+
+    Unitree's ``LocoClient.Start()`` calls ``SetFsmId(500)``, which its FSM
+    table names regular locomotion, and a ``Move`` after it is the kind of
+    write the ``"loco"`` scope gates. No driver verb is loco-scoped yet, so
+    the cell asks :meth:`G1Driver._check_motion_gates` directly, as the first
+    one will, with the FSM read off the motion switcher rather than assigned.
+    The arm and motion gates admit 500 as before, and the refusals stand: an
+    FSM in neither set, and a pack under the floor.
     """
-    driver = G1Driver(tool_name="g1", port="1.2.3.4")
+    switcher = _SwitcherReporting(500)
+    driver = G1Driver(tool_name="g1", port="1.2.3.4", motion_switcher_client_factory=lambda _iface: switcher)
     driver._connected = True
-    driver._fsm_id = 500  # in HANDSHAKE_FSMS, not in WALK_FSMS
     driver._mode_machine = 9  # uint8 layout id echoed from lowstate
     driver._battery = {"pct": 92.0, "current": 1.0, "cycle": 0, "t": 0.0}
 
-    # Arm-scoped write at 500 passes the gate (500 is in HANDSHAKE_FSMS).
-    arm_result = driver.send_action({"any": 0.0})
-    assert arm_result["status"] == "error"
-    # Not gated - the arm gate accepts 500; the refusal is transport-side
-    # (PR-B wired the write, so a driver without a live publisher fails
-    # here instead of at the "not wired yet" seam).
-    assert "publisher not initialised" in arm_result["content"][0]["text"]
+    assert [driver._check_motion_gates(scope) for scope in ("loco", "arm", "motion")] == [None, None, None]
+    assert driver._fsm_id == 500  # the id the gates compared came from the switcher
 
-    # Loco-scoped gate at 500 refuses. Calling the helper directly is the
-    # narrow way to pin the boundary before any write verb classifies its
-    # scope.
-    loco_refusal = driver._check_motion_gates("loco")
-    assert loco_refusal is not None
-    text = loco_refusal["content"][0]["text"]
-    assert "FSM 500" in text
-    assert "locomotion writes" in text
-    # The message names the WALK set, not the union - so a caller sees
-    # exactly what would satisfy a loco write. Stated literally so an
-    # emptied WALK_FSMS (a maintainer error that would refuse every
-    # locomotion write the day the writes land) fires this test rather
-    # than passing over a vacuous ``for`` loop.
-    for member in (501, 801):
-        assert str(member) in text
-    # 500 is *not* in WALK_FSMS, so it must not appear as an admitted FSM.
-    admitted_set_part = text.split("needs one of ")[-1]
-    assert "500" not in admitted_set_part
+    switcher.fsm_id = 3  # LocoClient.Sit(): in neither set
+    refusal = driver._check_motion_gates("loco")
+    assert refusal is not None
+    assert refusal["content"][0]["text"] == "FSM 3 refuses locomotion writes; needs one of [500, 501, 801]"
+
+    switcher.fsm_id = 500
+    driver._battery = {"pct": 12.0, "current": 0.0, "cycle": 0, "t": 0.0}
+    refusal = driver._check_motion_gates("loco")
+    assert refusal is not None
+    assert refusal["content"][0]["text"] == "battery 12.0% is under floor 15.0%"
 
 
 # -------------------------------------------------------------------------
@@ -620,33 +617,24 @@ def test_walk_fsms_has_a_consumer_and_a_documented_boundary() -> None:
 # -------------------------------------------------------------------------
 
 
-def test_walk_fsms_is_a_proper_subset_of_handshake_fsms() -> None:
-    """Both sets are populated and the distinction is a real one.
+def test_walk_fsms_is_500_501_and_801() -> None:
+    """The walk set's contents, stated as literals.
 
-    ``test_walk_fsms_has_a_consumer_and_a_documented_boundary`` asserts the
-    contents of :data:`WALK_FSMS` with ``for member in WALK_FSMS``, which
-    is vacuous when the set is empty. This test states the shape directly
-    so an emptied :data:`WALK_FSMS` -- or a widening that erases the
-    distinction the ``loco`` scope depends on -- fails a test named for
-    the shape, not a test named for something else.
+    The acceptance cells drive the gate at literal FSM values; this one states
+    the set itself, so an emptied :data:`WALK_FSMS`, or one that leaves 500 out
+    again, fails a test named for the set rather than one named for a verb.
     """
-    assert WALK_FSMS, "WALK_FSMS must not be empty"
-    assert WALK_FSMS < HANDSHAKE_FSMS, "WALK_FSMS must be strictly narrower"
-    # 500 is the boundary the scope split exists to record: the arm gate
-    # admits it and the walk gate does not. Naming it literally makes the
-    # intent readable from the assertion alone.
-    assert 500 in HANDSHAKE_FSMS - WALK_FSMS
+    assert WALK_FSMS == frozenset({500, 501, 801})
 
 
-@pytest.mark.parametrize("fsm", [501, 801])
+@pytest.mark.parametrize("fsm", [500, 501, 801])
 def test_the_loco_gate_admits_every_walking_fsm(fsm: int) -> None:
     """Acceptance side of the loco gate, at literal FSM values.
 
-    ``test_walk_fsms_has_a_consumer_and_a_documented_boundary`` only grades
-    the refusal at 500; nothing asserts that a walkable FSM is admitted,
-    so emptying :data:`WALK_FSMS` fires no test in the shipped suite. This
-    test closes that gap by driving the helper directly at each FSM the
-    ``loco`` scope must accept.
+    Values stated literally so narrowing :data:`WALK_FSMS` (dropping 500
+    again, say) fires the ``[500]`` case rather than deselecting it. The
+    cell drives the helper directly at each FSM the ``loco`` scope must
+    accept.
     """
     driver = G1Driver(tool_name="g1", port="1.2.3.4")
     driver._connected = True

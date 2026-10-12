@@ -3,7 +3,8 @@
 Four kinds of name in `strands_robots/drivers/g1.py`, `strands_robots/drivers/unitree/` and
 `strands_robots/tools/g1/` pointed a reader at something that does not exist or means something
 else, and the Unitree hardware page promised an approval step most of its verbs do not have.
-Behaviour is unchanged apart from strings: no FSM set, gate or write path moves.
+Behaviour is unchanged apart from strings; the one FSM set that moves, `WALK_FSMS`, has its own
+entry.
 
 - **The arm topic.** The package spelled it `rt/armsdk` in eight places. Unitree's arm SDK
   examples publish `rt/arm_sdk` (`unitree_sdk2_python`,
@@ -20,8 +21,8 @@ Behaviour is unchanged apart from strings: no FSM set, gate or write path moves.
   "sitting", and the fourth labelled the set "arm-SDK, sit, sit-down". Unitree's SDK enters 500 from
   `LocoClient.Start()` and sits with FSM 3 (`LocoClient.Sit()`), and its FSM table
   (https://support.unitree.com/home/en/G1_developer/sport_services_interface) names 500 regular
-  locomotion, 501 the same with the 3-DoF waist and 801 walk-run locomotion. `WALK_FSMS` still
-  leaves 500 out; the text now says so without the reason that rested on the wrong label.
+  locomotion, 501 the same with the 3-DoF waist and 801 walk-run locomotion. That label was why
+  `WALK_FSMS` left 500 out; it now admits 500, which has its own entry.
 - **#358.** Twenty-seven lines cited `#358` as the G1 tools tracker, in refusal envelopes,
   docstrings and comments. Here #358 is a merged pull request about zenoh mock isolation, and
   #2928 is the issue opened for the tools port once that was noticed. The `refs` clauses under

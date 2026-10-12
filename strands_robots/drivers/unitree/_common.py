@@ -121,9 +121,11 @@ ERR_CODES: dict[int, str] = {
 #: ``g1_tools`` client and this driver does not write it.
 HANDSHAKE_FSMS: frozenset[int] = frozenset({500, 501, 801})
 
-#: FSM ids this driver admits locomotion velocity commands in:
-#: :data:`HANDSHAKE_FSMS` without 500.
-WALK_FSMS: frozenset[int] = frozenset({501, 801})
+#: FSM ids this driver admits locomotion velocity commands in: the same three
+#: as :data:`HANDSHAKE_FSMS`. Unitree's ``LocoClient.Start()`` enters 500, so a
+#: ``Move`` after it must pass. Kept apart from :data:`HANDSHAKE_FSMS` because
+#: the two gate different writes.
+WALK_FSMS: frozenset[int] = frozenset({500, 501, 801})
 
 
 def decode_code(code: object) -> str:
