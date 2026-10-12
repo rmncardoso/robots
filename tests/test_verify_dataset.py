@@ -975,7 +975,7 @@ class TestNearConstantColumn:
         assert len(report["warnings"]) == 1
         warning = report["warnings"][0]
         assert "near-constant" in warning and "dataset-wide" in warning
-        assert "'action'" in warning and "[0]" in warning and "[0, 1]" not in warning
+        assert "'action'" in warning and "[0] (std is 1e-05)" in warning and "[1]" not in warning
 
     def test_fifty_episodes_still_give_one_advisory_per_feature(self, tmp_path: Path) -> None:
         report = verify_dataset(_flat_action_dataset(tmp_path, episodes=50), check_videos=False)
@@ -1015,6 +1015,19 @@ class TestNearConstantColumn:
         assert len(report["warnings"]) == 1, report["warnings"]
         assert "'action'" in report["warnings"][0] and "[0]" in report["warnings"][0]
 
+    @pytest.mark.parametrize("std", [float("nan"), float("inf"), float("-inf")], ids=repr)
+    def test_a_non_finite_std_is_named_with_its_value(self, tmp_path: Path, std: float) -> None:
+        # ``nan < min_std`` is False, so a bare comparison passed over the stat
+        # that harms normalization most: dividing by a nan std makes every
+        # normalized value nan. Each non-finite value is named as its own reason.
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40])
+        _write_aggregate_stats(tmp_path, action={"std": [std, 0.0, 0.5]})
+        report = verify_dataset(tmp_path, check_videos=False)
+        assert report["ok"] is True, report["problems"]
+        [warning] = report["warnings"]
+        assert f"[0] (std is {std})" in warning, warning
+        assert "[1] (std is 0.0)" in warning and "[2]" not in warning
+
     @pytest.mark.parametrize("check_stats", [True, False])
     def test_a_dead_vector_is_also_one_advisory_whether_or_not_it_is_a_problem(
         self, tmp_path: Path, check_stats: bool
@@ -1033,7 +1046,7 @@ class TestNearConstantColumn:
         assert report["ok"] is not check_stats
         assert any("identically zero" in p for p in report["problems"]) is check_stats
         assert len(report["warnings"]) == 1, report["warnings"]
-        assert "[0, 1]" in report["warnings"][0]
+        assert "[0] (std is 0.0), [1] (std is 0.0)" in report["warnings"][0]
 
     def test_only_the_flat_columns_of_a_mixed_state_vector_are_named(self, tmp_path: Path) -> None:
         _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[60])
@@ -1064,6 +1077,7 @@ class TestNearConstantColumn:
         # A nested per-episode stat is check 6's input and a nested or ``false``
         # aggregate entry is not a number: neither may raise out of a checker
         # whose contract is to return a report, and neither is evidence of flatness.
+        # Nor may an integer too large for a float, which ``math.isfinite`` raises on.
         _write_stats_parquet(
             tmp_path,
             {
@@ -1078,7 +1092,7 @@ class TestNearConstantColumn:
         _write_aggregate_stats(
             tmp_path,
             observation__state={"std": [[1e-5, 1e-5], [1e-5, 1e-5]]},
-            action={"std": [False, None, "0"]},
+            action={"std": [False, None, "0", 10**400]},
         )
         report = verify_dataset(tmp_path, check_videos=False)
         assert report["ok"] is True, report["problems"]

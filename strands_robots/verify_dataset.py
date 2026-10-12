@@ -39,7 +39,8 @@ Checks performed against a dataset root (the dir containing ``meta/``):
 
 Separately, ``meta/stats.json`` is read for ADVICE in ``warnings``, never for a
 problem: a control column whose dataset-wide ``std`` is below ``--min-std``
-(default 1e-3; ``0`` disables it) is near-constant.
+(default 1e-3; ``0`` disables it) is near-constant, and one whose ``std`` is
+nan or infinite is named with that value.
 
 Usage:
     strands-robots verify-dataset /path/to/dataset
@@ -63,6 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -156,9 +158,10 @@ def verify_dataset(
             whole episode) is a measurement and is not flagged.
         min_std: Dataset-wide standard deviation (``meta/stats.json``) every
             control column is expected to reach; a column below it is reported
-            in ``warnings`` as near-constant. A non-negative finite number;
-            ``0`` disables this report. Advice and not a problem, because a
-            joint held still on purpose reads the same.
+            in ``warnings`` as near-constant, and so is one whose std is nan or
+            infinite. A non-negative finite number; ``0`` disables this report.
+            Advice and not a problem, because a joint held still on purpose
+            reads the same.
 
     Returns:
         A report dict with:
@@ -738,7 +741,7 @@ def _verify_feature_stats(
 
 
 def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
-    """Advice on control columns whose dataset-wide ``std`` is under ``min_std``.
+    """Advice on control columns whose dataset-wide ``std`` is under ``min_std`` or not finite.
 
     Read from ``meta/stats.json``, the aggregate stats ``MEAN_STD``
     normalization divides by, and not from the per-episode stats check 6 reads:
@@ -754,7 +757,8 @@ def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
         min_std: The spread a column is expected to reach; a positive number.
 
     Returns:
-        One advisory per control feature with near-constant columns. Empty when
+        One advisory per control feature with near-constant or non-finite
+        columns, each named with its std (``[3] (std is nan)``). Empty when
         ``meta/stats.json`` is absent, unreadable or not an object, and for an
         entry that is not a real number (a nested or ``bool`` stat).
     """
@@ -770,17 +774,23 @@ def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
         stds = values.get("std") if _is_control_feature(feat) and isinstance(values, dict) else None
         if not isinstance(stds, list):
             continue
+        # ``nan < min_std`` is False, so a non-finite float is named by its own
+        # test. Only a float can be one: ``math.isfinite`` raises on an integer
+        # too large for a float, which ``json`` parses from a long literal.
         flat = [
-            j
+            f"[{j}] (std is {std})"
             for j, std in enumerate(stds)
-            if isinstance(std, (int, float)) and not isinstance(std, bool) and std < min_std
+            if isinstance(std, (int, float))
+            and not isinstance(std, bool)
+            and (std < min_std or isinstance(std, float) and not math.isfinite(std))
         ]
         if flat:
             advice.append(
-                f"feature '{feat}' column(s) {flat} are near-constant: their dataset-wide std in "
-                f"meta/stats.json is below min_std={min_std:g}. MEAN_STD normalization divides by "
-                "std + 1e-8, so what deviation remains is scaled far past the range a policy's input "
-                "layer was fitted for. Advice, not a problem: a joint held still on purpose reads the same"
+                f"feature '{feat}' column(s) {', '.join(flat)} are near-constant or not finite: their "
+                f"dataset-wide std in meta/stats.json is below min_std={min_std:g}, or nan or infinite. "
+                "MEAN_STD normalization divides by std + 1e-8, so what deviation remains is scaled far past "
+                "the range a policy's input layer was fitted for. Advice, not a problem: a joint held still "
+                "on purpose reads the same"
             )
     return advice
 
@@ -853,8 +863,8 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=_NEAR_CONSTANT_STD,
         help=(
-            "Advise on any control column whose dataset-wide std (meta/stats.json) is below this "
-            f"(default: {_NEAR_CONSTANT_STD:g}); 0 disables. Advisory: it does not change the exit code."
+            "Advise on any control column whose dataset-wide std (meta/stats.json) is below this or not "
+            f"finite (default: {_NEAR_CONSTANT_STD:g}); 0 disables. Advisory: it does not change the exit code."
         ),
     )
     args = parser.parse_args(argv)
