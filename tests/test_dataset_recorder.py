@@ -2439,12 +2439,14 @@ def test_resolve_dataset_dir_keeps_a_hub_id_under_the_dataset_home(tmp_path, mon
 
 # A root or an id that names a remote store, one per scheme a caller reaches
 # for: the two object stores, the bucket URI ``sync_to_bucket`` itself prints,
-# and a plain web URL.
+# and a plain web URL. Then one that reads as something else: a URL behind the
+# leading space a pasted value carries.
 DATASET_STORE_URLS = [
     "s3://probe-bucket/datasets/run1",
     "gs://probe-bucket/datasets/run1",
     "hf://buckets/org/collection/run1",
     "https://example.invalid/datasets/run1",
+    " s3://b/k",
 ]
 
 
@@ -2486,7 +2488,10 @@ def test_resolve_dataset_dir_refuses_a_url_as_the_root_and_as_the_id(tmp_path, m
     with pytest.raises(ValueError) as as_id_beside_a_root:
         dataset_source.resolve_dataset_dir(url, str(tmp_path / "dataset"))
 
-    scheme = url.split("://", 1)[0]
+    # The folder Path() names after the scheme keeps a leading space; the
+    # scheme the refusal names does not.
+    prefix = url.split("://", 1)[0]
+    scheme = prefix.lstrip()
     for what, refusal in (("root", as_root), ("id", as_id), ("id", as_id_beside_a_root)):
         text = str(refusal.value)
         assert text.startswith(f"The dataset {what} {url!r} opens with the URL scheme {scheme}://")
@@ -2506,7 +2511,7 @@ def test_resolve_dataset_dir_refuses_a_url_as_the_root_and_as_the_id(tmp_path, m
         DatasetRecorder.create("local/probe", root=url, joint_names=["j1"])
     with pytest.raises(ValueError, match="opens with the URL scheme"):
         DatasetRecorder.create(url, root=None, joint_names=["j1"])
-    assert not (tmp_path / f"{scheme}:").exists()
+    assert not (tmp_path / f"{prefix}:").exists()
     assert not (tmp_path / "home").exists()
 
 

@@ -140,7 +140,10 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
         them) and every ``owner/name`` Hub id.
     """
     text = os.fspath(value)
-    scheme = url_scheme(text)
+    # Read past leading whitespace, as the policy resolver strips its input:
+    # " s3://b/k" is a URL too, not a folder named " s3:".
+    stripped = text.lstrip()
+    scheme = url_scheme(stripped)
     # A one-letter scheme is a Windows drive letter: C://data/run is a path.
     if scheme is None or len(scheme) == 1:
         return None
