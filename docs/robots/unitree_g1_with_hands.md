@@ -1,11 +1,11 @@
 ---
 title: unitree_g1_with_hands
-description: "Unitree G1 Humanoid with hands (43-DOF: 29 body + 7 per hand)"
+description: "Unitree G1 Humanoid with Dex3-1 hands (43-DOF: 29 body + 7 per hand)"
 ---
 
 <!-- generated: docs/hooks/robot_pages.py -->
 
-# Unitree G1 Humanoid with hands (43-DOF: 29 body + 7 per hand)
+# Unitree G1 Humanoid with Dex3-1 hands (43-DOF: 29 body + 7 per hand)
 
 {{robot_chips:unitree_g1_with_hands}}
 

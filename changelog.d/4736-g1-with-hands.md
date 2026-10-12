@@ -8,11 +8,13 @@ the entry contradicted itself, and a reader who sized an action vector from the
 description got 29 keys and no fingers.
 
 The hands are in a second model in the same upstream directory,
-`g1_with_hands.xml`: the same 29 body joints plus seven per hand - three thumb,
-two middle and two index hinges - for 43 actuated joints, each driven by one
-actuator. It now has its own registry entry, so `Robot("unitree_g1_with_hands")`
-(or `Robot("g1_with_hands")`) spawns it and `robot_action_keys` reports the
-fourteen hand joints; `unitree_g1`'s description no longer promises them.
+`g1_with_hands.xml`: the same 29 body joints plus two Unitree Dex3-1 hands of
+seven joints each - three thumb, two middle and two index hinges - for 43
+actuated joints, each driven by one actuator. It now has its own registry entry,
+which names the hand because a G1 also ships with Inspire's 6-DoF hand, whose
+action vector does not fit this model. `Robot("unitree_g1_with_hands")` (or
+`Robot("g1_with_hands")`) spawns it and `robot_action_keys` reports the fourteen
+hand joints; `unitree_g1`'s description no longer promises them.
 
 Nothing is vendored. Both entries name one `robot_descriptions` module, whose
 `PACKAGE_PATH` is the directory holding both models, so the second arrives

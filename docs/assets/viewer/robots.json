@@ -2665,7 +2665,7 @@
    ],
    "base_url": "https://cdn.jsdelivr.net/gh/google-deepmind/mujoco_menagerie@c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",
    "category": "humanoid",
-   "description": "Unitree G1 Humanoid with hands (43-DOF: 29 body + 7 per hand)",
+   "description": "Unitree G1 Humanoid with Dex3-1 hands (43-DOF: 29 body + 7 per hand)",
    "driver": null,
    "joints": 43,
    "lfs_url": "https://media.githubusercontent.com/media/google-deepmind/mujoco_menagerie/c96a32d28fb5da84da38c1da4d749e7a13212855/unitree_g1/",

@@ -958,7 +958,7 @@
       ]
     },
     "unitree_g1_with_hands": {
-      "description": "Unitree G1 Humanoid with hands (43-DOF: 29 body + 7 per hand)",
+      "description": "Unitree G1 Humanoid with Dex3-1 hands (43-DOF: 29 body + 7 per hand)",
       "category": "humanoid",
       "joints": 43,
       "asset": {
