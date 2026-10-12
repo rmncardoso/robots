@@ -32,6 +32,9 @@ guard runs ahead of `ensure_dds`'s lazy SDK import, so an unusable value reports
 the same with the vendor SDK installed and without it, and
 `tests/test_dds_domain_id_domain.py` now grades both drivers over the same
 fourteen unusable and five usable values as every other domain surface.
+`use_unitree` refuses one in the same words before its operator-approval gate,
+so an operator is never asked to approve a command that could only fail on its
+domain.
 
 A second, *different* domain in one process is refused the way a second
 interface already is, and for the same reason: `ChannelFactory.Init`

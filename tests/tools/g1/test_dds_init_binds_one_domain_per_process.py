@@ -252,8 +252,8 @@ class TestAnUnusableDomainIsRefusedBeforeTheBus:
     ) -> None:
         """Every facet of one unusable value, in the order the harm would land:
         the shared refusal word for word, no call to the SDK, every other
-        surface refusing it too - ``use_unitree`` as a failed call carrying
-        that refusal - and nothing recorded, so the next caller still binds."""
+        surface refusing it too - ``use_unitree`` in the same words, before its
+        approval gate - and nothing recorded, so the next caller still binds."""
         refusal = dds_domain_id_error(value, "domain_id", "ensure_dds")
         assert ensure_dds("eth0", value) == refusal
         assert bus_calls == []
@@ -266,7 +266,9 @@ class TestAnUnusableDomainIsRefusedBeforeTheBus:
                 driver_cls(domain_id=value)
         result = uu.use_unitree("loco", "GetFsmId", {}, domain_id=value)
         assert result["status"] == "error"
-        assert result["content"][0]["json"]["message"] == f"loco.GetFsmId failed: {refusal}"
+        assert result["content"][0]["json"]["message"] == (
+            f"loco.GetFsmId refused: {dds_domain_id_error(value, 'domain_id', 'use_unitree')}"
+        )
 
         assert ensure_dds("eth0") is None
         assert bus_calls == [(0, "eth0")]

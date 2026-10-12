@@ -79,6 +79,7 @@ from strands.types.tools import ToolContext
 
 from strands_robots._command_gate import gate_motion
 from strands_robots.drivers.unitree._common import _DDS_INIT_LOCK, as_tool_result, ensure_dds
+from strands_robots.utils import dds_domain_id_error
 
 logger = logging.getLogger(__name__)
 
@@ -707,6 +708,17 @@ def use_unitree(
         "mutative": mutative,
         "high_danger": high_danger,
     }
+
+    # The model names the domain, so a value no bus can bind is refused here,
+    # ahead of the gate: an operator must not be asked to approve a command that
+    # could only fail on its domain. In the shared words, as every surface is.
+    if reason := dds_domain_id_error(domain_id, "domain_id", "use_unitree"):
+        return {
+            "status": "error",
+            "message": f"{service_name}.{operation_name} refused: {reason}",
+            "dispatched": False,
+            **classification,
+        }
 
     if (high_danger or mutative) and (service_name, operation_name) not in _UNGATED_STOP_OPS:
         refusal = _gate(service_name, operation_name, high_danger, tool_context)
