@@ -25,6 +25,7 @@ pytest.importorskip("pyarrow")
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from strands_robots.dataset_metadata import NEAR_CONSTANT_STD, flat_control_columns
 from strands_robots.verify_dataset import (
     _declared_column_blocks,
     _verify_feature_stats,
@@ -1117,6 +1118,53 @@ class TestNearConstantColumn:
 
         assert verify_main([str(tmp_path), "--no-check-videos", "--min-std", "0"]) == 0
         assert "near-constant" not in capsys.readouterr().out
+
+
+class TestFlatControlColumnsIsTheSharedReader:
+    """The advice above reads its columns through one public reader.
+
+    A trainer that refuses a flat dataset asks ``meta/stats.json`` the same
+    question with the same test, so the test lives once in
+    :func:`~strands_robots.dataset_metadata.flat_control_columns`, below both,
+    and the default threshold is one public name rather than a private copy each.
+    """
+
+    def test_it_returns_each_flagged_column_with_its_reason(self, tmp_path: Path) -> None:
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40])
+        _write_aggregate_stats(
+            tmp_path,
+            action={"std": [float("nan"), 0.0, 0.5]},
+            observation__state={"std": [0.2, 5e-5]},
+            observation__images__cam={"std": [[[1e-9]]]},
+        )
+        assert flat_control_columns(tmp_path, 1e-3) == {
+            "action": [("[0]", "std is nan"), ("[1]", "std is 0.0")],
+            "observation.state": [("[1]", "std is 5e-05")],
+        }
+
+    def test_the_advice_names_exactly_the_columns_it_returns(self, tmp_path: Path) -> None:
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40])
+        _write_aggregate_stats(
+            tmp_path, action={"std": [float("inf"), 0.3]}, observation__state={"std": [0.0, -1.0, 2e-4]}
+        )
+        flagged = flat_control_columns(tmp_path, 1e-3)
+        warnings = verify_dataset(tmp_path, check_videos=False, min_std=1e-3)["warnings"]
+        assert len(warnings) == len(flagged) == 2, warnings
+        for (feat, columns), warning in zip(flagged.items(), warnings, strict=True):
+            assert warning.startswith(f"feature '{feat}' column(s) ")
+            assert ", ".join(f"{column} ({reason})" for column, reason in columns) in warning
+
+    def test_one_public_default_threshold_serves_the_reader_the_api_and_the_cli(self, tmp_path: Path, capsys) -> None:
+        # The value both doc rows state.
+        assert NEAR_CONSTANT_STD == 1e-3
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40])
+        # Either side of the default: a column at 0.9 of it is flat, one at 1.1 is not.
+        _write_aggregate_stats(tmp_path, action={"std": [0.9 * NEAR_CONSTANT_STD, 1.1 * NEAR_CONSTANT_STD]})
+        assert [column for column, _ in flat_control_columns(tmp_path)["action"]] == ["[0]"]
+        [warning] = verify_dataset(tmp_path, check_videos=False)["warnings"]
+        assert f"min_std={NEAR_CONSTANT_STD:g}" in warning
+        assert verify_main([str(tmp_path), "--no-check-videos"]) == 0
+        assert f"min_std={NEAR_CONSTANT_STD:g}" in capsys.readouterr().out
 
 
 def _write_stats_parquet(root: Path, columns: dict[str, list]) -> Path:

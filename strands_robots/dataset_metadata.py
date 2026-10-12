@@ -13,15 +13,30 @@ or copies.
 It earns that place by its dependencies: ``pyarrow``, the standard library, and
 :func:`~strands_robots.utils.declared_count`, the one owner of "is this header a
 count" - and nothing else internal.
+
+``meta/stats.json`` is read here for the same reason. Which control columns are
+too flat, or too broken, for mean-std normalization to scale is a fact about the
+recorded dataset: the ``verify-dataset`` advice asks it, and so does any trainer
+that refuses such a dataset, so :func:`flat_control_columns` answers both rather
+than living inside the first and being copied by the second.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 from strands_robots.utils import declared_count
+
+#: The dataset-wide ``std`` below which :func:`flat_control_columns` calls a
+#: control column near-constant, and the default of ``verify-dataset --min-std``.
+#: Mean-std normalization divides by ``std``, so a column this flat has whatever
+#: deviation remains scaled by about 1e3. The threshold is in the column's own
+#: unit: a milliradian on a radian-valued joint, a thousandth of a degree on a
+#: degree-valued one.
+NEAR_CONSTANT_STD = 1e-3
 
 
 def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
@@ -196,3 +211,64 @@ def read_dataset_episode_indices(root: str | Path) -> dict[str, Any]:
         "info_problems": info_problems,
         "unreadable_files": unreadable_files,
     }
+
+
+def _is_control_feature(name: str) -> bool:
+    """Whether ``name`` is a control feature: ``action`` or an ``observation.state*``.
+
+    ``verify-dataset``'s dead-column check and :func:`flat_control_columns` both
+    grade exactly these features.
+    """
+    return name == "action" or name == "observation.state" or name.startswith("observation.state.")
+
+
+def flat_control_columns(root: str | Path, min_std: float = NEAR_CONSTANT_STD) -> dict[str, list[tuple[str, str]]]:
+    """The control columns mean-std normalization cannot scale, each with its reason.
+
+    Reads ``meta/stats.json``, the dataset-wide stats a normalizer divides by,
+    and flags every ``action`` / ``observation.state*`` column whose ``std`` is
+    below ``min_std`` (near-constant) or is nan or infinite. Per-episode stats
+    cannot answer this: a column held still within each episode and moved
+    between them has a healthy dataset-wide spread. A nested (2-D) ``std``, such
+    as a matrix-valued feature's, is skipped: only a flat list of numbers is
+    graded. It never raises on what the file holds, so a checker or a preflight
+    whose contract is to report can call it as is.
+
+    Args:
+        root: Dataset root directory (the dir that contains ``meta/``).
+        min_std: The spread every column is expected to reach; a positive finite
+            number, which the caller grades. Defaults to :data:`NEAR_CONSTANT_STD`.
+
+    Returns:
+        ``{feature: [(column, reason), ...]}`` for each control feature with a
+        flagged column, in file order. ``column`` is ``"[<index>]"``, and
+        ``reason`` is ``"std is <value>"`` (``"std is 0.0"``, ``"std is nan"``).
+        Empty when ``meta/stats.json`` is absent, unreadable or not an object;
+        an entry that is not a real number (a nested or ``bool`` stat) is never
+        flagged.
+    """
+    try:
+        stats = json.loads((Path(root) / "meta" / "stats.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(stats, dict):
+        return {}
+
+    flagged: dict[str, list[tuple[str, str]]] = {}
+    for feat, values in stats.items():
+        stds = values.get("std") if _is_control_feature(feat) and isinstance(values, dict) else None
+        if not isinstance(stds, list):
+            continue
+        # ``nan < min_std`` is False, so a non-finite float is named by its own
+        # test. Only a float can be one: ``math.isfinite`` raises on an integer
+        # too large for a float, which ``json`` parses from a long literal.
+        columns = [
+            (f"[{j}]", f"std is {std}")
+            for j, std in enumerate(stds)
+            if isinstance(std, (int, float))
+            and not isinstance(std, bool)
+            and (std < min_std or isinstance(std, float) and not math.isfinite(std))
+        ]
+        if columns:
+            flagged[feat] = columns
+    return flagged

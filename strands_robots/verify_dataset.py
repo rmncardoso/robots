@@ -64,22 +64,19 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import sys
 from pathlib import Path
 from typing import Any
 
-from strands_robots.dataset_metadata import read_dataset_episode_indices
+from strands_robots.dataset_metadata import (
+    NEAR_CONSTANT_STD,
+    _is_control_feature,
+    flat_control_columns,
+    read_dataset_episode_indices,
+)
 from strands_robots.utils import declared_count, finite_number_error, non_negative_count_error, refusal_repr
 
 logger = logging.getLogger(__name__)
-
-#: Default ``min_std``: the dataset-wide standard deviation below which a control
-#: column is reported as near-constant. Mean-std normalization divides by ``std``,
-#: so a column this flat has whatever deviation remains scaled by about 1e3. The
-#: threshold is in the column's own unit: a milliradian on a radian-valued joint,
-#: a thousandth of a degree on a degree-valued one.
-_NEAR_CONSTANT_STD = 1e-3
 
 
 def _info_json_document(root_path: Path) -> tuple[dict[str, Any], str | None]:
@@ -134,7 +131,7 @@ def verify_dataset(
     min_frames: int = 1,
     check_videos: bool = True,
     check_stats: bool = True,
-    min_std: float = _NEAR_CONSTANT_STD,
+    min_std: float = NEAR_CONSTANT_STD,
 ) -> dict[str, Any]:
     """Verify the episode integrity of a LeRobot dataset on disk.
 
@@ -158,11 +155,13 @@ def verify_dataset(
             zero SUBSET of one robot's block (a gripper parked at zero for the
             whole episode) is a measurement and is not flagged.
         min_std: Dataset-wide standard deviation (``meta/stats.json``) every
-            control column is expected to reach; a column below it is reported
-            in ``warnings`` as near-constant, and so is one whose std is nan or
-            infinite. A non-negative finite number; ``0`` disables this report.
-            Advice and not a problem, because a joint held still on purpose
-            reads the same.
+            control column is expected to reach, by default
+            :data:`~strands_robots.dataset_metadata.NEAR_CONSTANT_STD`; a column
+            below it is reported in ``warnings`` as near-constant, and so is one
+            whose std is nan or infinite. A non-negative finite number; ``0``
+            disables this report, while training's ``TrainSpec.min_std`` is off
+            as ``None`` and refuses ``0``. Advice and not a problem, because a
+            joint held still on purpose reads the same.
 
     Returns:
         A report dict with:
@@ -362,7 +361,7 @@ def verify_dataset(
         problems.extend(stats_problems)
 
     if min_std > 0:
-        report["warnings"].extend(_near_constant_columns(root_path, float(min_std)))
+        report["warnings"].extend(_near_constant_advice(root_path, float(min_std)))
 
     report["ok"] = not problems
     report["status"] = "success" if report["ok"] else "error"
@@ -590,14 +589,6 @@ def _declared_column_blocks(feature_spec: Any, width: int) -> list[tuple[str, tu
     return [(label, tuple(indices)) for label, indices in blocks.items()]
 
 
-def _is_control_feature(name: str) -> bool:
-    """Whether ``name`` is a control feature: ``action`` or an ``observation.state*``.
-
-    Check 6 and the near-constant advice both grade exactly these features.
-    """
-    return name == "action" or name == "observation.state" or name.startswith("observation.state.")
-
-
 def _verify_feature_stats(
     root_path: Path,
     *,
@@ -741,14 +732,13 @@ def _verify_feature_stats(
     return checked, problems
 
 
-def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
-    """Advice on control columns whose dataset-wide ``std`` is under ``min_std`` or not finite.
+def _near_constant_advice(root_path: Path, min_std: float) -> list[str]:
+    """One advisory per control feature :func:`flat_control_columns` flags.
 
-    Read from ``meta/stats.json``, the aggregate stats mean-std normalization
-    divides by, and not from the per-episode stats check 6 reads:
-    a column held still within each episode and moved between them is not flat
-    to the normalizer. A zero column is named like any other. Check 6 reports
-    one only inside a wholly zero vector or robot block, and only while
+    The columns come from that one shared reader of ``meta/stats.json``, so any
+    other caller of it (a training preflight, say) names the same ones. A zero
+    column is named like any other. Check 6 reports one
+    only inside a wholly zero vector or robot block, and only while
     ``check_stats`` is on; it calls a zero column among moving ones (a gripper
     parked at zero) a measurement. Deferring to it would leave that column
     unreported, so a wholly zero vector is named here as well as failed there.
@@ -758,40 +748,18 @@ def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
         min_std: The spread a column is expected to reach; a positive number.
 
     Returns:
-        One advisory per control feature with near-constant or non-finite
-        columns, each named with its std (``[3] (std is nan)``). Empty when
-        ``meta/stats.json`` is absent, unreadable or not an object, and for an
-        entry that is not a real number (a nested or ``bool`` stat).
+        One advisory per flagged feature, each column named with its reason
+        (``[3] (std is nan)``). Empty when nothing is flagged.
     """
-    try:
-        stats = json.loads((root_path / "meta" / "stats.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(stats, dict):
-        return []
-
     advice: list[str] = []
-    for feat, values in stats.items():
-        stds = values.get("std") if _is_control_feature(feat) and isinstance(values, dict) else None
-        if not isinstance(stds, list):
-            continue
-        # ``nan < min_std`` is False, so a non-finite float is named by its own
-        # test. Only a float can be one: ``math.isfinite`` raises on an integer
-        # too large for a float, which ``json`` parses from a long literal.
-        flat = [
-            f"[{j}] (std is {std})"
-            for j, std in enumerate(stds)
-            if isinstance(std, (int, float))
-            and not isinstance(std, bool)
-            and (std < min_std or isinstance(std, float) and not math.isfinite(std))
-        ]
-        if flat:
-            advice.append(
-                f"feature '{feat}' column(s) {', '.join(flat)} are near-constant or not finite: their "
-                f"dataset-wide std in meta/stats.json is below min_std={min_std:g}, or nan or infinite. "
-                "Mean-std normalization divides by that std, which scales such a column far out of range "
-                "or turns it to nan or 0. Advice, not a problem: a joint held still on purpose reads the same"
-            )
+    for feat, columns in flat_control_columns(root_path, min_std).items():
+        named = ", ".join(f"{column} ({reason})" for column, reason in columns)
+        advice.append(
+            f"feature '{feat}' column(s) {named} are near-constant or not finite: their dataset-wide std in "
+            f"meta/stats.json is below min_std={min_std:g}, or nan or infinite. Mean-std normalization divides "
+            "by that std, which scales such a column far out of range or turns it to nan or 0. Advice, not a "
+            "problem: a joint held still on purpose reads the same"
+        )
     return advice
 
 
@@ -861,10 +829,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--min-std",
         type=float,
-        default=_NEAR_CONSTANT_STD,
+        default=NEAR_CONSTANT_STD,
         help=(
             "Advise on any control column whose dataset-wide std (meta/stats.json) is below this or not "
-            f"finite (default: {_NEAR_CONSTANT_STD:g}); 0 disables. Advisory: it does not change the exit code."
+            f"finite (default: {NEAR_CONSTANT_STD:g}); 0 disables. Advisory: it does not change the exit code."
         ),
     )
     args = parser.parse_args(argv)
