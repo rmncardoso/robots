@@ -104,7 +104,10 @@ class TrainSpec:
             the training set.
         min_std: Smallest aggregate ``std`` an ``action`` /
             ``observation.state`` column may have, or ``None`` (the default) to
-            train on whatever the data holds. A positive finite number. A
+            train on whatever the data holds. A positive finite number: ``0``
+            is refused, not read as off, unlike ``verify-dataset --min-std 0``,
+            which switches that command's advice off (its default is
+            ``strands_robots.dataset_metadata.NEAR_CONSTANT_STD``, ``1e-3``). A
             backend that reads it refuses a dataset with a column below it, or
             whose ``std`` is nan or infinite, because ``MEAN_STD``
             normalization divides by ``std + 1e-8``; the data is not changed.

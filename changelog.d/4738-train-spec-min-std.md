@@ -25,4 +25,6 @@ the same statistic. The value's domain is a new shared field-scoped gate,
 threshold no column falls below, and no comparison with a non-finite one grades
 a column honestly - `inf` would call every column flat, `nan` and `-inf` none),
 so the `sagemaker` provider, which forwards the field to its container, refuses
-a bad value before submission rather than inside the job.
+a bad value before submission rather than inside the job. Only `None` is off:
+`0` is refused, unlike `verify-dataset --min-std 0`, which switches that
+command's advice off.
