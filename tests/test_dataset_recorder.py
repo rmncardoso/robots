@@ -2515,13 +2515,23 @@ def test_resolve_dataset_dir_keeps_a_local_path_that_merely_mentions_a_scheme(tm
 
     ``:`` is a legal character in a POSIX directory name, so these are local
     paths and the writer must keep resolving them: the rule is RFC 3986's
-    ``scheme://`` prefix and nothing looser.
+    ``scheme://`` prefix and nothing looser. A one-letter scheme is a Windows
+    drive letter (``C://data/run`` is a valid drive path there), so a dataset
+    root reads it as a path, though the shared scheme reader does not.
     """
     from strands_robots import dataset_source
 
     monkeypatch.setattr(dataset_source, "_lerobot_home", lambda: tmp_path / "home")
 
-    local_paths = ("s3:/bucket/run1", "s3:run1", "run_s3://x", "./s3/run1", str(tmp_path / "s3:bucket"))
+    local_paths = (
+        "s3:/bucket/run1",
+        "s3:run1",
+        "run_s3://x",
+        "./s3/run1",
+        str(tmp_path / "s3:bucket"),
+        "C://data/run",
+        "c://x",
+    )
     for local in local_paths:
         assert dataset_source.dataset_url_error(local, "root") is None
         assert dataset_source.resolve_dataset_dir("local/probe", local) == Path(local)

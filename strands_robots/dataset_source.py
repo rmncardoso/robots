@@ -136,11 +136,13 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
     Returns:
         The refusal - naming the value, the local path ``Path()`` reads it as,
         and the remedy - or ``None`` for any value that is not a URL, which is
-        every local path and every ``owner/name`` Hub id.
+        every local path (a Windows drive path such as ``C://data/run`` among
+        them) and every ``owner/name`` Hub id.
     """
     text = os.fspath(value)
     scheme = url_scheme(text)
-    if scheme is None:
+    # A one-letter scheme is a Windows drive letter: C://data/run is a path.
+    if scheme is None or len(scheme) == 1:
         return None
     return (
         f"The dataset {what} {text!r} opens with the URL scheme {scheme}://, and a recording is "
