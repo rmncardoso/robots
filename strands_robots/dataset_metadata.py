@@ -265,9 +265,11 @@ def flat_control_columns(root: str | Path, min_std: float = NEAR_CONSTANT_STD) -
         flagged.
     """
     meta = Path(root) / "meta"
+    # ``RecursionError`` is not a ``ValueError``: ``json`` raises it on a document
+    # nested too deep to parse, which is as unreadable as one that is not JSON.
     try:
         stats = json.loads((meta / "stats.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(stats, dict):
         return {}
@@ -275,7 +277,7 @@ def flat_control_columns(root: str | Path, min_std: float = NEAR_CONSTANT_STD) -
     # leaves the indices, which still locate every column.
     try:
         declared = json.loads((meta / "info.json").read_text(encoding="utf-8"))["features"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, RecursionError, KeyError, TypeError):
         declared = None
     features = declared if isinstance(declared, dict) else {}
 

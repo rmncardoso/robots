@@ -1182,6 +1182,21 @@ class TestFlatControlColumnsIsTheSharedReader:
         _write_aggregate_stats(tmp_path, action={"std": [0.2, 0.0]})
         assert flat_control_columns(tmp_path) == {"action": [("[1]", "std is 0.0")]}
 
+    def test_a_file_nested_too_deep_for_json_is_unreadable_not_a_raise(self, tmp_path: Path) -> None:
+        # ``json`` raises ``RecursionError``, which is not a ``ValueError``, on a
+        # document nested this deep; a reader a report-returning checker calls
+        # must answer it the way it answers a file that is not JSON.
+        deep = "[" * 1_000_000 + "]" * 1_000_000
+        with pytest.raises(RecursionError):
+            json.loads(deep)
+        _write_dataset(tmp_path, episode_indices=[0], frames_per_episode=[40])
+        (tmp_path / "meta" / "stats.json").write_text(deep, encoding="utf-8")
+        report = verify_dataset(tmp_path, check_videos=False)
+        assert report["ok"] is True and report["warnings"] == []
+        _write_aggregate_stats(tmp_path, action={"std": [0.2, 0.0]})
+        (tmp_path / "meta" / "info.json").write_text(deep, encoding="utf-8")
+        assert flat_control_columns(tmp_path) == {"action": [("[1]", "std is 0.0")]}
+
     def test_one_public_default_threshold_serves_the_reader_the_api_and_the_cli(self, tmp_path: Path, capsys) -> None:
         # The value both doc rows state.
         assert NEAR_CONSTANT_STD == 1e-3
