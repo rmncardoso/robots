@@ -959,8 +959,8 @@ class TestNearConstantColumn:
     block of it, identically zero across an episode is a reading no sensor and
     no teleoperator produces. A column that moved by a thousandth of its unit
     proves nothing of the kind - a joint can be held still on purpose - but
-    ``MEAN_STD`` normalization divides by ``std + 1e-8``, so the operator should
-    hear about it. The spread graded is the dataset-wide one in
+    mean-std normalization divides by ``std``, so the operator should hear
+    about it. The spread graded is the dataset-wide one in
     ``meta/stats.json``, the one normalization uses, so the advice is one line
     per feature and silent about a column that moved between episodes. A zero
     column is named too: the dead-column check calls one among moving columns a
@@ -976,6 +976,9 @@ class TestNearConstantColumn:
         warning = report["warnings"][0]
         assert "near-constant" in warning and "dataset-wide" in warning
         assert "'action'" in warning and "[0] (std is 1e-05)" in warning and "[1]" not in warning
+        # Said of mean-std normalization only: a min-max or quantile normalizer
+        # divides by another spread, so no one mode is named as if universal.
+        assert "Mean-std normalization divides by that std" in warning and "MEAN_STD" not in warning
 
     def test_fifty_episodes_still_give_one_advisory_per_feature(self, tmp_path: Path) -> None:
         report = verify_dataset(_flat_action_dataset(tmp_path, episodes=50), check_videos=False)

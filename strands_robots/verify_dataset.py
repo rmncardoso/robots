@@ -75,9 +75,10 @@ from strands_robots.utils import declared_count, finite_number_error, non_negati
 logger = logging.getLogger(__name__)
 
 #: Default ``min_std``: the dataset-wide standard deviation below which a control
-#: column is reported as near-constant. lerobot's ``MEAN_STD`` normalization
-#: divides by ``std + 1e-8``, so a column flat to 1e-3 of its unit (a milliradian
-#: on a joint) scales whatever deviation remains by ~1e3.
+#: column is reported as near-constant. Mean-std normalization divides by ``std``,
+#: so a column this flat has whatever deviation remains scaled by about 1e3. The
+#: threshold is in the column's own unit: a milliradian on a radian-valued joint,
+#: a thousandth of a degree on a degree-valued one.
 _NEAR_CONSTANT_STD = 1e-3
 
 
@@ -743,8 +744,8 @@ def _verify_feature_stats(
 def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
     """Advice on control columns whose dataset-wide ``std`` is under ``min_std`` or not finite.
 
-    Read from ``meta/stats.json``, the aggregate stats ``MEAN_STD``
-    normalization divides by, and not from the per-episode stats check 6 reads:
+    Read from ``meta/stats.json``, the aggregate stats mean-std normalization
+    divides by, and not from the per-episode stats check 6 reads:
     a column held still within each episode and moved between them is not flat
     to the normalizer. A zero column is named like any other. Check 6 reports
     one only inside a wholly zero vector or robot block, and only while
@@ -788,9 +789,8 @@ def _near_constant_columns(root_path: Path, min_std: float) -> list[str]:
             advice.append(
                 f"feature '{feat}' column(s) {', '.join(flat)} are near-constant or not finite: their "
                 f"dataset-wide std in meta/stats.json is below min_std={min_std:g}, or nan or infinite. "
-                "MEAN_STD normalization divides by std + 1e-8, so what deviation remains is scaled far past "
-                "the range a policy's input layer was fitted for. Advice, not a problem: a joint held still "
-                "on purpose reads the same"
+                "Mean-std normalization divides by that std, which scales such a column far out of range "
+                "or turns it to nan or 0. Advice, not a problem: a joint held still on purpose reads the same"
             )
     return advice
 
