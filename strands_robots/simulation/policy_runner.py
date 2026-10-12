@@ -364,7 +364,9 @@ def clopper_pearson_interval(
     handful of episodes, so the score interval alone understates what the run left
     open. At 0/n and n/n it is the narrower one from n=46 up - the score interval's
     single open end then reaches further than the exact tail does - which is why
-    neither is reported as the conservative one by construction.
+    neither is reported as the conservative one by construction. It is still the
+    pair to gate on: a gate relies on coverage, not width, and this is the interval
+    that guarantees its coverage, so it is also the pair the text block prints.
 
     Found by bisection, since the standard library has no inverse beta function. The
     tail is monotone in ``p``, so the root is unique and the bracket cannot straddle
@@ -412,11 +414,16 @@ def success_interval(n_completed: int, n_success: int) -> dict[str, float]:
 
     A success rate is a count over however many episodes ran, and reported alone it
     reads as a measurement with no width: 4/5 and 400/500 both print as 80%, while
-    the first is consistent with anything from 38% to 96% and the second only with
+    the first is consistent with anything from 28% to 99% and the second only with
     76% to 83%. So a reader comparing two checkpoints cannot tell a difference the
     run demonstrated from one it was too short to see, which is the question a
     promotion decision turns on - the same gap :func:`pass_hat_k` fills for repeated
     attempts.
+
+    Gate on ``clopper_pearson_low`` / ``clopper_pearson_high``: that interval
+    guarantees its coverage at every rate, and Wilson's does not. The Wilson pair
+    stays beside it because the difference between the two is what the normal
+    approximation costs.
 
     Args:
         n_completed: Attempts that ran to a verdict.
@@ -445,6 +452,25 @@ def success_interval(n_completed: int, n_success: int) -> dict[str, float]:
         "clopper_pearson_low": round(exact_low, 4),
         "clopper_pearson_high": round(exact_high, 4),
     }
+
+
+def _interval_text(interval: Mapping[str, float]) -> str:
+    """The text block's clause for a :func:`success_interval` payload: ``", 95% CI 28-99%"``.
+
+    The Clopper-Pearson pair in whole percents, since it is the one to gate on and the
+    text is what an agent mostly reads; the ``json`` block keeps all four bounds.
+
+    Args:
+        interval: What :func:`success_interval` returned for the run.
+
+    Returns:
+        The clause that follows the rate inside its parentheses, or ``""`` when
+        ``interval`` is empty (no episode completed), which leaves that line as it was.
+    """
+    if not interval:
+        return ""
+    low, high = interval["clopper_pearson_low"] * 100, interval["clopper_pearson_high"] * 100
+    return f", {interval['confidence']:.0%} CI {low:.0f}-{high:.0f}%"
 
 
 def action_commands_robot(action: Mapping[str, Any]) -> bool:
@@ -4380,12 +4406,15 @@ class PolicyRunner:
             ``confidence`` plus ``wilson_low`` / ``wilson_high`` and
             ``clopper_pearson_low`` / ``clopper_pearson_high``, see
             :func:`success_interval`. It says how much of the rate is the episode
-            count: 4 of 5 is 80% and also anything from 38% to 96%. Two
+            count: 4 of 5 is 80% and also anything from 28% to 99%. Gate on the
+            Clopper-Pearson pair, which guarantees its coverage at every rate; the
+            text block prints it beside the rate, as ``95% CI 28-99%``. Two
             checkpoints whose intervals do not overlap were separated by the run;
-            overlapping ones may still differ, which takes a two-sample test. Both
-            intervals are reported because their difference is the cost of the
+            overlapping ones may still differ, which takes a two-sample test. The
+            Wilson pair is reported too because the difference is the cost of the
             normal approximation, which at these counts is not negligible. Gated and
-            empty on the same conditions as ``pass_hat_k``.
+            empty on the same conditions as ``pass_hat_k``, and the text prints
+            bounds only when the key is present and non-empty.
 
             ``episodes_successful_at_reset`` (int) counts episodes whose success
             criterion already held at reset, before any action was applied. The
@@ -4848,6 +4877,7 @@ class PolicyRunner:
         n_completed = len(results)
         n_success = sum(1 for r in results if r["success"])
         success_rate = n_success / max(n_completed, 1)
+        rate_interval = success_interval(n_completed, n_success) if success_measured else {}
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         total_steps = sum(r["steps"] for r in results)
         total_actions = sum(r["actions_applied"] for r in results)
@@ -4896,7 +4926,7 @@ class PolicyRunner:
                         + f"Episodes: {n_completed}"
                         + (f" of {n_episodes} (stopped early)" if stopped_early else "")
                         + (
-                            f" | Success: {n_success}/{n_completed} ({success_rate:.1%})"
+                            f" | Success: {n_success}/{n_completed} ({success_rate:.1%}{_interval_text(rate_interval)})"
                             if success_measured
                             # No fraction when nothing measured it: "0/3 (0.0%)
                             # [not measured]" was read as a 0% baseline and each
@@ -4954,7 +4984,7 @@ class PolicyRunner:
                         # above: bounds around a rate nobody measured would read as a
                         # measured range. Derived from the same two counts, so it is
                         # reported on both routes.
-                        **({"success_rate_ci": success_interval(n_completed, n_success)} if success_measured else {}),
+                        **({"success_rate_ci": rate_interval} if success_measured else {}),
                         "avg_steps": round(avg_steps, 1),
                         "max_steps": max_steps,
                         "policy_load_time_s": round(float(getattr(policy, "load_time_s", 0.0)), 3),
@@ -5463,6 +5493,7 @@ class PolicyRunner:
         n_success = sum(1 for r in results if r["success"])
         n_failure = sum(1 for r in results if r["failure"])
         success_rate = n_success / max(n_completed, 1)
+        rate_interval = success_interval(n_completed, n_success)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         avg_reward = sum(r["cumulative_reward"] for r in results) / max(n_completed, 1)
         total_steps = sum(r["steps"] for r in results)
@@ -5512,7 +5543,8 @@ class PolicyRunner:
                         + (f"Stopped because the {onframe_error}\n" if onframe_error is not None else "")
                         + f"Episodes: {n_completed}"
                         + (f" of {n_episodes} (stopped early)" if stopped_early else "")
-                        + f" | Success: {n_success} | Failure: {n_failure} ({success_rate:.1%} success)\n"
+                        + f" | Success: {n_success} | Failure: {n_failure}"
+                        f" ({success_rate:.1%} success{_interval_text(rate_interval)})\n"
                         f"Avg reward: {avg_reward:.2f} | Avg steps: {avg_steps:.0f}/{max_steps}"
                         + f" | Actions applied: {total_actions}/{total_steps}"
                         + (f"\n{uncommanded_error}" if uncommanded_error is not None else "")
@@ -5557,7 +5589,7 @@ class PolicyRunner:
                         # A benchmark always measures success, so this is unconditional
                         # here; it is empty when no episode completed, the same shape
                         # ``pass_hat_k`` takes above it.
-                        "success_rate_ci": success_interval(n_completed, n_success),
+                        "success_rate_ci": rate_interval,
                         "max_steps": max_steps,
                         "seed": seed,
                         "benchmark_class": spec_name,

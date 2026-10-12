@@ -29,6 +29,11 @@ The 0/n, 1/n and n/n ends have closed forms, and those are checked against the c
 form itself. Each sweep over ``_COUNTS`` runs inside one cell and names the offending
 pair, rather than multiplying into a parametrised grid.
 
+The text block prints the Clopper-Pearson pair beside the rate, since it is the one to
+gate on (its coverage is guaranteed) and the text is what an agent mostly reads - and
+only where the ``json`` block carries an interval, so the unmeasured line and the line
+of a run that completed nothing read exactly as they did.
+
 No paired test (McNemar's and friends) is added: both surfaces evaluate one policy per
 call, so a paired statistic would have no caller here, and code with no caller is
 refused (``AGENTS.md`` convention 10).
@@ -425,23 +430,34 @@ def _metrics(result: dict) -> dict:
     return next(c["json"] for c in result["content"] if "json" in c)
 
 
+def _text(result: dict) -> str:
+    assert result.get("status") != "error", result
+    return next(c["text"] for c in result["content"] if "text" in c)
+
+
+def _stop_at_once(step: int, observation: dict, action: dict) -> None:
+    """An ``on_frame`` that stops the run at its first applied step, before any episode completes."""
+    raise CooperativeStop("stopped before the first episode completed")
+
+
 class TestEvalPolicyReportsTheInterval:
     """The ``success_fn`` route, where the rate is a count and nothing else."""
 
-    def _evaluated(
+    def _evaluation(
         self, sim, robot: str, *, n_episodes: int, budget: int, on_frame: Callable[..., None] | None = None
     ) -> dict:
-        return _metrics(
-            sim.eval_policy(
-                robot_name=robot,
-                policy_provider="mock",
-                n_episodes=n_episodes,
-                max_steps=_MAX_STEPS,
-                success_fn=_SucceedsForTheFirstAttempts(budget),
-                on_frame=on_frame,
-                seed=0,
-            )
+        return sim.eval_policy(
+            robot_name=robot,
+            policy_provider="mock",
+            n_episodes=n_episodes,
+            max_steps=_MAX_STEPS,
+            success_fn=_SucceedsForTheFirstAttempts(budget),
+            on_frame=on_frame,
+            seed=0,
         )
+
+    def _evaluated(self, sim, robot: str, **evaluation) -> dict:
+        return _metrics(self._evaluation(sim, robot, **evaluation))
 
     def test_a_measured_evaluation_reports_it(self, sim, arm) -> None:
         metrics = self._evaluated(sim, arm, n_episodes=5, budget=2)
@@ -489,11 +505,7 @@ class TestEvalPolicyReportsTheInterval:
         and no episode completed. The key is then empty rather than ``[0, 1]``, the shape
         ``pass_hat_k`` takes there too.
         """
-
-        def stop_at_once(step: int, observation: dict, action: dict) -> None:
-            raise CooperativeStop("stopped before the first episode completed")
-
-        metrics = self._evaluated(sim, arm, n_episodes=3, budget=0, on_frame=stop_at_once)
+        metrics = self._evaluated(sim, arm, n_episodes=3, budget=0, on_frame=_stop_at_once)
         assert (metrics["success_measured"], metrics["episodes_completed"]) == (True, 0), metrics
         assert metrics["success_rate_ci"] == {}
         assert metrics["pass_hat_k"] == {}, "the two keys no longer share a gate"
@@ -501,6 +513,32 @@ class TestEvalPolicyReportsTheInterval:
     def test_the_payload_survives_json(self, sim, arm) -> None:
         metrics = self._evaluated(sim, arm, n_episodes=3, budget=1)
         assert json.loads(json.dumps(metrics))["success_rate_ci"] == metrics["success_rate_ci"]
+
+    def test_the_text_prints_the_clopper_pearson_bounds_beside_the_rate(self, sim, arm) -> None:
+        """The bare ``4/5 (80.0%)`` is the reading this interval argues against.
+
+        A budget of 8 approvals makes four of the five attempts succeed. The pair is
+        Clopper-Pearson's, the one to gate on; Wilson's would print 38-96% here.
+        """
+        text = _text(self._evaluation(sim, arm, n_episodes=5, budget=8))
+        assert "Episodes: 5 | Success: 4/5 (80.0%, 95% CI 28-99%)\n" in text, text
+
+    def test_an_unmeasured_evaluation_prints_its_line_unchanged(self, sim, arm) -> None:
+        """No criterion, no rate, and so no bounds beside it: the line reads as it did."""
+        text = _text(
+            sim.eval_policy(robot_name=arm, policy_provider="mock", n_episodes=3, max_steps=_MAX_STEPS, seed=0)
+        )
+        assert (
+            "Episodes: 3 | Success: not measured (no success criterion - pass success_fn, e.g. 'contact', "
+            "or a benchmark spec)\n"
+        ) in text, text
+        assert "% CI" not in text, text
+
+    def test_a_run_stopped_before_any_episode_completed_prints_no_bounds(self, sim, arm) -> None:
+        """Nothing completed, so the interval is empty and the line reads as it did."""
+        text = _text(self._evaluation(sim, arm, n_episodes=3, budget=0, on_frame=_stop_at_once))
+        assert "Episodes: 0 of 3 (stopped early) | Success: 0/0 (0.0%)\n" in text, text
+        assert "% CI" not in text, text
 
 
 class TestEvaluateBenchmarkReportsTheInterval:
@@ -528,3 +566,21 @@ class TestEvaluateBenchmarkReportsTheInterval:
     def test_the_payload_survives_json(self, sim, scoring_task) -> None:
         metrics = _metrics(sim.evaluate_benchmark(scoring_task, policy_provider="mock", n_episodes=2, seed=0))
         assert json.loads(json.dumps(metrics))["success_rate_ci"] == metrics["success_rate_ci"]
+
+    def test_the_text_prints_the_clopper_pearson_bounds_beside_the_rate(self, sim, scoring_task) -> None:
+        """Three failures leave 0-71% open, which a bare 0.0% reads as settled.
+
+        Clopper-Pearson's pair again; Wilson's would print 0-56% here.
+        """
+        text = _text(sim.evaluate_benchmark(scoring_task, policy_provider="mock", n_episodes=3, seed=0))
+        assert "Episodes: 3 | Success: 0 | Failure: 0 (0.0% success, 95% CI 0-71%)\n" in text, text
+
+    def test_a_run_stopped_before_any_episode_completed_prints_no_bounds(self, sim, scoring_task) -> None:
+        """Nothing completed, so the interval is empty and the line reads as it did."""
+        result = sim.evaluate_benchmark(
+            scoring_task, policy_provider="mock", n_episodes=3, seed=0, on_frame=_stop_at_once
+        )
+        assert _metrics(result)["success_rate_ci"] == {}
+        text = _text(result)
+        assert "Episodes: 0 of 3 (stopped early) | Success: 0 | Failure: 0 (0.0% success)\n" in text, text
+        assert "% CI" not in text, text
