@@ -123,7 +123,8 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
     up front: as a root it becomes a folder named after the scheme under the
     working directory, which LeRobot creates and whose first save then fails,
     and as an id with no root, a dataset under ``$HF_LEROBOT_HOME`` that
-    nothing uploads.
+    nothing uploads. Only the string form is caught: ``Path("s3://b/k")`` has
+    already collapsed to ``s3:/b/k`` before it gets here.
 
     Public for the reason :data:`HUB_ID_OUTSIDE_HOME` is a constant: the
     refusal's wording lives in one place, so a caller reporting it and a test
