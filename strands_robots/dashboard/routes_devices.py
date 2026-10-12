@@ -236,6 +236,7 @@ async def spawn_and_settle(request: Request, body: dict[str, Any], *, remember: 
         body.get("robot_id"),
         remember,
         network_interface=body.get("network_interface"),
+        domain_id=body.get("domain_id"),
     )
     # A pid is not a running robot.
     peer_id = result.get("peer_id")

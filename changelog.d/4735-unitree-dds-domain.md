@@ -20,6 +20,12 @@ Robot("g1", mode="real", driver="strands", port="192.168.123.161",
 does, so a caller can read back what the bus will bind before a frame is
 written.
 
+The dashboard's spawn takes `domain_id` the way it takes `network_interface`.
+The registry's `real_transport` says which drivers declare it (the Unitree
+drivers and the Booster T1); naming one for any other driver, or naming a value
+that is not a domain, is refused before a process exists; and the spawner hands
+it to `Robot`, so a spawn that names none still builds its driver on domain 0.
+
 The value is refused through the *shared* domain rule
 (`strands_robots.utils.dds_domain_id_error`) rather than a local test, for the
 reason the telemetry bridges and the Booster driver use it: a domain id indexes
