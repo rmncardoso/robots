@@ -32,7 +32,8 @@ pair, rather than multiplying into a parametrised grid.
 The text block prints the Clopper-Pearson pair beside the rate, since it is the one to
 gate on (its coverage is guaranteed) and the text is what an agent mostly reads - and
 only where the ``json`` block carries an interval, so the unmeasured line and the line
-of a run that completed nothing read exactly as they did.
+of a run that completed nothing read exactly as they did. The rollouts page's sample
+output shows the line with its bounds.
 
 No paired test (McNemar's and friends) is added: both surfaces evaluate one policy per
 call, so a paired statistic would have no caller here, and code with no caller is
@@ -43,15 +44,19 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Callable
 from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
+import strands_robots
 from strands_robots.simulation.policy_runner import (
     _CI_CONFIDENCE,
     CooperativeStop,
     _binomial_tail_at_least,
+    _interval_text,
     clopper_pearson_interval,
     success_interval,
     wilson_interval,
@@ -90,6 +95,11 @@ _PROBE_XML = """
 
 #: Steps an evaluated episode is allowed.
 _MAX_STEPS = 4
+
+_REPO_ROOT = Path(strands_robots.__file__).resolve().parent.parent
+
+#: The docs page whose sample output shows both rollout surfaces' success line.
+_ROLLOUTS_PAGE = _REPO_ROOT / "docs" / "learn" / "simulation" / "predicates-and-rollouts.md"
 
 
 def _exact_tail_at_least(k: int, n: int, p: float) -> float:
@@ -584,3 +594,45 @@ class TestEvaluateBenchmarkReportsTheInterval:
         text = _text(result)
         assert "Episodes: 0 of 3 (stopped early) | Success: 0 | Failure: 0 (0.0% success)\n" in text, text
         assert "% CI" not in text, text
+
+
+def _sample_output(page: str) -> str:
+    """The page's "You should see" block; exactly one must exist."""
+    blocks = re.findall(r"^You should see:\n\n```text\n(.*?)^```", page, re.M | re.S)
+    assert len(blocks) == 1, f"expected one 'You should see' block, found {len(blocks)}"
+    return blocks[0]
+
+
+class TestTheRolloutsPageShowsTheLineTheSurfacesPrint:
+    """The rollouts page's sample output carries the bounds its evaluations print.
+
+    The page's "You should see" block is written by hand, so a change to the line
+    reaches it only when someone edits it, and the bounds were such a change: the
+    block showed the bare ``2/2 (100.0%)``. ``docs/hooks/check_fences.py`` runs the
+    page's snippet but checks only that it runs, not what it prints. So each line of
+    the block that is one of the two surfaces' success line is rebuilt here from the
+    counts it shows, with the clause both surfaces append.
+    """
+
+    def test_each_success_line_carries_the_bounds_for_its_counts(self) -> None:
+        checked = {}
+        for line in _sample_output(_ROLLOUTS_PAGE.read_text(encoding="utf-8")).splitlines():
+            if shown := re.fullmatch(r"Episodes: (\d+) \| Success: (\d+)/\1 \(.*\)", line):
+                surface, completed, successes = "eval_policy", int(shown[1]), int(shown[2])
+                line_format = "Episodes: {n} | Success: {k}/{n} ({rate:.1%}{clause})"
+            elif shown := re.fullmatch(r"Episodes: (\d+) \| Success: (\d+) \| Failure: (\d+) \(.*\)", line):
+                surface, completed, successes = "evaluate_benchmark", int(shown[1]), int(shown[2])
+                line_format = "Episodes: {n} | Success: {k} | Failure: " + shown[3] + " ({rate:.1%} success{clause})"
+            else:
+                continue
+            expected = line_format.format(
+                n=completed,
+                k=successes,
+                rate=successes / max(completed, 1),
+                clause=_interval_text(success_interval(completed, successes)),
+            )
+            assert line == expected, f"the page shows {surface}'s line as {line!r}; its counts print {expected!r}"
+            checked[surface] = line
+        assert set(checked) == {"eval_policy", "evaluate_benchmark"}, (
+            f"the sample output no longer shows both surfaces' success line: {checked}"
+        )
