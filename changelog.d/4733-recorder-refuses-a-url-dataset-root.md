@@ -14,7 +14,7 @@ not in the store the caller named. The writers' shared resolver now refuses a
 before anything is created or launched, naming the value, the local path
 `Path()` reads it as, and the two-step remedy: record to a local root, then
 `sync_to_bucket()` or `push_to_hub()` the finished directory. A `file://` URL
-on this machine is refused naming the path to pass instead (`/tmp/run1` for
+for a local path is refused naming that path to pass instead (`/tmp/run1` for
 `file:///tmp/run1`). A URL `repo_id` is refused beside a usable local `root`
 too: that call used to record into the root, where `sync_to_bucket()` could
 upload it but `push_to_hub()` could not (`huggingface_hub` refuses a URL as a
