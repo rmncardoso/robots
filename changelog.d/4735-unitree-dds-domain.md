@@ -20,7 +20,8 @@ Robot("g1", mode="real", driver="strands", port="192.168.123.161",
 does, so a caller can read back what the bus will bind before a frame is
 written.
 
-The dashboard's spawn takes `domain_id` the way it takes `network_interface`.
+The dashboard's spawn request takes `domain_id` the way it takes
+`network_interface` (the Devices form does not offer the field yet).
 The registry's `real_transport` says which drivers declare it (the Unitree
 drivers and the Booster T1); naming one for any other driver, or naming a value
 that is not a domain, is refused before a process exists; and the spawner hands
