@@ -505,10 +505,12 @@ def _columns_below_min_std(dataset_root: str, min_std: float) -> list[str]:
         absent, unreadable or not an object: a run is not refused on evidence
         nobody gathered.
     """
+    # ``RecursionError`` is not a ``ValueError``: ``json`` raises it on a document
+    # nested too deep to parse, which is as unreadable as one that is not JSON.
     try:
         with open(os.path.join(dataset_root, "meta", "stats.json"), encoding="utf-8") as fh:
             stats = json.load(fh)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return []
     if not isinstance(stats, dict):
         return []

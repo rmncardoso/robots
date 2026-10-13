@@ -302,6 +302,20 @@ class TestMinStdPreflight:
         spec.min_std = 0.05
         assert LerobotTrainer().validate(spec) == []
 
+    def test_a_file_nested_too_deep_for_json_is_unreadable_not_a_raise(self, spec):
+        # ``json`` raises ``RecursionError``, which is not a ``ValueError``, on a
+        # document nested this deep; a preflight documented to return problems
+        # must answer it the way it answers a file that is not JSON.
+        import os
+
+        deep = "[" * 1_000_000 + "]" * 1_000_000
+        with pytest.raises(RecursionError):
+            json.loads(deep)
+        with open(os.path.join(spec.dataset_root, "meta", "stats.json"), "w", encoding="utf-8") as fh:
+            fh.write(deep)
+        spec.min_std = 0.05
+        assert LerobotTrainer().validate(spec) == []
+
     def test_an_image_feature_is_not_graded(self, spec):
         # A camera's std is a nested per-channel array, not one value per control
         # column, and a flat channel is not the failure this looks for. Reading
