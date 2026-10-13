@@ -8,25 +8,28 @@ calibration id. :func:`~strands_robots.drivers.port_kind` is the fact the sheet 
 refusals now branch on.
 
 A driver that joins a DDS domain (G1, Go2) takes ``domain_id`` the same way it takes
-``network_interface``: refused before a process exists unless the driver declares it and it names
-a domain, and forwarded to ``Robot`` by the spawner, so a spawn that names none still binds the
-driver's own default, domain 0. A camera change respawns the child and hands the new one both
-again; it used to come back on the driver's defaults, ``eth0`` and domain 0.
+``network_interface``: read off the spawn request, refused before a process exists unless the
+driver declares it and it names a domain, and forwarded to ``Robot`` by the spawner, so a spawn
+that names none still binds the driver's own default, domain 0. A camera change respawns the
+child and hands the new one both again; it used to come back on the driver's defaults, ``eth0``
+and domain 0.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import strands_robots
-from strands_robots.dashboard import device_manager, routes_mesh
+from strands_robots.dashboard import device_manager, routes_devices, routes_mesh
 from strands_robots.dashboard.device_manager import DeviceManager, validate_port
 from strands_robots.drivers import port_kind
 from strands_robots.utils import dds_domain_id_error
@@ -218,6 +221,35 @@ def test_a_camera_change_respawns_the_robot_on_the_interface_and_domain_it_had(
     assert respawned["cameras"] is None
     assert {k: respawned.get(k) for k in bus} == bus
     assert _status_domain(_driver_the_spawner_builds(respawned, monkeypatch)) == 7
+
+
+class _SpawnRecorder(DeviceManager):
+    """A DeviceManager whose spawn records, by parameter name, what it was handed, and starts nothing."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(profiles_path=str(tmp_path / "profiles.json"))
+        self.handed: list[dict[str, Any]] = []
+
+    def spawn(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        bound = inspect.signature(DeviceManager.spawn).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        self.handed.append(dict(bound.arguments))
+        return {"peer_id": bound.arguments["peer_id"], "pid": 1, "mode": bound.arguments["mode"]}
+
+
+def test_the_spawn_route_hands_domain_id_from_the_body_to_the_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POST /devices/spawn`` reads ``domain_id`` off the request body, as it reads ``network_interface``."""
+    monkeypatch.setattr(routes_devices.env_install, "spawn_preflight", lambda *a, **k: None)
+    manager = _SpawnRecorder(tmp_path)
+    request: Any = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(devices=manager, bridge=None)))
+    body = {"robot_name": "unitree_g1", "mode": "real", "network_interface": "enp3s0", "domain_id": 7}
+
+    asyncio.run(routes_devices.spawn(request, body, {}))
+
+    (handed,) = manager.handed
+    assert (handed["network_interface"], handed["domain_id"]) == ("enp3s0", 7)
 
 
 def test_the_spawn_form_is_told_which_transport_each_robot_uses() -> None:
