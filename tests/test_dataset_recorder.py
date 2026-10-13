@@ -2553,8 +2553,9 @@ def test_resolve_dataset_dir_refuses_a_file_url_naming_the_path_to_pass_instead(
     schemes get would send the caller to a store they never meant. It is
     refused rather than converted: the readers take the same ``root`` as a
     path, so a converted URL would record into ``/tmp/run1`` and read back from
-    ``file:/tmp/run1``. ``localhost`` is this machine too (RFC 8089); a file URL
-    naming another host is a remote store, one of ``DATASET_STORE_URLS``.
+    ``file:/tmp/run1``. ``localhost`` is this machine too (RFC 8089), in any
+    case, since a host is case-insensitive (RFC 3986); a file URL naming
+    another host is a remote store, one of ``DATASET_STORE_URLS``.
     """
     from strands_robots import dataset_source
 
@@ -2562,7 +2563,8 @@ def test_resolve_dataset_dir_refuses_a_file_url_naming_the_path_to_pass_instead(
 
     # The space is percent-encoded in the URL, and decoded in the path named.
     run = tmp_path / "my run"
-    for url in (run.as_uri(), run.as_uri().replace("file://", "file://localhost", 1)):
+    for host in ("", "localhost", "LOCALHOST"):
+        url = run.as_uri().replace("file://", f"file://{host}", 1)
         with pytest.raises(ValueError) as as_root:
             dataset_source.resolve_dataset_dir("local/probe", url)
         with pytest.raises(ValueError) as as_id:

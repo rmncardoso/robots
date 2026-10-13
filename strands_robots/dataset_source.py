@@ -152,7 +152,8 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
         return None
     # Refused, not converted: the readers take this root as a path, so a
     # converted URL would record into one directory and read back from another.
-    if scheme.lower() == "file" and (parts := urlsplit(stripped)).netloc in ("", "localhost"):
+    # A host is case-insensitive (RFC 3986): file://LOCALHOST/ is this machine too.
+    if scheme.lower() == "file" and (parts := urlsplit(stripped)).netloc.lower() in ("", "localhost"):
         # Deferred: urllib.request pulls in http.client and hashlib, and only
         # this refusal reads it.
         from urllib.request import url2pathname
