@@ -137,10 +137,10 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
 
     Returns:
         The refusal - naming the value, the local path ``Path()`` reads it as,
-        and the remedy, or for a ``file://`` URL on this machine the path to
-        pass instead - or ``None`` for any value that is not a URL, which is
-        every local path (a Windows drive path such as ``C://data/run`` among
-        them) and every ``owner/name`` Hub id.
+        and the remedy, or for a ``file://`` URL naming a path on this machine
+        that path to pass instead - or ``None`` for any value that is not a
+        URL, which is every local path (a Windows drive path such as
+        ``C://data/run`` among them) and every ``owner/name`` Hub id.
     """
     text = os.fspath(value)
     # Read past leading whitespace, as the policy resolver strips its input:
@@ -158,10 +158,10 @@ def dataset_url_error(value: str | os.PathLike[str], what: str) -> str | None:
         # this refusal reads it.
         from urllib.request import url2pathname
 
-        return (
-            f"The dataset {what} {text!r} is a file:// URL, and a recording takes a path: "
-            f"pass {url2pathname(parts.path)!r} instead."
-        )
+        # A URL with no path (file://, file://localhost) has none to pass
+        # instead, so it gets the refusal below, as any other URL does.
+        if path := url2pathname(parts.path):
+            return f"The dataset {what} {text!r} is a file:// URL, and a recording takes a path: pass {path!r} instead."
     return (
         f"The dataset {what} {text!r} opens with the URL scheme {scheme}://, and a recording is "
         f"written to a local directory: Path() reads this value as the relative path "

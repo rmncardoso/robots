@@ -2439,8 +2439,9 @@ def test_resolve_dataset_dir_keeps_a_hub_id_under_the_dataset_home(tmp_path, mon
 
 # A root or an id that names a remote store, one per scheme a caller reaches
 # for: the two object stores, the bucket URI ``sync_to_bucket`` itself prints,
-# and a plain web URL. Then two that read as something else: a URL behind the
-# leading space a pasted value carries, and a file URL naming another host.
+# and a plain web URL. Then four that read as something else: a URL behind the
+# leading space a pasted value carries, a file URL naming another host, and two
+# file URLs on this machine that name no path, so there is none to pass instead.
 DATASET_STORE_URLS = [
     "s3://probe-bucket/datasets/run1",
     "gs://probe-bucket/datasets/run1",
@@ -2448,6 +2449,8 @@ DATASET_STORE_URLS = [
     "https://example.invalid/datasets/run1",
     " s3://b/k",
     "file://gpu-box/datasets/run1",
+    "file://",
+    "file://localhost",
 ]
 
 
@@ -2554,8 +2557,9 @@ def test_resolve_dataset_dir_refuses_a_file_url_naming_the_path_to_pass_instead(
     refused rather than converted: the readers take the same ``root`` as a
     path, so a converted URL would record into ``/tmp/run1`` and read back from
     ``file:/tmp/run1``. ``localhost`` is this machine too (RFC 8089), in any
-    case, since a host is case-insensitive (RFC 3986); a file URL naming
-    another host is a remote store, one of ``DATASET_STORE_URLS``.
+    case, since a host is case-insensitive (RFC 3986). A file URL naming
+    another host is a remote store, and one naming no path (``file://``) has no
+    path to pass instead: both are among ``DATASET_STORE_URLS``.
     """
     from strands_robots import dataset_source
 
