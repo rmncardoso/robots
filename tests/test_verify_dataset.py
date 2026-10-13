@@ -15,6 +15,8 @@ truth. Each test asserts observable behaviour - the report's ``status`` /
 from __future__ import annotations
 
 import json
+import pkgutil
+import re
 import sys
 from pathlib import Path
 
@@ -1108,6 +1110,35 @@ class TestNearConstantColumn:
         _flat_action_dataset(tmp_path)
         assert verify_dataset(tmp_path, check_videos=False, min_std=0)["warnings"] == []
         assert len(verify_dataset(tmp_path, check_videos=False, check_stats=False)["warnings"]) == 1
+
+    def test_the_min_std_docs_say_0_disables_and_cite_only_names_this_command_reaches(self) -> None:
+        # The ``min_std`` Args entry and both ``--min-std`` rows say what ``0`` does
+        # here. How another API's threshold spells "off" is that API's to document
+        # beside its own field: named here, it is a field this command does not
+        # have, and possibly one this tree does not have yet. So every class
+        # attribute or ``strands_robots`` name these three cite has to resolve.
+        docs = Path(__file__).resolve().parents[1] / "docs"
+        surfaces = {"verify_dataset": (verify_dataset.__doc__ or "").partition("min_std:")[2].partition("\n\n")[0]}
+        for page in ("learn/data/verify.md", "reference/cli.md"):
+            lines = (docs / page).read_text(encoding="utf-8").splitlines()
+            [surfaces[page]] = [line for line in lines if line.startswith("| `--min-std X` |")]
+        assert all(re.search(r"`0`+\s+disables", text) for text in surfaces.values()), surfaces
+        cited = [
+            (where, name)
+            for where, text in surfaces.items()
+            for name in re.findall(r"`~?([A-Za-z_]\w*(?:\.\w+)+)`", text)
+            if name[0].isupper() or name.startswith("strands_robots.")
+        ]
+        # Non-vacuity: the Args entry cites the default by its qualified name.
+        assert ("verify_dataset", "strands_robots.dataset_metadata.NEAR_CONSTANT_STD") in cited
+        unresolved = []
+        for where, name in cited:
+            target = name if name.startswith("strands_robots.") else f"strands_robots.verify_dataset:{name}"
+            try:
+                pkgutil.resolve_name(target)
+            except (ImportError, AttributeError):
+                unresolved.append(f"{where}: {name}")
+        assert unresolved == [], unresolved
 
     def test_the_cli_prints_the_advice_and_still_exits_zero(self, tmp_path: Path, capsys) -> None:
         _flat_action_dataset(tmp_path)

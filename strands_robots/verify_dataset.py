@@ -159,9 +159,8 @@ def verify_dataset(
             :data:`~strands_robots.dataset_metadata.NEAR_CONSTANT_STD`; a column
             below it is reported in ``warnings`` as near-constant, and so is one
             whose std is nan or infinite. A non-negative finite number; ``0``
-            disables this report, while training's ``TrainSpec.min_std`` is off
-            as ``None`` and refuses ``0``. Advice and not a problem, because a
-            joint held still on purpose reads the same.
+            disables this report. Advice and not a problem, because a joint held
+            still on purpose reads the same.
 
     Returns:
         A report dict with:

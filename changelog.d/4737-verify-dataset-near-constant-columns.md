@@ -13,19 +13,18 @@ the dataset-wide stats normalization divides by, and name each control column
 whose `std` there is below the threshold, or is nan or infinite, in one line per
 feature. The default is the public
 `strands_robots.dataset_metadata.NEAR_CONSTANT_STD` (`1e-3`); `0` switches the
-advice off, while training's `TrainSpec.min_std` is off as `None`. A column is
-named as `meta/info.json` declares it, or by its index when nothing does, with
-its std: `gripper.pos (std is 0.0)`, `[3] (std is nan)`. The per-episode stats
-check 6 reads would be the wrong evidence: a column held still within each
-episode and moved between them has a healthy dataset-wide spread. The finding is
-advice, not a verdict: it lands in the report's new `warnings` list, prints on a
-`!` line below the problems, and leaves `ok`, `status` and the exit code alone,
-because a joint held still on purpose produces the same reading. A zero column
-is named like any other: check 6 calls one among moving columns (a gripper
-parked at zero) a measurement and reports nothing, and a wholly zero vector,
-which check 6 fails, is also one advisory. An absent or unreadable
-`meta/stats.json`, a nested (2-D) std, or an entry that is not a number says
-nothing. `--no-check-stats` still switches off check 6 alone.
+advice off. A column is named as `meta/info.json` declares it, or by its index
+when nothing does, with its std: `gripper.pos (std is 0.0)`, `[3] (std is nan)`.
+The per-episode stats check 6 reads would be the wrong evidence: a column held
+still within each episode and moved between them has a healthy dataset-wide
+spread. The finding is advice, not a verdict: it lands in the report's new
+`warnings` list, prints on a `!` line below the problems, and leaves `ok`,
+`status` and the exit code alone, because a joint held still on purpose produces
+the same reading. A zero column is named like any other: check 6 calls one among
+moving columns (a gripper parked at zero) a measurement and reports nothing, and
+a wholly zero vector, which check 6 fails, is also one advisory. An absent or
+unreadable `meta/stats.json`, a nested (2-D) std, or an entry that is not a
+number says nothing. `--no-check-stats` still switches off check 6 alone.
 
 The columns come from `strands_robots.dataset_metadata.flat_control_columns`,
 a public reader that returns each flagged column with its reason, so a trainer
