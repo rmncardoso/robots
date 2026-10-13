@@ -10,7 +10,8 @@ refusals now branch on.
 A driver that joins a DDS domain (G1, Go2) takes ``domain_id`` the same way it takes
 ``network_interface``: refused before a process exists unless the driver declares it and it names
 a domain, and forwarded to ``Robot`` by the spawner, so a spawn that names none still binds the
-driver's own default, domain 0.
+driver's own default, domain 0. A camera change respawns the child and hands the new one both
+again; it used to come back on the driver's defaults, ``eth0`` and domain 0.
 """
 
 from __future__ import annotations
@@ -67,6 +68,12 @@ class _Proc:
 
     def poll(self) -> int | None:
         return None
+
+    def terminate(self) -> None:
+        """A respawn stops the child first; this one runs nothing to stop."""
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
 
 
 @pytest.fixture
@@ -182,6 +189,35 @@ def test_a_spawn_that_names_no_domain_still_builds_its_driver_on_domain_0(
 
     assert "domain_id" not in calls[0]
     assert _status_domain(_driver_the_spawner_builds(calls[0], monkeypatch)) == 0
+
+
+@pytest.mark.parametrize(
+    ("robot", "where"),
+    [("unitree_g1", {}), ("unitree_go2", {"port": "192.168.123.161"})],
+    ids=["unitree_g1", "unitree_go2"],
+)
+def test_a_camera_change_respawns_the_robot_on_the_interface_and_domain_it_had(
+    dm: tuple[DeviceManager, list[dict[str, Any]], list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    robot: str,
+    where: dict[str, Any],
+) -> None:
+    """``reconfigure_cameras`` stops the child and spawns it again with everything but the cameras."""
+    manager, calls, _ = dm
+    # The respawn lists this machine's cameras and serial boards; the stand-ins list none.
+    monkeypatch.setattr(DeviceManager, "_camera_names", lambda self, refresh=False: [])
+    monkeypatch.setattr(device_manager, "scan_serial_ports", lambda: [])
+    bus = {"network_interface": "enp3s0", "domain_id": 7}
+    cameras = {"front": {"index_or_path": 0}}
+    assert "error" not in manager.spawn(robot, "real", peer_id="peer", remember=False, cameras=cameras, **bus, **where)
+
+    out = manager.reconfigure_cameras("peer", None)
+
+    assert out.get("reconfigured") is True, out
+    respawned = calls[-1]
+    assert respawned["cameras"] is None
+    assert {k: respawned.get(k) for k in bus} == bus
+    assert _status_domain(_driver_the_spawner_builds(respawned, monkeypatch)) == 7
 
 
 def test_the_spawn_form_is_told_which_transport_each_robot_uses() -> None:

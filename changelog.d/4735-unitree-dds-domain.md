@@ -25,6 +25,8 @@ The registry's `real_transport` says which drivers declare it (the Unitree
 drivers and the Booster T1); naming one for any other driver, or naming a value
 that is not a domain, is refused before a process exists; and the spawner hands
 it to `Robot`, so a spawn that names none still builds its driver on domain 0.
+A camera change, which respawns the robot, hands it both again: it used to
+bring a networked robot back on its driver's default interface.
 
 The value is refused through the *shared* domain rule
 (`strands_robots.utils.dds_domain_id_error`) rather than a local test, for the

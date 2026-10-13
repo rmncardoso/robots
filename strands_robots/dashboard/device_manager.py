@@ -77,6 +77,9 @@ class ManagedRobot:
     port: str | None = None
     # The lerobot calibration id this child was started with.
     robot_id: str | None = None
+    # The NIC and DDS domain it was started with, so a camera respawn binds the same bus.
+    network_interface: str | None = None
+    domain_id: int | None = None
     cameras: dict[str, Any] = field(default_factory=dict)
     process: subprocess.Popen | None = None
     started_at: float = 0.0
@@ -2349,6 +2352,8 @@ class DeviceManager:
                 mode=mode,
                 port=port,
                 robot_id=robot_id,
+                network_interface=network_interface,
+                domain_id=domain_id,
                 cameras=cameras or {},
                 process=proc,
                 started_at=time.time(),
@@ -2665,6 +2670,7 @@ class DeviceManager:
                 }
             # Everything about the old spawn EXCEPT the cameras.
             robot_name, mode, port = m.robot_name, m.mode, m.port
+            network_interface, domain_id = m.network_interface, m.domain_id
         if mode not in SPAWNABLE_MODES:
             return {"error": f"{peer_id} is a {mode} job, not a respawnable robot"}
         # robot_id is the lerobot CALIBRATION identity - ManagedRobot does not
@@ -2686,6 +2692,8 @@ class DeviceManager:
             cameras=cameras,
             robot_id=robot_id,
             remember=True,
+            network_interface=network_interface,
+            domain_id=domain_id,
         )
         result["reconfigured"] = "error" not in result
         return result
