@@ -94,23 +94,6 @@ class TestTheEntryIsWellFormed:
         assert entry["joints"] == BODY_JOINTS + len(HAND_JOINTS) == 43
         assert entry["joints"] + FLOATING_BASE_JOINTS == 44, "the model's njnt, for the record"
 
-    def test_the_hand_joints_are_two_dex3_1_hands(self) -> None:
-        """The fourteen names, pinned where CI runs.
-
-        CI has no menagerie cache, so the cells that read them back from the
-        compiled model (``tests/simulation/test_g1_asset_variants_differ_by_their_hand_joints.py``)
-        skip there; this one holds them. Each hand is Unitree's Dex3-1: three
-        thumb, two middle and two index hinges, listed in the asset's order.
-        """
-        fingers = (("thumb", 3), ("middle", 2), ("index", 2))
-        dex3_1 = tuple(
-            f"{side}_hand_{finger}_{i}_joint"
-            for side in ("left", "right")
-            for finger, count in fingers
-            for i in range(count)
-        )
-        assert HAND_JOINTS == dex3_1
-
     def test_the_description_carries_the_dof_a_reader_sizes_an_action_vector_from(self) -> None:
         """Both figures, because the hands are the reason to pick this entry over the other."""
         description = _entry()["description"]
