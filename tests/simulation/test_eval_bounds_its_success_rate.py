@@ -32,8 +32,9 @@ pair, rather than multiplying into a parametrised grid.
 The text block prints the Clopper-Pearson pair beside the rate, since it is the one to
 gate on (its coverage is guaranteed) and the text is what an agent mostly reads - and
 only where the ``json`` block carries an interval, so the unmeasured line and the line
-of a run that completed nothing read exactly as they did. The rollouts page's sample
-output shows the line with its bounds.
+of a run that completed nothing read exactly as they did. It prints whole percents, so
+a gate reads the ``json`` bounds, and the rollouts page's sample output shows the line
+with its bounds.
 
 No paired test (McNemar's and friends) is added: both surfaces evaluate one policy per
 call, so a paired statistic would have no caller here, and code with no caller is
@@ -42,6 +43,7 @@ refused (``AGENTS.md`` convention 10).
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import re
@@ -55,6 +57,7 @@ import strands_robots
 from strands_robots.simulation.policy_runner import (
     _CI_CONFIDENCE,
     CooperativeStop,
+    PolicyRunner,
     _binomial_tail_at_least,
     _interval_text,
     clopper_pearson_interval,
@@ -336,6 +339,41 @@ class TestThePayloadShape:
         assert (payload["clopper_pearson_low"], payload["clopper_pearson_high"]) == tuple(
             round(b, 4) for b in clopper_pearson_interval(13, 8)
         )
+
+
+def _returns_paragraph(key: str) -> str:
+    """The paragraph of ``PolicyRunner.evaluate``'s docstring that opens on ``key``, on one line."""
+    doc = inspect.getdoc(PolicyRunner.evaluate) or ""
+    paragraphs = [p for p in doc.split("\n\n") if p.strip().startswith(f"``{key}``")]
+    assert len(paragraphs) == 1, f"expected one paragraph opening on {key!r}, found {len(paragraphs)}"
+    return " ".join(paragraphs[0].split())
+
+
+class TestTheTextRoundsTheGatedPairToWholePercents:
+    """The text is for reading, and a gate reads the ``json`` bounds.
+
+    The text block prints the payload's Clopper-Pearson pair to the nearest whole
+    percent, so 4 of 5's ``0.9949`` reads as 99%, not 100%. A printed bound can then
+    sit up to half a percent from the value a threshold would be compared with, which
+    is why ``PolicyRunner.evaluate``'s ``Returns:`` block sends a gate to the 4-decimal
+    ``json`` bounds.
+    """
+
+    def test_each_printed_bound_is_the_json_bound_to_the_nearest_whole_percent(self) -> None:
+        for n, c in _COUNTS:
+            payload = success_interval(n, c)
+            clause = _interval_text(payload)
+            printed = re.fullmatch(r", 95% CI (\d+)-(\d+)%", clause)
+            assert printed, f"{c}/{n} prints {clause!r} beside its rate, not a 95% interval"
+            for bound, key in zip(printed.groups(), ("clopper_pearson_low", "clopper_pearson_high")):
+                assert abs(int(bound) - payload[key] * 100) <= 0.5 + 1e-9, (
+                    f"{c}/{n} prints {bound}% for {key}={payload[key]}, which is not its nearest whole percent"
+                )
+
+    def test_the_returns_block_says_so_and_sends_a_gate_to_the_json(self) -> None:
+        paragraph = _returns_paragraph("success_rate_ci")
+        assert "rounded to the nearest whole percent" in paragraph, paragraph
+        assert "a gate should read the JSON bounds, not the text" in paragraph, paragraph
 
 
 #: Counts no success rate can be read from, each beside the refusal it earns. A float or

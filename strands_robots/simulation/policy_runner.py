@@ -4408,13 +4408,14 @@ class PolicyRunner:
             :func:`success_interval`. It says how much of the rate is the episode
             count: 4 of 5 is 80% and also anything from 28% to 99%. Gate on the
             Clopper-Pearson pair, which guarantees its coverage at every rate; the
-            text block prints it beside the rate, as ``95% CI 28-99%``. Two
-            checkpoints whose intervals do not overlap were separated by the run;
-            overlapping ones may still differ, which takes a two-sample test. The
-            Wilson pair is reported too because the difference is the cost of the
-            normal approximation, which at these counts is not negligible. Gated and
-            empty on the same conditions as ``pass_hat_k``, and the text prints
-            bounds only when the key is present and non-empty.
+            text block prints it beside the rate, as ``95% CI 28-99%``, rounded to
+            the nearest whole percent, so a gate should read the JSON bounds, not
+            the text. Two checkpoints whose intervals do not overlap were separated
+            by the run; overlapping ones may still differ, which takes a two-sample
+            test. The Wilson pair is reported too because the difference is the cost
+            of the normal approximation, which at these counts is not negligible.
+            Gated and empty on the same conditions as ``pass_hat_k``, and the text
+            prints bounds only when the key is present and non-empty.
 
             ``episodes_successful_at_reset`` (int) counts episodes whose success
             criterion already held at reset, before any action was applied. The
