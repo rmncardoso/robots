@@ -210,7 +210,7 @@ def test_a_camera_change_respawns_the_robot_on_the_interface_and_domain_it_had(
     # The respawn lists this machine's cameras and serial boards; the stand-ins list none.
     monkeypatch.setattr(DeviceManager, "_camera_names", lambda self, refresh=False: [])
     monkeypatch.setattr(device_manager, "scan_serial_ports", lambda: [])
-    bus = {"network_interface": "enp3s0", "domain_id": 7}
+    bus: dict[str, Any] = {"network_interface": "enp3s0", "domain_id": 7}
     cameras = {"front": {"index_or_path": 0}}
     assert "error" not in manager.spawn(robot, "real", peer_id="peer", remember=False, cameras=cameras, **bus, **where)
 
