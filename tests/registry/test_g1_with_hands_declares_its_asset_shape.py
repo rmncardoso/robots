@@ -101,7 +101,7 @@ class TestTheEntryIsWellFormed:
         assert str(BODY_JOINTS) in description and str(len(HAND_JOINTS) // 2) in description
 
     def test_the_description_names_the_hand_the_model_carries(self) -> None:
-        """A G1 also ships with Inspire's 6-DoF hand, and its action vector does not fit this model."""
+        """A G1 also ships with Inspire's hand, and its action vector does not fit this model."""
         assert "Dex3-1" in _entry()["description"]
 
     def test_the_asset_names_the_with_hands_model_and_its_own_scene(self) -> None:

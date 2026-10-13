@@ -11,8 +11,8 @@ The hands are in a second model in the same upstream directory,
 `g1_with_hands.xml`: the same 29 body joints plus two Unitree Dex3-1 hands of
 seven joints each - three thumb, two middle and two index hinges - for 43
 actuated joints, each driven by one actuator. It now has its own registry entry,
-which names the hand because a G1 also ships with Inspire's 6-DoF hand, whose
-action vector does not fit this model. `Robot("unitree_g1_with_hands")` (or
+which names the hand because a G1 also ships with Inspire's hand, whose action
+vector does not fit this model. `Robot("unitree_g1_with_hands")` (or
 `Robot("g1_with_hands")`) spawns it and `robot_action_keys` reports the fourteen
 hand joints; `unitree_g1`'s description no longer promises them.
 
