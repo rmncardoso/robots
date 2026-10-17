@@ -13,7 +13,7 @@ from ...policy.base import PolicyFault
 from ...recording import Episode, NotRecording, episode
 from ...types import Observation
 from ..safety import EStopped, NonFiniteTarget, apply_on_disconnect
-from .bind import Bound, bind, decide, looks, release
+from .bind import Bound, bind, decide, install_gains, looks, release
 from .result import RunResult
 from .source import is_agent
 from .task import Task
@@ -121,6 +121,7 @@ def _loop(
     dt = 1.0 / hz
     sim_steps = max(1, round(dt / robot.sim.physics.timestep)) if robot.sim is not None else None
     max_steps = steps if steps is not None else (int(round(seconds * hz)) if seconds is not None else None)
+    install_gains({robot: bound})  # after the rate and the step count, the loop's last checks
     n, stops0 = 0, robot.estop_latch.count
     why: str = "steps"
     fault: str | None = None

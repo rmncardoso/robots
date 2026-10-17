@@ -3,7 +3,7 @@ import time
 import pytest
 
 from strands_robots import JointState, Robot, Simulation
-from strands_robots.policy import SequencePolicy
+from strands_robots.policy import Requirements, SequencePolicy
 from strands_robots.robot import RunResult
 
 
@@ -116,6 +116,96 @@ def test_set_gains_never_writes_an_actuator_the_world_cannot_name(tmp_path):
             link.set_gains([5.0], [0.1])  # dev: written to the world's last actuator, the arm's gripper
         sim.add_object("box", shape="box", position=[1, 1, 0.05])  # and so never put back on it by a recompile
         assert _kp(arm) == before
+
+
+class _PD:
+    """A policy that carries its own PD gains, as holosoma's checkpoint does."""
+
+    gains = ([33.0] * 6, [1.0] * 6)
+
+    def act(self, obs, *, instruction=None):
+        return obs.joints.positions
+
+    def reset(self):
+        pass
+
+
+class _PDAt50(_PD):
+    hz = 50.0
+
+
+class _PDNeedsFront(_PD):
+    def requirements(self):
+        return Requirements(images={"front": None})
+
+
+class _PDForFive(_PD):
+    gains = ([33.0] * 5, [1.0] * 5)
+
+
+@pytest.mark.parametrize(
+    ("start", "match"),
+    [
+        (lambda a, b: a.run(_PD(), units="bogus", steps=1), "unknown units"),
+        (lambda a, b: a.run(_PDNeedsFront(), steps=1), "needs camera"),
+        (lambda a, b: a.run(_PDAt50(), hz=100, steps=1), "runs at 50 Hz; hz=100"),
+        (lambda a, b: a.run(_PD(), seconds=float("nan")), "NaN"),  # the step count, the loop's last check
+        (lambda a, b: a.sim.run({a: _PDNeedsFront()}, steps=1), "needs camera"),
+        (lambda a, b: a.sim.run({a: _PDAt50()}, hz=100, steps=1), "runs at 50 Hz; hz=100"),
+        (lambda a, b: a.sim.run({a: _PDAt50(), b: _At30([{"shoulder_pan": 0.1}])}, steps=1), "different rates"),
+        (lambda a, b: a.sim.run({a: _PD()}, seconds=float("nan")), "NaN"),
+        (lambda a, b: a.sim.run({a: _PD(), b: _PDForFive()}, steps=1), "so101_2: .*actuators"),  # b's own gains
+    ],
+    ids=[
+        "units",
+        "requirements",
+        "rate",
+        "steps",
+        "lockstep_requirements",
+        "lockstep_rate",
+        "lockstep_two_rates",
+        "lockstep_steps",
+        "lockstep_gains_size",
+    ],
+)
+def test_a_run_refused_before_step_one_leaves_the_gains_it_found(start, match):
+    arm, other = Robot("so101"), Robot("so101", position=[0, 0.5, 0])
+    found = _kp(arm), _kp(other)
+    with pytest.raises(ValueError, match=match):
+        start(arm, other)
+    assert (_kp(arm), _kp(other)) == found  # dev: the policy's kp 33 on the body
+
+
+def test_a_run_a_latched_estop_ends_at_step_zero_leaves_the_gains_it_holds_with():
+    arm = Robot("so101")
+    found = _kp(arm)
+    arm.estop()
+    assert arm.run(_PD(), steps=3).steps == 0 and arm.sim.run({arm: _PD()}, steps=3)[arm.id].stopped_by == "estop"
+    assert _kp(arm) == found  # dev: kp 33; an e-stopped G1 given holosoma's gains this way falls within 3 s
+    other = Robot("so101", position=[0, 0.5, 0])  # not e-stopped: its partner's latch ends the run, nothing goes on
+    assert arm.sim.run({other: _PD(), arm: _PD()}, steps=3)[other.id].stopped_by == "estop"
+    assert (_kp(arm), _kp(other)) == (found, found)
+
+
+class _PDThatReads(_PD):
+    """Records, at each act(), the kp its robot is under."""
+
+    def __init__(self, robot):
+        self.robot, self.seen = robot, []
+
+    def act(self, obs, *, instruction=None):
+        self.seen.append(_kp(self.robot))
+        return super().act(obs, instruction=instruction)
+
+
+@pytest.mark.parametrize(
+    "start", [lambda a, p: a.run(p, steps=2), lambda a, p: a.sim.run({a: p}, steps=2)], ids=["run", "lockstep"]
+)
+def test_a_run_that_passes_its_checks_acts_under_its_policys_gains_from_step_one(start):
+    arm = Robot("so101")
+    pol = _PDThatReads(arm)
+    start(arm, pol)
+    assert pol.seen == [[33.0] * 6] * 2  # each loop puts them on itself, after its last checks
 
 
 def test_the_operator_gate_passes_a_simulated_body():

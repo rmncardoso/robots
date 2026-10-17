@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from ...policy.base import PolicyFault
 from ...types import Observation
 from ..safety import EStopped, NonFiniteTarget, apply_on_disconnect
-from .bind import Bound, bind, decide, looks, release
+from .bind import Bound, bind, decide, install_gains, looks, release
 from .loop import _announce, _declared, _emit
 from .result import RunResult
 from .source import is_agent
@@ -64,6 +64,7 @@ def _lockstep(
     dt = sim.physics.control_dt if rate is None else 1.0 / rate
     per = max(1, round(dt / sim.physics.timestep))
     total = steps if steps is not None else int(round(float(seconds or 0.0) / dt))
+    install_gains(bound)  # after the rate and the step count, the loop's last checks
     realtime = any(b.realtime for b in bound.values())
     faults: dict[str, str] = {}
     stopped: list[Robot] = []
