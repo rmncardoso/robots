@@ -1,12 +1,13 @@
 """The watchdog: a heartbeat on the command path. When it lapses, every control applies its ``on_disconnect``.
 
 The clock is ``robot.clock``: the world's time for a simulated body (so ``manual_time`` tests are exact),
-the body's clock on hardware. ``poll()`` checks once; ``start()`` polls on a thread until ``stop()``.
-An apply that raises leaves the lapse open: the next poll retries it.
+the body's clock on hardware. ``poll()`` checks once; ``start()`` polls on a thread until ``stop()`` or the
+robot is closed. An apply that raises leaves the lapse open: the next poll retries it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -35,6 +36,7 @@ class Watchdog:
         self.clock = clock or robot.clock.now
         self.last = self.clock()
         self.lapsed = False
+        self.errors = 0  # polls that raised on the start() thread; each one is retried the next period
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -57,9 +59,28 @@ class Watchdog:
         return True
 
     def start(self, period_s: float = 0.01) -> Watchdog:
+        """Poll every ``period_s`` on a daemon thread until ``stop()`` or the robot is closed.
+
+        A poll that raises is counted in ``errors`` and retried the next period. Each run of failures is one ``fault``
+        event, whose subscribers run on this thread: the retry waits until they return."""
+        period = float(period_s)  # Event.wait() takes a float or an int: an np.float32 or a Decimal ends the thread
+        if not 0 < period <= threading.TIMEOUT_MAX:  # 0, negative or NaN spin a core; above the max, wait() overflows
+            raise ValueError(f"period_s must be in (0, {threading.TIMEOUT_MAX:.0f}] seconds, got {period_s}")
+
         def loop() -> None:
-            while not self._stop.wait(period_s):
-                self.poll()
+            failing = False
+            while not self._stop.wait(period) and self.robot._body is not None:
+                try:
+                    self.poll()
+                except Exception as e:  # a corrupted reply or an I/O error must not end the watchdog
+                    self.errors += 1
+                    if not failing:
+                        with contextlib.suppress(Exception):  # nor may an error that cannot print, or a subscriber
+                            why = f"watchdog: poll failed ({type(e).__name__}: {e}); retrying every {period:g} s"
+                            self.robot.events.emit("fault", {"device_id": self.robot.id, "reason": why})
+                    failing = True
+                else:
+                    failing = False
 
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
