@@ -22,8 +22,8 @@ class Watchdog:
     """``beat()`` on every command; a lapse longer than ``timeout_ms`` applies ``on_disconnect`` once."""
 
     def __init__(self, robot: Robot, timeout_ms: float, *, clock: Callable[[], float] | None = None) -> None:
-        if timeout_ms <= 0:
-            raise ValueError(f"timeout_ms must be > 0, got {timeout_ms}")
+        if not 0 < timeout_ms < float("inf"):  # a NaN lapses at every poll after a beat, an inf never lapses
+            raise ValueError(f"timeout_ms must be a finite number > 0, got {timeout_ms}")
         if robot.is_real and robot.description.hardware.on_disconnect is None:
             from .validators import RequestRefused
 

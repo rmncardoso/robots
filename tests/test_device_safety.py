@@ -454,6 +454,15 @@ def test_a_watchdog_period_outside_zero_to_timeout_max_is_refused(period_s):
     real.close()
 
 
+@pytest.mark.parametrize("timeout_ms", [float("nan"), float("inf")])
+def test_a_watchdog_timeout_that_is_not_a_finite_number_is_refused(timeout_ms):
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    with pytest.raises(ValueError, match="timeout_ms must be a finite number > 0"):
+        Watchdog(real, timeout_ms=timeout_ms)
+    real.close()
+
+
 @pytest.mark.parametrize("period_s", [np.float32(0.005), Decimal("0.005")], ids=["np.float32", "Decimal"])
 def test_a_watchdog_period_given_as_another_number_type_still_paces_its_retries(period_s):
     real, s = _held_arm_whose_next_hold_fails()
