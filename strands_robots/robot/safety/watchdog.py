@@ -2,6 +2,7 @@
 
 The clock is ``robot.clock``: the world's time for a simulated body (so ``manual_time`` tests are exact),
 the body's clock on hardware. ``poll()`` checks once; ``start()`` polls on a thread until ``stop()``.
+An apply that raises leaves the lapse open: the next poll retries it.
 """
 
 from __future__ import annotations
@@ -42,11 +43,17 @@ class Watchdog:
         self.lapsed = False
 
     def poll(self) -> bool:
-        """True when this call found a fresh lapse and applied ``on_disconnect``."""
+        """True when this call found a fresh lapse and applied ``on_disconnect``.
+
+        An apply that raises propagates, and the lapse stays open for the next poll to retry."""
         if self.lapsed or self.clock() - self.last <= self.timeout:
             return False
-        self.lapsed = True
-        apply_on_disconnect(self.robot)
+        self.lapsed = True  # claimed before the apply: a beat() that lands during it starts a new heartbeat
+        try:
+            apply_on_disconnect(self.robot)
+        except BaseException:
+            self.lapsed = False
+            raise
         return True
 
     def start(self, period_s: float = 0.01) -> Watchdog:
