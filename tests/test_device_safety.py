@@ -322,6 +322,59 @@ def test_a_watchdog_refuses_a_real_body_with_no_declared_on_disconnect():
     so.close()
 
 
+def _held_arm_whose_next_hold_fails():
+    """An SO-101 on the fake bus under torque, whose next ``hold()`` raises (the USB adapter re-enumerated)."""
+    d, s = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    real.act({"shoulder_pan": 0.3})  # torque on: a hold is one Goal_Position write
+    hold, calls = d.hold, []
+
+    def hold_failing_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("the USB adapter re-enumerated")
+        hold()
+
+    d.hold = hold_failing_once  # type: ignore[method-assign]
+    return real, s
+
+
+def test_a_poll_after_a_failed_on_disconnect_retries_it_in_the_same_lapse():
+    from test_operator_gate import goal_writes
+
+    real, s = _held_arm_whose_next_hold_fails()
+    now = {"t": 0.0}
+    dog = Watchdog(real, timeout_ms=50, clock=lambda: now["t"])
+    now["t"] = 0.1
+    with pytest.raises(OSError, match="re-enumerated"):
+        dog.poll()
+    n = len(goal_writes(s))
+    now["t"] = 0.2  # no beat since: the same lapse, still not applied
+    assert dog.poll() is True and len(goal_writes(s)) == n + 1
+    assert dog.poll() is False  # applied once per lapse
+    real.close()
+
+
+def test_a_beat_while_on_disconnect_is_applied_is_kept_so_the_next_lapse_applies_too():
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    now = {"t": 0.0}
+    dog = Watchdog(real, timeout_ms=50, clock=lambda: now["t"])
+    hold = d.hold
+
+    def hold_as_the_commander_returns():
+        hold()
+        dog.beat()  # the commander's next command lands mid-apply (beat() takes no lock)
+
+    d.hold = hold_as_the_commander_returns  # type: ignore[method-assign]
+    now["t"] = 0.1
+    assert dog.poll() is True
+    d.hold = hold  # type: ignore[method-assign]
+    now["t"] = 0.3  # the commander went quiet again after that one command: a new lapse
+    assert dog.poll() is True
+    real.close()
+
+
 def test_workspace_bounds_validator_refuses_a_target_whose_tool_leaves_the_box():
     from strands_robots.robot.safety import WorkspaceBoundsValidator
 
