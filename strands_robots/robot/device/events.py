@@ -31,7 +31,8 @@ class Emitter:
     """Subscribers per event; ``state`` subscribers each get their own sampling thread at their ``hz``.
 
     A tick that raises is counted in ``errors`` and reported as one ``fault`` event until a sample goes through
-    again; the stream keeps its rate, and ends only when unsubscribed or when the robot is closed."""
+    again; the next read waits a full period, counted from when that event's subscribers (on the stream's thread)
+    return. A stream ends only when unsubscribed or when the robot is closed."""
 
     def __init__(self, robot: Robot) -> None:
         self.robot = robot
@@ -83,8 +84,8 @@ class Emitter:
                 except Exception as e:  # a corrupted reply or an I/O error must not end the stream
                     if stop.is_set() or self.robot._body is None:
                         return  # unsubscribed or closed during the sample: not a fault
-                    self._failed(e, report=not failing)
-                    failing = True
+                    self._failed(e, period, report=not failing)
+                    failing, nxt = True, time.monotonic()  # a full period before the next read: no burst to catch up
                 else:
                     failing = False
                 seq += 1
@@ -102,7 +103,7 @@ class Emitter:
         self._streams.append(unsubscribe)
         return unsubscribe
 
-    def _failed(self, e: Exception, *, report: bool) -> None:
+    def _failed(self, e: Exception, period: float, *, report: bool) -> None:
         """Count a state sample that raised; ``report`` it as a ``fault`` event (the first of a run of failures)."""
         with self._lock:
             self.errors += 1
@@ -112,7 +113,7 @@ class Emitter:
             what = f"{type(e).__name__}: {e}"
         except Exception:  # an error whose message cannot be formatted is reported by its type
             what = type(e).__name__
-        why = f"state stream: a sample failed ({what}); still sampling"
+        why = f"state stream: a sample failed ({what}); retrying {period:g} s after each failure"
         with contextlib.suppress(Exception):  # nor may a fault subscriber that raises end the stream
             self.emit("fault", {"device_id": self.robot.id, "reason": why})
 

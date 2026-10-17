@@ -159,17 +159,26 @@ def test_lockstep_emits_per_robot():
 
 
 class FlakySerial(FakeSerial):
-    """The fake bus with noise on the line while ``noise`` is set: every SYNC_READ reply's last checksum is flipped."""
+    """The fake bus with trouble on the line: while ``noise`` is set every SYNC_READ reply's last checksum is flipped;
+    while ``dead`` is set no servo answers, and a read waits out the bus's 20 ms timeout, as pyserial does."""
 
     def __init__(self):
         super().__init__()
-        self.noise, self.garbled = False, 0
+        self.noise, self.dead, self.garbled = False, False, 0
 
     def write(self, data):
+        if self.dead:
+            self.frames.append(bytes(data))
+            return
         super().write(data)
         if self.noise and data[4] == ft.SYNC_READ:
             self.rx[-1] ^= 0xFF
             self.garbled += 1
+
+    def read(self, n):
+        if self.dead and n > len(self.rx):
+            time.sleep(0.02)
+        return super().read(n)
 
 
 def _until(cond, timeout=5.0):
@@ -179,14 +188,14 @@ def _until(cond, timeout=5.0):
     return cond()
 
 
-def _streaming_arm(**subscribers):
-    """An SO-101 on a ``FlakySerial`` bus streaming state at 200 Hz into a list: (arm, serial, got, unsubscribe)."""
+def _streaming_arm(hz=200, **subscribers):
+    """An SO-101 on a ``FlakySerial`` bus streaming state at ``hz`` into a list: (arm, serial, got, unsubscribe)."""
     d, s = make_driver(serial=FlakySerial())
     arm = Robot("so101", driver=d, twin=False)
     for event, cb in subscribers.items():
         arm.subscribe(event, cb)
     got: list[dict] = []
-    return arm, s, got, arm.subscribe("state", got.append, hz=200)
+    return arm, s, got, arm.subscribe("state", got.append, hz=hz)
 
 
 def _a_burst_of_noise(arm, s, got):
@@ -276,3 +285,18 @@ def test_an_error_that_cannot_print_itself_is_reported_by_its_type_and_does_not_
     assert resumed, f"the stream ended after {len(calls)} read(s)"
     assert arm.events.errors == 2
     assert len(faults) == 1 and "a sample failed (Unprintable)" in faults[0]["reason"], faults
+
+
+def test_after_a_failed_read_a_state_stream_waits_a_period_so_it_never_bursts_when_the_bus_answers_again():
+    arm, s, got, unsubscribe = _streaming_arm(hz=100)
+    assert _until(lambda: len(got) >= 3)
+    s.dead = True  # a read now fails after the 20 ms timeout, once per try: two periods or more at 100 Hz
+    time.sleep(1.0)
+    s.dead, n = False, len(got)
+    t0 = time.monotonic()
+    assert _until(lambda: len(got) > n), "no sample after the bus answered again"
+    time.sleep(max(0.0, t0 + 0.25 - time.monotonic()))
+    unsubscribe()
+    arm.close()
+    back = [g for g in got[n:] if g["t"] - t0 < 0.2]  # 20 periods: a late or retried read is made up, the outage not
+    assert len(back) <= 40, f"{len(back)} samples in the first 200 ms back at 100 Hz"
