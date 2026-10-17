@@ -91,6 +91,33 @@ def test_set_gains_takes_one_kp_and_kd_per_actuator():
         arm.set_gains([50.0] * 5, [1.0] * 6)
 
 
+def _kp(robot):
+    m = robot.sim.backend.model
+    return [float(m.actuator_gainprm[m.actuator(f"{robot.id}/{a}").id, 0]) for a in robot.description.actuators]
+
+
+ONE_LINK = (  # one hinge whose <position> actuator has no name, as many hand-written MJCFs have
+    '<mujoco model="one_link"><compiler angle="radian"/><worldbody><body name="base">'  # MJCF reads degrees otherwise
+    '<geom type="box" size=".05 .05 .05" mass="1"/>'
+    '<body name="link" pos="0 0 .1"><joint name="hinge" axis="0 1 0" range="-1.5 1.5"/>'
+    '<geom type="capsule" fromto="0 0 0 0 0 .2" size=".02" mass=".2"/></body></body></worldbody>'
+    '<actuator><position joint="hinge" kp="20" ctrlrange="-1.5 1.5"/></actuator></mujoco>'
+)
+
+
+def test_set_gains_never_writes_an_actuator_the_world_cannot_name(tmp_path):
+    xml = tmp_path / "one_link.xml"
+    xml.write_text(ONE_LINK)
+    with Simulation() as sim:
+        link = Robot(str(xml), sim=sim)
+        arm = Robot("so101", sim=sim, position=[0.5, 0, 0])
+        before = _kp(arm)
+        with pytest.raises(KeyError, match="'hinge' has no named actuator"):
+            link.set_gains([5.0], [0.1])  # dev: written to the world's last actuator, the arm's gripper
+        sim.add_object("box", shape="box", position=[1, 1, 0.05])  # and so never put back on it by a recompile
+        assert _kp(arm) == before
+
+
 def test_the_operator_gate_passes_a_simulated_body():
     arm = Robot("so101")
     assert arm.gate({"shoulder_pan": 0.2})[0] == pytest.approx(0.2)
