@@ -205,3 +205,64 @@ def test_a_simulated_and_a_hardware_so101_in_one_agent_are_refused_not_one_dropp
     assert sim_arm.observe(images=False)["shoulder_pan"] > 0.3 and goal_writes(serial) == []
     bench.close()
     world.close()
+
+
+@pytest.fixture
+def two_policies(monkeypatch):
+    """``tests.left`` / ``tests.right`` drive shoulder_pan to +0.3 / -0.3; the list records who decided each step."""
+    from strands_robots.policy import factory
+
+    decided: list[str] = []
+    real_make = factory.make
+    sides = {"tests.left": ("left", 0.3), "tests.right": ("right", -0.3)}
+
+    def make(spec, **kw):
+        if spec not in sides:
+            return real_make(spec)
+        side, target = sides[spec]
+        return lambda obs: decided.append(side) or {"shoulder_pan": target}
+
+    monkeypatch.setattr(factory, "make", make)
+    return decided
+
+
+def _run_left_and_right(**limits):
+    return [("robot_so101", {"rpc": "run", "run": {"policy": f"tests.{s}", **limits}}) for s in ("left", "right")]
+
+
+def test_two_runs_in_one_model_turn_are_one_run_and_one_refusal(two_policies):
+    """strands runs one message's tool uses at once: both runs drove one hardware so101, their goals alternating on
+    the bus. The second is refused with ``Robot.start``'s message, and one policy decides every step."""
+    from strands_robots import Robot
+
+    d, serial = make_driver()
+    real = Robot("so101", driver=d, twin=False, confirm=lambda targets: True)
+    done = sorted((r["status"], r["content"][0]["text"]) for r in _turn(real, [_run_left_and_right(steps=10, hz=20)]))
+    assert [status for status, _ in done] == ["error", "success"], done
+    assert done[0][1] == "RuntimeError: robot 'so101' already has a running task; call stop() first"
+    assert len(two_policies) == 10 and len(set(two_policies)) == 1, two_policies
+    real.close()
+
+
+def test_the_operators_stop_ends_an_agents_run(two_policies):
+    """An agent's run was not the robot's task: ``describe()`` said no task and ``stop()`` returned None while the
+    arm kept moving. Now the operator's ``stop()`` ends it, and the agent's tool call returns that result."""
+    import threading
+    import time
+
+    from strands_robots import Robot
+
+    d, serial = make_driver()
+    real = Robot("so101", driver=d, twin=False, confirm=lambda targets: True)
+    out: list[dict] = []
+    call = ("robot_so101", {"rpc": "run", "run": {"policy": "tests.left", "seconds": 3, "hz": 20}})
+    turn = threading.Thread(target=lambda: out.extend(_turn(real, [call])))
+    turn.start()
+    deadline = time.monotonic() + 2
+    while real.describe()["task"] != "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stopped = real.stop(timeout=2)
+    turn.join(5)
+    assert stopped is not None and stopped.stopped_by == "stopped", stopped
+    assert json.loads(out[0]["content"][0]["text"])["stopped_by"] == "stopped" and len(two_policies) < 60
+    real.close()

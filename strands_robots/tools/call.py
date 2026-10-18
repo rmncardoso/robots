@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -22,6 +23,8 @@ def target(device: Any, rpc: str) -> Callable[..., Any]:
         raise ValueError(f"unknown rpc {rpc!r}; {device.id} offers {list(names)}")
     if rpc == "hold" and hasattr(device, "gate"):  # torque on at the measured pose: the operator says go first
         return lambda: _gated_hold(device)
+    if rpc == "run" and hasattr(device, "start"):  # the robot's one task: a second run is refused, stop() ends it
+        return _run_as_the_task(device)
     gated = _AS_AGENT.get(rpc)
     return getattr(device, gated) if gated and hasattr(device, gated) else handler(device, rpc)
 
@@ -29,6 +32,16 @@ def target(device: Any, rpc: str) -> Callable[..., Any]:
 def _gated_hold(device: Any) -> None:
     device.gate(device.observe(images=False).joints)
     device.hold()
+
+
+def _run_as_the_task(device: Any) -> Callable[..., Any]:
+    """``run`` as ``device.start(...)``, waited on until the run ends (``decode`` reads ``start``'s signature)."""
+
+    @functools.wraps(device.start)
+    def run(**args: Any) -> Any:
+        return device.start(**args)._wait()
+
+    return run
 
 
 def dispatch(device: Any, tool_input: Mapping[str, Any]) -> Any:
