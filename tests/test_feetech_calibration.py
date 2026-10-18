@@ -1,6 +1,7 @@
-"""A Feetech arm's calibration file: the one ``Robot(id=)`` names, and the one ``calibrate()`` saves.
+"""A Feetech arm's calibration file: the one ``Robot(id=)`` names, the one ``calibrate()`` saves, a question first.
 
-LeRobot files an arm's calibration under its ``--robot.id``. Every bus here is the suite's ``FakeSerial``.
+LeRobot files an arm's calibration under its ``--robot.id`` and asks before it records over one
+(``so_follower.py:139-147`` at the pinned 53feaef3). Every bus here is the suite's ``FakeSerial``.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from strands_robots.robot.drivers import feetech as ft
 from strands_robots.robot.drivers.feetech import driver as ftd
 
 OTHER = {name: dict(joint, range_min=1124, range_max=3172) for name, joint in CAL.items()}  # another arm's file
+AT_120 = {name: dict(joint, homing_offset=120) for name, joint in CAL.items()}  # recorded with offsets of 120
 
 
 def on_disk(tmp_path, monkeypatch, files):
@@ -33,6 +35,11 @@ def on_disk(tmp_path, monkeypatch, files):
 def feetech(serial, **kw):
     bus = ft.FeetechBus("/dev/fake", serial=serial)
     return ft.FeetechDriver(Description.load("so101"), port="/dev/fake", bus=bus, **kw)
+
+
+def homing(serial, offset):
+    for i in serial.regs:  # what the servos' EEPROM holds from an earlier calibration
+        serial.regs[i][ft.REG_HOMING_OFFSET : ft.REG_HOMING_OFFSET + 2] = ft.encode_sm(offset, 11)
 
 
 @pytest.mark.parametrize(
@@ -111,3 +118,40 @@ def test_calibrate_never_records_over_or_beside_a_file_it_only_guessed(tmp_path,
             str(robots / "so_follower/arm_a.json"),
             Calibration.from_json(CAL),
         )
+
+
+def test_calibrate_asks_before_torque_goes_off_and_enter_keeps_the_calibration(tmp_path, monkeypatch):
+    robots = on_disk(tmp_path, monkeypatch, {"so_follower/my_arm.json": CAL})
+    serial = FakeSerial()
+    d = feetech(serial, robot_id="my_arm")
+    asked = []
+    kept = d.calibrate(interactive=True, prompt=lambda msg: asked.append(msg) or "", sweep_seconds=0.05)
+    assert kept == Calibration.from_json(CAL) and len(asked) == 1 and "Enter keeps it, c re-records" in asked[0]
+    assert bus_writes(serial) == [] and json.loads((robots / "so_follower/my_arm.json").read_text()) == CAL
+
+
+@pytest.mark.parametrize(
+    "files, answers",
+    [
+        ({"so_follower/my_arm.json": AT_120}, ["^C"]),
+        ({"so_follower/my_arm.json": AT_120}, ["c", "^C"]),
+        ({}, ["^C"]),
+    ],
+    ids=["ctrl-c-at-the-question", "ctrl-c-at-the-middle-pose", "uncalibrated-ctrl-c-at-the-middle-pose"],
+)
+def test_homing_offsets_change_only_after_the_middle_pose_is_confirmed(tmp_path, monkeypatch, files, answers):
+    on_disk(tmp_path, monkeypatch, files)
+    serial = FakeSerial()
+    homing(serial, 120)
+    d = feetech(serial, robot_id="my_arm")
+    replies = iter(answers)
+
+    def operator(msg):
+        reply = next(replies)
+        if reply == "^C":
+            raise KeyboardInterrupt
+        return reply
+
+    with pytest.raises(KeyboardInterrupt):
+        d.calibrate(interactive=True, prompt=operator, sweep_seconds=0.05)
+    assert [serial._homing(i) for i in serial.regs] == [120] * 6  # nothing was confirmed: the servos are unchanged

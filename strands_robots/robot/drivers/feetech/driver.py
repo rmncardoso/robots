@@ -170,7 +170,8 @@ class FeetechDriver:
     ) -> Calibration:
         """LeRobot's procedure: torque off, middle pose sets the homing offset, sweep records min/max.
 
-        ``interactive=False`` returns the calibration already loaded (LeRobot's file) and moves nothing."""
+        ``interactive=False`` returns the calibration already loaded (LeRobot's file) and moves nothing. With one
+        loaded, ``interactive=True`` first asks, as LeRobot does: Enter keeps it, ``c`` records a new one."""
         if not interactive:
             if self.calibration is None:
                 raise RuntimeError(
@@ -181,12 +182,16 @@ class FeetechDriver:
             return self.calibration
         if prompt is input and not sys.stdin.isatty():  # torque off drops the arm: only a human at the arm says go
             raise RuntimeError(f"{self.description.name}: calibrate(interactive=True) needs a human at a terminal")
+        if self.calibration is not None:  # ask first, as LeRobot does; unlike LeRobot's, this Enter writes nothing
+            said = f"{self.description.name} has a calibration ({self.calibration_source}). Enter keeps it"
+            if str(prompt(said + ", c re-records (torque goes off)") or "").strip().lower() != "c":
+                return self.calibration
         if save and self._save_to is None:  # over or beside a guess, the save could give another arm this calibration
             raise RuntimeError(f"with no id, {self.calibration_source} may be another arm's: pass id= or calibration=")
         self.torque(False)
-        for i in self.ids:  # the firmware reports Present = Actual - Homing_Offset: read the middle unshifted
-            self._write_homing(i, 0)
         prompt(f"Move {self.description.name} to the MIDDLE of every joint's range, then press Enter")
+        for i in self.ids:  # only after that Enter; Present = Actual - Homing_Offset, so read the middle unshifted
+            self._write_homing(i, 0)
         mid = {i: decode_sm(self.bus.read(i, REG_PRESENT_POSITION, 2), 15) for i in self.ids}
         limit = (1 << 11) - 1  # sign-magnitude, bit 11: LeRobot clamps pos - 2047 the same way
         homing = {i: max(-limit, min(limit, m - (RESOLUTION - 1) // 2)) for i, m in mid.items()}
