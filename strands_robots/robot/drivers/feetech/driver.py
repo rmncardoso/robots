@@ -190,11 +190,11 @@ class FeetechDriver:
             raise RuntimeError(f"with no id, {self.calibration_source} may be another arm's: pass id= or calibration=")
         self.torque(False)
         prompt(f"Move {self.description.name} to the MIDDLE of every joint's range, then press Enter")
+        was = {i: decode_sm(self.bus.read(i, REG_HOMING_OFFSET, 2), 11) for i in self.ids}  # put back if refused
         for i in self.ids:  # only after that Enter; Present = Actual - Homing_Offset, so read the middle unshifted
             self._write_homing(i, 0)
         mid = {i: decode_sm(self.bus.read(i, REG_PRESENT_POSITION, 2), 15) for i in self.ids}
-        limit = (1 << 11) - 1  # sign-magnitude, bit 11: LeRobot clamps pos - 2047 the same way
-        homing = {i: max(-limit, min(limit, m - (RESOLUTION - 1) // 2)) for i, m in mid.items()}
+        homing = {i: max(-2047, min(2047, m - (RESOLUTION - 1) // 2)) for i, m in mid.items()}  # as LeRobot clamps
         for i, h in homing.items():
             self._write_homing(i, h)
         full = {i for n, i in zip(self.names, self.ids, strict=True) if n == "wrist_roll"}  # LeRobot never sweeps it
@@ -208,6 +208,13 @@ class FeetechDriver:
                 v = decode_sm(raw[i], 15)
                 lo[i], hi[i] = min(lo[i], v), max(hi[i], v)
             time.sleep(0.01)
+        if unswept := [n for n, i in zip(self.names, self.ids, strict=True) if lo[i] >= hi[i]]:  # as LeRobot does
+            for i, h in was.items():  # the driver keeps the calibration it had: the servos get their offsets back
+                self._write_homing(i, h)
+            raise ValueError(
+                f"{self.description.name}: the sweep recorded no range for {unswept}: nothing saved, and the servos "
+                "have their homing offsets back. Run calibrate() again and move each of them through its full range"
+            )
         cal = Calibration(
             {n: JointCalibration(i, 0, homing[i], lo[i], hi[i]) for n, i in zip(self.names, self.ids, strict=True)}
         )

@@ -245,17 +245,18 @@ def test_calibration_loads_from_lerobot_path(tmp_path, monkeypatch):
 
 def test_calibrate_writes_lerobot_json(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_LEROBOT_CALIBRATION", str(tmp_path))
-    d, s = make_driver(cal=None)
+    d, s = make_driver(cal=None, serial=SweepSerial(middle=2100))
     with pytest.raises(RuntimeError, match="interactive=True"):
         d.calibrate(interactive=False)  # no file yet: recording one needs a human
     for i in s.regs:  # the encoder reads 2100 at "middle"; the EEPROM still carries an old calibration's offset
         s.actual[i] = 2100
         s.regs[i][ft.REG_HOMING_OFFSET : ft.REG_HOMING_OFFSET + 2] = ft.encode_sm(-300, 11)
-    cal = d.calibrate(interactive=True, prompt=lambda msg: None, sweep_seconds=0.05)
+    cal = d.calibrate(interactive=True, prompt=lambda msg: None, sweep_seconds=0.1)
+    s.actual.update(dict.fromkeys(s.actual, 2100))  # the sweep over, the arm is back at the middle
     # LeRobot's Feetech convention: Homing_Offset = middle - 2047, so the firmware then reports the middle at 2047
     assert cal.joints["shoulder_pan"].homing_offset == 2100 - 2047 == s._homing(1)
     assert ft.decode_sm(d.bus.read(1, ft.REG_PRESENT_POSITION, 2), 15) == 2047
-    assert (cal.joints["shoulder_pan"].range_min, cal.joints["shoulder_pan"].range_max) == (2047, 2047)
+    assert (cal.joints["shoulder_pan"].range_min, cal.joints["shoulder_pan"].range_max) == (2047 - 200, 2047 + 200)
     saved = json.loads((tmp_path / "robots" / "so101_follower" / "so101_follower.json").read_text())
     assert saved["gripper"]["id"] == 6
     assert set(saved["gripper"]) == {"id", "drive_mode", "homing_offset", "range_min", "range_max"}
