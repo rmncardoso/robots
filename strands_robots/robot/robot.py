@@ -140,8 +140,8 @@ class Robot(DeviceVerbs):
 
     def observe(self, *, images: bool = True) -> Observation:
         """One read of the body; ``t`` is the capture time on ``self.clock``."""
-        body = self.body
         with self._lock:
+            body = self.body  # under the lock: a world that closed meanwhile has detached it, and this says so
             t = self.clock.now()
             js = body.read()
             obs = Observation(

@@ -39,16 +39,19 @@ def mirror(robot: Robot, targets: np.ndarray, *, step: bool = False, measured: b
     ``act`` does; ``manual_time()`` still suppresses it. ``measured=True`` (what ``observe`` passes) also
     places the twin's joints AT the measurement, so it shows the real pose with no step.
 
-    A sample that is not finite is not mirrored (MuJoCo would reset the whole world on its next step).
+    A sample that is not finite is not mirrored (MuJoCo would reset the whole world on its next step), and a twin
+    whose world closed, or that left it, is skipped: the real body goes on without its display.
     """
     twin = robot.twin
-    if not np.isfinite(targets).all():  # one bad sample: MuJoCo would reset the whole world on its next step
+    sim = twin.sim if twin is not None else None  # read once: a world that closes sets it to None
+    if twin is None or sim is None or not np.isfinite(targets).all():
         return
-    if twin is not None and twin.sim is not None:
-        with twin.sim.lock:
-            if measured:
-                with contextlib.suppress(NotImplementedError):  # an engine that cannot place joints: command only
-                    twin.sim.backend.set_joints(twin.id, targets)
-            twin.body.write(targets)
+    with sim.lock:  # close() takes it too, so inside it the twin is either still in this world or gone
+        if sim.robots.get(twin.id) is not twin:
+            return
+        if measured:
+            with contextlib.suppress(NotImplementedError):  # an engine that cannot place joints: command only
+                sim.backend.set_joints(twin.id, targets)
+        twin.body.write(targets)
         if step:
-            twin.sim.control_step()
+            sim.control_step()

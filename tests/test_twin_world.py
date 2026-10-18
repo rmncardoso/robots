@@ -1,11 +1,14 @@
-"""A hardware Robot's twin shares Simulation.default() with simulated bodies: it never pushes them, and one bad
-sample never resets their world."""
+"""A hardware Robot's twin shares Simulation.default() with simulated bodies: it never pushes them, one bad
+sample never resets their world, and a world that closes under another thread refuses cleanly."""
+
+import threading
+import time
 
 import numpy as np
 import pytest
 from test_drivers import FakeLowState, FakeSub, make_driver
 
-from strands_robots import Description, Robot
+from strands_robots import Description, Robot, Simulation
 from strands_robots.robot.drivers.unitree import UnitreeDriver
 
 
@@ -68,3 +71,70 @@ def test_a_nan_reading_never_resets_the_twins_world():
     arm.act({"shoulder_pan": 0.8})
     assert arm.sim.time > t and arm.observe()["shoulder_pan"] == pytest.approx(0.8, abs=0.02)  # dev: 0.020 s, 0.0
     real.close()
+
+
+def test_close_waits_for_the_step_another_thread_is_taking():
+    sim = Simulation()
+    Robot("so101", sim=sim)
+    closed = threading.Event()
+    with sim.lock:  # another thread is inside a step
+        th = threading.Thread(target=lambda: (sim.close(), closed.set()))
+        th.start()
+        assert not closed.wait(0.2)  # dev: closed at once, under the step
+    th.join(5)
+    assert closed.is_set() and sim.backend.model is None
+
+
+@pytest.mark.parametrize(
+    "verb",
+    [lambda sim, arm: arm.act({"shoulder_pan": 0.2}), lambda sim, arm: sim.reset()],
+    ids=["act", "reset"],
+)
+def test_close_while_another_thread_uses_the_world_raises_a_clean_error(verb):
+    seen = set()
+    for _ in range(10):
+        sim = Simulation()
+        arm, errors = Robot("so101", sim=sim), []
+
+        def loop(sim=sim, arm=arm, errors=errors):  # given the world too: arm.sim is None once it closes
+            try:
+                for _ in range(10_000):
+                    verb(sim, arm)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        th = threading.Thread(target=loop)
+        th.start()
+        time.sleep(0.02)
+        sim.close()
+        th.join(10)
+        seen |= {type(err) for err in errors}
+    assert seen == {RuntimeError}  # dev: TypeError from mj_step() (act) or mj_forward() (reset) on the closed model
+
+
+def test_a_real_robot_outlives_its_twins_world():
+    real = Robot("so101", driver=make_driver()[0])
+    world, out = real.twin.sim, []
+    with world.lock:  # the twin's world is busy, so real.observe() waits there to mirror ...
+        th = threading.Thread(target=lambda: out.append(real.observe()))
+        th.start()
+        time.sleep(0.2)
+        world.close()  # ... and the world closes while it waits
+    th.join(5)
+    assert out and real.twin.sim is None  # dev: observe() raises AttributeError from the closed twin
+    assert real.act({"shoulder_pan": 0.3})["shoulder_pan"] == pytest.approx(0.3, abs=1e-3)  # the bus still moves
+    real.close()
+
+
+@pytest.mark.parametrize(
+    "use",
+    [lambda s: s.camera("c"), lambda s: s.randomize(friction=1.1), lambda s: s.render()],
+    ids=["camera", "randomize", "render"],
+)
+def test_a_closed_world_is_never_rebuilt(use):
+    sim = Simulation()
+    Robot("so101", sim=sim)
+    sim.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        use(sim)
+    assert sim.backend.model is None  # dev: the closed world's so101 compiled again
