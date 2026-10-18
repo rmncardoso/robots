@@ -197,13 +197,14 @@ class FeetechDriver:
         homing = {i: max(-limit, min(limit, m - (RESOLUTION - 1) // 2)) for i, m in mid.items()}
         for i, h in homing.items():
             self._write_homing(i, h)
-        prompt(f"Now move EVERY joint through its full range for {sweep_seconds:.0f} s (recording); Enter to start")
-        lo = {i: RESOLUTION for i in self.ids}
-        hi = {i: 0 for i in self.ids}
+        full = {i for n, i in zip(self.names, self.ids, strict=True) if n == "wrist_roll"}  # LeRobot never sweeps it
+        prompt(f"Now move every joint but wrist_roll through its full range for {sweep_seconds:.0f} s; Enter to start")
+        lo = {i: 0 if i in full else RESOLUTION for i in self.ids}  # wrist_roll: the full turn, as LeRobot records it
+        hi = {i: RESOLUTION - 1 if i in full else 0 for i in self.ids}
         end = time.monotonic() + sweep_seconds
         while time.monotonic() < end:
             raw = self.bus.sync_read(REG_PRESENT_POSITION, 2, self.ids)
-            for i in self.ids:
+            for i in set(self.ids) - full:
                 v = decode_sm(raw[i], 15)
                 lo[i], hi[i] = min(lo[i], v), max(hi[i], v)
             time.sleep(0.01)

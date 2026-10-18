@@ -10,7 +10,7 @@ import json
 import warnings
 
 import pytest
-from test_drivers import CAL, FakeSerial
+from test_drivers import CAL, FakeSerial, SweepSerial
 from test_drivers import writes as bus_writes
 
 from strands_robots import Description, Robot
@@ -20,6 +20,7 @@ from strands_robots.robot.drivers.feetech import driver as ftd
 
 OTHER = {name: dict(joint, range_min=1124, range_max=3172) for name, joint in CAL.items()}  # another arm's file
 AT_120 = {name: dict(joint, homing_offset=120) for name, joint in CAL.items()}  # recorded with offsets of 120
+LEROBOTS = CAL | {"wrist_roll": dict(CAL["wrist_roll"], range_min=0, range_max=4095)}  # as lerobot-calibrate saves it
 
 
 def on_disk(tmp_path, monkeypatch, files):
@@ -155,3 +156,15 @@ def test_homing_offsets_change_only_after_the_middle_pose_is_confirmed(tmp_path,
     with pytest.raises(KeyboardInterrupt):
         d.calibrate(interactive=True, prompt=operator, sweep_seconds=0.05)
     assert [serial._homing(i) for i in serial.regs] == [120] * 6  # nothing was confirmed: the servos are unchanged
+
+
+@pytest.mark.parametrize("still", [{5}, set()], ids=["wrist-roll-left-still-as-lerobot-asks", "wrist-roll-turned-too"])
+def test_calibrate_gives_wrist_roll_the_full_turn_as_lerobot_does(tmp_path, monkeypatch, still):
+    on_disk(tmp_path, monkeypatch, {"so_follower/my_arm.json": LEROBOTS})
+    serial = SweepSerial(still=still)  # servo 5 is wrist_roll; the others sweep 200 counts each way
+    d = feetech(serial, robot_id="my_arm")
+    serial.actual.update(dict.fromkeys(serial.actual, 2348))  # the operator's middle pose
+    answers = iter(["c", "", ""])  # re-record, middle pose, sweep
+    cal = d.calibrate(interactive=True, prompt=lambda msg: next(answers), sweep_seconds=0.1)
+    ranges = {name: (joint.range_min, joint.range_max) for name, joint in cal.joints.items()}
+    assert ranges == dict.fromkeys(CAL, (2047 - 200, 2047 + 200)) | {"wrist_roll": (0, 4095)}  # so_follower.py:160-168

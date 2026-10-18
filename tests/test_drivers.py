@@ -79,6 +79,21 @@ class FakeSerial:
                     self.actual[i] = (int.from_bytes(chunk, "little") + self._homing(i)) % 4096
 
 
+class SweepSerial(FakeSerial):
+    """The operator's sweep: each SYNC_READ finds every joint but the ``still`` ones 200 counts below, then above,
+    ``middle``."""
+
+    def __init__(self, middle=2348, still=()):
+        super().__init__()
+        self.middle, self.still, self.side = middle, set(still), 200
+
+    def write(self, data):
+        if data[4] == ft.SYNC_READ:
+            self.side = -self.side
+            self.actual.update({i: self.middle + self.side for i in self.actual if i not in self.still})
+        super().write(data)
+
+
 CAL = {
     n: {"id": i + 1, "drive_mode": 0, "homing_offset": 0, "range_min": 1024, "range_max": 3072}
     for i, n in enumerate(("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"))
