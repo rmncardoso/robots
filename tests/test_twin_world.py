@@ -43,6 +43,17 @@ class _MemoryDriver:
         return JointState(self.names, self.q.copy(), np.zeros_like(self.q), np.zeros_like(self.q))
 
 
+def _on_the_floor(robot):
+    """The bodies of ``robot`` that touch the floor over 1 s of its world's steps, with nobody observing it."""
+    bodies = set()
+    for _ in range(50):
+        robot.sim.control_step()
+        for c in robot.sim.contacts():
+            if "world" in (c.body_a, c.body_b):
+                bodies |= {b.split("/", 1)[1] for b in (c.body_a, c.body_b) if b.startswith(f"{robot.id}/")}
+    return bodies
+
+
 @pytest.mark.parametrize("arm_first", [True, False], ids=["arm_first", "real_first"])
 def test_a_twin_never_pushes_a_simulated_arm_off_its_targets(arm_first):
     # both stand on the so101 spawn point and every observe() places the twin there; #4749's headline is arm first
@@ -72,6 +83,17 @@ def test_a_twin_rests_on_the_floor_and_touches_nothing_else():
         touched |= _touching(twin.sim, twin.id)
     assert touched == {"world"} and twin.pose.position[2] > 0.05  # dev: it touches the sim G1 and itself too
     real.close()
+
+
+def test_a_twin_stands_on_the_floor_as_its_plain_body_does():
+    # cassie's shins, tarsi and feet carry only contact bits 2 and 4: they meet each other, never the floor
+    plain = Robot("cassie", sim=Simulation(), id="plain")  # alone in a world of its own
+    real = Robot("cassie", driver=_MemoryDriver("cassie"))  # cassie has no built-in driver: a third-party one
+    # with the twin bit on every colliding geom, the twin also stood on its feet and tarsi, at 0.296 m, not 0.154 m
+    assert _on_the_floor(real.twin) == _on_the_floor(plain)
+    assert real.twin.pose.position[2] == pytest.approx(plain.pose.position[2], abs=0.01)
+    real.close()
+    plain.sim.close()
 
 
 def test_a_nan_reading_never_resets_the_twins_world():

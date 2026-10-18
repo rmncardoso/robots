@@ -68,10 +68,9 @@ def attach_robot(spec: mujoco.MjSpec, r: SceneRobot) -> None:
         rs.delete(g)  # the world owns the floor
     for light in [li for li in rs.lights if li.parent.name == "world"]:
         rs.delete(light)  # and the lighting: a robot's scene light would stack on the world's and wash it out
-    if r._twin:  # a hardware robot's twin touches the floor and nothing else, so it never pushes a body
-        for g in rs.geoms:
-            if g.contype or g.conaffinity:  # a visual-only geom stays visual-only
-                g.contype, g.conaffinity = _TWIN_BIT, 0
+    if r._twin:  # a hardware robot's twin touches the floor as its plain body would, and nothing else
+        for g in rs.geoms:  # a plain geom meets the floor (1, 1) when either of its masks has bit 1
+            g.contype, g.conaffinity = (_TWIN_BIT, 0) if (g.contype | g.conaffinity) & 1 else (0, 0)
     frame = spec.worldbody.add_frame(pos=list(r.position), quat=list(r.orientation))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # "attach conflict: integrator" — the world's option wins

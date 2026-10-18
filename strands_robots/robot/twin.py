@@ -16,9 +16,10 @@ _MJ_MAXVAL = 1e10  # MuJoCo's mjMAXVAL: mj_step resets the whole world when a qp
 def make(real: Robot, name: str, position: Any, orientation: Any, keyframe: str | None) -> Robot:
     """``real``'s twin: a simulated body of its description in ``Simulation.default()``, whose ``twin_of`` is ``real``.
 
-    Its scene entry is marked as a twin, so there it touches the floor and nothing else: it never pushes a simulated
-    robot or object that stands where it spawns, and a floating twin still rests on the floor. The world's lock is
-    held from the add to the rebuild that marks it, so a step in another thread never meets it unmarked.
+    Its scene entry is marked as a twin, so there it touches the floor where its plain body would, and nothing
+    else: it never pushes a simulated robot or object that stands where it spawns, and a floating twin still stands
+    on the floor as its plain body does. The world's lock is held from the add to the rebuild that marks it, so a
+    step in another thread never meets it unmarked.
     """
     from ..simulation import Simulation
     from .robot import Robot
