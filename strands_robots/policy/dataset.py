@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,10 +23,14 @@ class ReplayPolicy(SequencePolicy):
     ``units`` is what ``meta/units.json`` says the dataset stores (``record=`` writes it), and ``units_for``
     rebuilds those units for the robot it replays on, with the LeRobot norm mode the file names for each joint.
     A dataset without that file (one written by another tool) needs ``units=`` from the caller, because guessing
-    radians for degrees moves a real arm by a factor of 57.
+    radians for degrees moves a real arm by a factor of 57. One whose file names no modes (written before
+    ``record=`` named them, or with ``units="lerobot"`` alone) takes them from ``norm=``; without it a real body
+    refuses the replay, because the registry's modes are a guess there, and a simulated body takes them.
     """
 
-    def __init__(self, root: Path, episode: int = 0, *, units: str | None = None) -> None:
+    def __init__(
+        self, root: Path, episode: int = 0, *, units: str | None = None, norm: Mapping[str, str] | None = None
+    ) -> None:
         info = json.loads((root / "meta" / "info.json").read_text())
         stored = root / "meta" / "units.json"
         said: dict[str, Any] = json.loads(stored.read_text()) if stored.is_file() else {}
@@ -34,25 +39,42 @@ class ReplayPolicy(SequencePolicy):
                 f"{root}: meta/units.json says the actions are stored in {said['units']!r}, but units={units!r} was "
                 "passed; drop units= (the dataset knows) or replay a dataset recorded in those units"
             )
-        units = said.get("units", units)
+        given = dict(norm) if norm else None  # an empty norm names no mode
+        units = said.get("units", units or ("lerobot" if given else None))
         if units is None:
-            raise ValueError(f"{root}: no meta/units.json says what the actions are in; pass units='rad' or 'lerobot'")
+            raise ValueError(
+                f"{root}: no meta/units.json says what the actions are in; pass units='rad', or norm= with the "
+                "LeRobot norm mode each joint was recorded in"
+            )
         modes = {k.removesuffix(".pos"): j["mode"] for k, j in said.get("joints", {}).items() if "mode" in j}
-        self.norm: dict[str, str] | None = modes or None  # joint -> LeRobot norm mode, as the dataset names them
+        if given is not None and units != "lerobot":
+            raise ValueError(f"{root}: norm= names LeRobot norm modes, but the actions are stored in {units!r}")
+        if given is not None and modes and {k: given.get(k, given.get("*")) for k in modes} != modes:
+            raise ValueError(
+                f"{root}: meta/units.json says the joints are in {modes}, but norm={given} was passed; drop norm= "
+                "(the dataset knows)"
+            )
+        self.norm: dict[str, str] | None = modes or given  # joint (or "*") -> LeRobot norm mode; None: unknown
         self.units, self.hz, self.root, self.episode = units, float(info["fps"]), root, episode
         self.names = [n.removesuffix(".pos") for n in info["features"]["action"]["names"]]
         self.recorded = _episode_actions(root, episode)
         super().__init__(list(self.recorded))
 
     def units_for(self, description: Description) -> Units | None:
-        """The recorded units for this robot: LeRobot's in the modes the dataset names (the registry's if it names
-        none); any other scheme by its name."""
+        """The recorded units for this robot: LeRobot's in the modes the dataset or ``norm=`` names (else the
+        registry's, which ``attach`` refuses on a real body); any other scheme by its name."""
         if self.units == "lerobot":
             return lerobot_units(description, self.norm)
         return Units.for_robot(description, str(self.units))  # never None: __init__ refuses a dataset without units
 
     def attach(self, robot: Any) -> None:
         """Order the recorded columns by this robot's action keys; a key the dataset lacks is refused by name."""
+        if robot.is_real and self.units == "lerobot" and self.norm is None:
+            raise ValueError(  # the registry's modes would be a guess, and a wrong one moves a real arm off target
+                f"{self!r} does not say which LeRobot norm mode each joint was recorded in, and {robot.id} is a real "
+                "body: pass norm={'*': 'degrees' | 'range_m100_100', ...} with the modes it was recorded in "
+                "(record= names them in meta/units.json)"
+            )
         missing = [k for k in robot.action_keys if k not in self.names]
         if missing:
             raise ValueError(f"{self!r} has no action for {', '.join(missing)} (it recorded {', '.join(self.names)})")

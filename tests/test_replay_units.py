@@ -92,3 +92,24 @@ def test_a_degrees_recording_replays_on_a_real_arm_at_the_counts_the_run_wrote(r
     replayed = _goals(Policy(recorded("deg", _units_json(DEG))))
     print(f"[measured] Goal_Position counts: the degrees run {direct}, its replay {replayed}")
     assert replayed == direct
+
+
+def test_a_real_arm_refuses_a_replay_that_does_not_name_its_norm_modes(recorded):
+    for spec, kw in (
+        (recorded("old", _units_json(DEG, modes=False)), {}),
+        (recorded("bare", None), {"units": "lerobot"}),
+    ):
+        arm, serial = _arm()
+        with pytest.raises(ValueError, match="pass norm=") as refused:
+            arm.run(Policy(spec, **kw), steps=1)
+        arm.close()
+        assert "real body" in str(refused.value) and serial.frames == []  # refused before the bus
+        assert _goals(Policy(spec, norm=DEG)) == _goals(Degrees())  # the caller names the modes: exact
+        assert Robot("so101").run(Policy(spec, **kw), steps=1).steps == 1  # a simulated arm: the registry's modes
+
+
+def test_a_callers_norm_never_overrides_the_modes_the_dataset_names(recorded):
+    spec = recorded("deg", _units_json(DEG))
+    with pytest.raises(ValueError, match="says the joints are in"):
+        Policy(spec, norm={"*": "range_m100_100", "gripper": "range_0_100"})
+    assert Policy(spec, norm=DEG).units == "lerobot"  # agreeing is fine; so is saying nothing
