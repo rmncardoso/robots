@@ -57,3 +57,16 @@ def lerobot_calibration_candidates(robot_type: str, robot_id: str | None) -> lis
         only = sorted(path.parent.glob("*.json")) if robot_id is None and path.parent.is_dir() else []
         out += [path] + (only if len(only) == 1 and only[0] != path else [])
     return out
+
+
+def _find_lerobot_calibration(
+    robot_type: str, robot_id: str | None, path: str | Path | None = None
+) -> tuple[Path | None, list[Path]]:
+    """``(found, looked)``: the file holding this arm's LeRobot calibration (None if none does), every file looked at.
+
+    ``path`` (``calibration=<path>``) is the only file looked at, and a missing one is an error."""
+    looked = [Path(path).expanduser()] if path is not None else lerobot_calibration_candidates(robot_type, robot_id)
+    found = next((p for p in looked if p.is_file()), None)
+    if found is None and path is not None:
+        raise FileNotFoundError(f"calibration file not found: {looked[0]}")
+    return found, looked

@@ -14,7 +14,7 @@ import numpy as np
 
 from ....description import Description
 from ....types import JointState, Pose
-from ..calibration import Calibration, JointCalibration, lerobot_calibration_candidates, lerobot_calibration_path
+from ..calibration import Calibration, JointCalibration, _find_lerobot_calibration, lerobot_calibration_path
 from .bus import (
     REG_GOAL_POSITION,
     REG_HOMING_OFFSET,
@@ -71,24 +71,17 @@ class FeetechDriver:
         elif isinstance(cal, Mapping):
             self.calibration, self.calibration_source = Calibration.from_json(cal), "caller"
         else:
-            looked = [Path(cal).expanduser()] if cal is not None else self.calibration_candidates(robot_id)
-            path = next((p for p in looked if p.is_file()), looked[0])
+            rtype = str(self.description.hardware.lerobot_type or self.description.name)
+            path, looked = _find_lerobot_calibration(rtype, robot_id, cal)
             self.calibration_looked = [str(p) for p in looked]
-            if path.is_file():
+            if path is not None:
                 self.calibration = Calibration.from_json(json.loads(path.read_text()))
                 self.calibration_source = str(path)
-            elif cal is not None:
-                raise FileNotFoundError(f"calibration file not found: {path}")
 
     def default_calibration_path(self, robot_id: str | None = None) -> Path:
         """Where ``calibrate()`` saves: LeRobot's ``<type>/<id>.json`` for this arm."""
         rtype = str(self.description.hardware.lerobot_type or self.description.name)
         return lerobot_calibration_path(rtype, robot_id or rtype)
-
-    def calibration_candidates(self, robot_id: str | None = None) -> list[Path]:
-        return lerobot_calibration_candidates(
-            str(self.description.hardware.lerobot_type or self.description.name), robot_id
-        )
 
     def _span(self, name: str) -> tuple[float, float, float, float, bool]:
         """(count_min, count_max, rad_lo, rad_hi, reversed) for a joint, or the uncalibrated full turn."""
