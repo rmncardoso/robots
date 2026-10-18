@@ -70,6 +70,34 @@ def test_start_stop_background_task():
     arm.stop()
 
 
+def test_two_threads_starting_one_robot_at_once_start_one_run():
+    """``start`` checked for a running task and then stored its own: two threads released together both started a
+    run on one bus (the fake Feetech bus), as two tool calls from one model turn do."""
+    import threading
+
+    from test_drivers import make_driver
+
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    together, got = threading.Barrier(2), []
+
+    def start() -> None:
+        together.wait()
+        try:
+            got.append(type(real.start(lambda o: {}, steps=20, hz=20)).__name__)
+        except RuntimeError as e:
+            got.append(str(e))
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    real.stop(timeout=5)
+    assert sorted(got) == ["Task", "robot 'so101' already has a running task; call stop() first"], got
+    real.close()
+
+
 def test_background_task_error_surfaces_in_result():
     arm = Robot("so101")
 

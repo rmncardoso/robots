@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from ..robot import Robot
 
 __all__ = ["run", "start", "Task", "RunResult"]
+_CLAIM = threading.Lock()  # start(): the check for a running task and the claim of robot._task are one step
 
 
 def run(
@@ -162,25 +163,26 @@ def start(
     on_miss: OnMiss = "skip",
 ) -> Task:
     """``run`` in a background thread (every ``run`` keyword but ``stop_event``); ``Task.stop()`` / ``.result``."""
-    if robot._task is not None and robot._task.running:
-        raise RuntimeError(f"robot {robot.id!r} already has a running task; call stop() first")
-    ctx = contextvars.copy_context()  # who commanded it (``source.from_agent``) travels to the task's thread
-    robot._task = Task(
-        lambda ev: ctx.run(
-            run,
-            robot,
-            policy,
-            instruction=instruction,
-            hz=hz,
-            seconds=seconds,
-            steps=steps,
-            stop_when=stop_when,
-            units=units,
-            realtime=realtime,
-            stop_event=ev,
-            record=record,
-            push=push,
-            on_miss=on_miss,
+    with _CLAIM:  # two threads at once (two tool calls of one model turn): one run, one refusal
+        if robot._task is not None and robot._task.running:
+            raise RuntimeError(f"robot {robot.id!r} already has a running task; call stop() first")
+        ctx = contextvars.copy_context()  # who commanded it (``source.from_agent``) travels to the task's thread
+        robot._task = task = Task(
+            lambda ev: ctx.run(
+                run,
+                robot,
+                policy,
+                instruction=instruction,
+                hz=hz,
+                seconds=seconds,
+                steps=steps,
+                stop_when=stop_when,
+                units=units,
+                realtime=realtime,
+                stop_event=ev,
+                record=record,
+                push=push,
+                on_miss=on_miss,
+            )
         )
-    )
-    return robot._task
+    return task
