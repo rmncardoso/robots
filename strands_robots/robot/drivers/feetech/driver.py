@@ -122,12 +122,12 @@ class FeetechDriver:
         return JointState(self.names, np.array(pos), np.array(vel), np.array(load))
 
     def write(self, targets: np.ndarray) -> None:
+        goals = {  # first: a goal that cannot be written (NaN, a wrong length) leaves torque as it was
+            mid: word(self.rad_to_counts(n, float(t))) for n, mid, t in zip(self.names, self.ids, targets, strict=True)
+        }
         if not self._torque_on:
             self.bus.torque(self.ids, True)
             self._torque_on = True
-        goals = {
-            mid: word(self.rad_to_counts(n, float(t))) for n, mid, t in zip(self.names, self.ids, targets, strict=True)
-        }
         self.bus.sync_write(REG_GOAL_POSITION, 2, goals)
 
     def pose(self) -> Pose | None:
