@@ -51,8 +51,13 @@ def _pair(v: Any) -> bool:
     return isinstance(v, tuple | list) and len(v) == 2
 
 
+def _gain(v: Any) -> bool:
+    g = np.asarray(v, dtype=float)
+    return bool(np.isfinite(g).all() and (g >= 0).all())
+
+
 def bind(robot: Robot, policy: PolicyLike | Callable[[Observation], Any], units: str | None) -> Bound:
-    """What every loop does before step one: the policy's units, its requirements, the size of its gains, a reset.
+    """What every loop does before step one: the policy's units, its requirements, a check of its gains, a reset.
 
     The policy's gains are only carried in the ``Bound``: ``install_gains`` puts them on after the loop's last checks.
     """
@@ -85,6 +90,8 @@ def bind(robot: Robot, policy: PolicyLike | Callable[[Observation], Any], units:
         gains = None
     elif gains is not None and any(np.size(g) != n for g in gains):  # refused here: in lock-step, before any go on
         raise ValueError(f"{robot.id}: {pol!r} carries kp/kd for {[np.size(g) for g in gains]} actuators, not {n}")
+    elif gains is not None and not all(map(_gain, gains)):  # as set_gains would, but before a partner's go on
+        raise ValueError(f"{robot.id}: {pol!r} carries kp/kd that are not all finite and >= 0: {gains!r}")
     pol.reset()
     return Bound(pol, conv, None if hz is None else float(hz), bool(realtime), gains)
 

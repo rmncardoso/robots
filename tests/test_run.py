@@ -190,6 +190,8 @@ def test_a_run_a_latched_estop_ends_at_step_zero_leaves_the_gains_it_holds_with(
 class _PDThatReads(_PD):
     """Records, at each act(), the kp its robot is under."""
 
+    gains = ([33.0] * 6, [0.0] * 6)  # kd 0, no damping: a gain, not a refusal
+
     def __init__(self, robot):
         self.robot, self.seen = robot, []
 
@@ -230,6 +232,26 @@ def test_a_run_that_starts_under_a_latched_estop_ends_at_step_zero_even_if_resum
     lock = arm.sim.run({arm: _PD()}, steps=3)[arm.id]
     assert (alone.stopped_by, alone.steps, lock.stopped_by, lock.steps) == ("estop", 0, "estop", 0)
     assert _kp(arm) == found  # without one read: 3 steps at kp 17.8, a run without its policy's gains
+
+
+@pytest.mark.parametrize(
+    ("kp", "kd"),
+    [(float("nan"), 1.0), (float("inf"), 1.0), (-50.0, 1.0), (33.0, float("nan")), (33.0, float("inf")), (33.0, -5.0)],
+    ids=["nan_kp", "inf_kp", "negative_kp", "nan_kd", "inf_kd", "negative_kd"],
+)
+def test_set_gains_refuses_a_kp_or_kd_that_is_nan_infinite_or_negative(kp, kd):
+    arm, other = Robot("so101"), Robot("so101", position=[0, 0.5, 0])
+    found = _kp(arm), _kp(other)
+    bad = ([33.0] * 5 + [kp], [1.0] * 5 + [kd])
+
+    class _Bad(_PD):
+        gains = bad
+
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        arm.set_gains(*bad)  # dev: written; a NaN or inf makes MuJoCo reset the whole shared world every step
+    with pytest.raises(ValueError, match="finite and >= 0"):
+        arm.sim.run({other: _PD(), arm: _Bad()}, steps=1)  # refused in bind, before the other's kp 33 goes on
+    assert (_kp(arm), _kp(other)) == found
 
 
 def test_the_operator_gate_passes_a_simulated_body():

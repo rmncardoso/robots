@@ -180,6 +180,8 @@ class MuJoCoBackend(Backend):
         kp, kd = np.asarray(kp, dtype=float).reshape(-1), np.asarray(kd, dtype=float).reshape(-1)
         if kp.shape != (len(ids),) or kd.shape != (len(ids),):
             raise ValueError(f"{body}: kp {kp.shape} / kd {kd.shape} for {len(ids)} actuators")
+        if not np.all(np.isfinite(np.r_[kp, kd]) & (np.r_[kp, kd] >= 0)):  # a NaN kp: MuJoCo resets the whole world
+            raise ValueError(f"{body}: kp and kd must be finite and >= 0, got kp {kp.tolist()} / kd {kd.tolist()}")
         if -1 in ids:  # an actuator without a name: index -1 is the world's last actuator, another robot's
             key = self._scene.robot(body).description.action_keys[ids.index(-1)]
             raise KeyError(f"{body}: action key {key!r} has no named actuator in the compiled world; nothing was set")
