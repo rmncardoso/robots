@@ -13,6 +13,15 @@ from .spec import tool_spec
 from .wire import content
 
 
+class _DeviceTool(PythonAgentTool):
+    """A device's tool. It is never hot-reloaded, so strands refuses a second tool of the same name in one agent
+    instead of keeping the last: a simulated and a hardware so101 are both ``robot_so101`` until one gets an ``id=``."""
+
+    @property
+    def supports_hot_reload(self) -> bool:
+        return False
+
+
 def agent_tool(device: Any, *, prefix: str = "robot") -> PythonAgentTool:
     """A strands tool whose spec is generated from ``device``'s rpcs; errors go back to the model as text."""
     spec = tool_spec(device, prefix=prefix)
@@ -26,7 +35,7 @@ def agent_tool(device: Any, *, prefix: str = "robot") -> PythonAgentTool:
             return {"toolUseId": tid, "status": "error", "content": [{"text": f"{type(exc).__name__}: {exc}"}]}
         return {"toolUseId": tid, "status": "success", "content": content(result)}  # type: ignore[typeddict-item]
 
-    return PythonAgentTool(spec["name"], spec, run)  # type: ignore[arg-type]
+    return _DeviceTool(spec["name"], spec, run)  # type: ignore[arg-type]
 
 
 def sim_tool(sim: Any) -> PythonAgentTool:

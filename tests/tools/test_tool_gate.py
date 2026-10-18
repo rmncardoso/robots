@@ -181,3 +181,27 @@ def test_an_agent_never_chooses_where_the_cameras_stream(monkeypatch, rpc):
     assert attached == [] and goal_writes(serial) == []
     assert real._task is None
     real.close()
+
+
+def test_a_simulated_and_a_hardware_so101_in_one_agent_are_refused_not_one_dropped():
+    """Both tools are named ``robot_so101``: strands kept the last one, so an act meant for the simulated arm wrote
+    goal frames to the hardware bus. A second tool of the same name is refused; with distinct ids both are kept."""
+    from strands_robots import Robot, Simulation
+
+    world = Simulation()
+    sim_arm = Robot("so101", sim=world)
+    d, serial = make_driver()
+    real = Robot("so101", driver=d, twin=False, confirm=lambda targets: True)
+    for tools in ([sim_arm.tool, real.tool], [real.tool, sim_arm.tool]):
+        with pytest.raises(ValueError, match="robot_so101"):
+            Agent(model=ScriptedModel([_act(0.5, steps=200)]), tools=tools, callback_handler=None)("move the sim arm")
+    assert goal_writes(serial) == []
+    real.close()
+    d, serial = make_driver()
+    bench = Robot("so101", id="bench", driver=d, twin=False, confirm=lambda targets: True)
+    agent = Agent(model=ScriptedModel([_act(0.5, steps=200)]), tools=[sim_arm.tool, bench.tool], callback_handler=None)
+    agent("move the sim arm")
+    assert agent.tool_names == ["robot_so101", "robot_bench"]
+    assert sim_arm.observe(images=False)["shoulder_pan"] > 0.3 and goal_writes(serial) == []
+    bench.close()
+    world.close()
