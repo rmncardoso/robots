@@ -39,7 +39,7 @@ description to `Simulation.default()`: `real.twin` is `so101_twin`, its `twin_of
 then `<lerobot_type>/<id>.json`, `<id>` being `Robot(id=)`, which never loads another arm's file (a warning names the files there); without one, `<lerobot_type>.json` or the only file in the directory.
 `Robot("so101", port=..., calibration="my_arm.json")` takes any path; a missing file is an error that
 lists where it looked. `calibrate()` walks a human at a terminal through LeRobot's procedure (middle
-pose, then a sweep) and writes the file; with no terminal it refuses before torque goes off. Without a
+pose, then a sweep) and writes over the file it loaded, else `<lerobot_type>/<id>.json`; with `save=True` (the default) it refuses to record when that file was only a guess (no id, the one file in its directory), which may be another arm's: pass `id=` or `calibration=`. With no terminal it refuses before torque goes off. Without a
 file, joints map the full turn of counts (2048 is 0 rad). `observe()` maps each joint's calibrated
 `range_min`..`range_max` onto the description's joint limits, so radians match the twin; LeRobot's own
 degrees are 360/4095 per count from the middle of that range, so the same pose can read a few degrees apart. A LeRobot policy

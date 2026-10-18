@@ -60,6 +60,7 @@ class FeetechDriver:
         self.calibration: Calibration | None = None
         self.calibration_source: str | None = None
         self.calibration_looked: list[str] = []
+        self._save_to: Path | None = self.default_calibration_path(robot_id)  # calibrate()'s file; None: no safe one
         self._load_calibration(calibration, robot_id)
         missing = [i for i in self.ids if not self.bus.ping(i)]
         if missing:
@@ -72,14 +73,14 @@ class FeetechDriver:
             self.calibration, self.calibration_source = Calibration.from_json(cal), "caller"
         else:
             rtype = str(self.description.hardware.lerobot_type or self.description.name)
-            path, looked = _find_lerobot_calibration(rtype, robot_id, cal)
+            path, self._save_to, looked = _find_lerobot_calibration(rtype, robot_id, cal)
             self.calibration_looked = [str(p) for p in looked]
             if path is not None:
                 self.calibration = Calibration.from_json(json.loads(path.read_text()))
                 self.calibration_source = str(path)
 
     def default_calibration_path(self, robot_id: str | None = None) -> Path:
-        """Where ``calibrate()`` saves: LeRobot's ``<type>/<id>.json`` for this arm."""
+        """Where ``calibrate()`` saves when no file was loaded: LeRobot's ``<type>/<id>.json`` for this arm."""
         rtype = str(self.description.hardware.lerobot_type or self.description.name)
         return lerobot_calibration_path(rtype, robot_id or rtype)
 
@@ -180,6 +181,8 @@ class FeetechDriver:
             return self.calibration
         if prompt is input and not sys.stdin.isatty():  # torque off drops the arm: only a human at the arm says go
             raise RuntimeError(f"{self.description.name}: calibrate(interactive=True) needs a human at a terminal")
+        if save and self._save_to is None:  # over or beside a guess, the save could give another arm this calibration
+            raise RuntimeError(f"with no id, {self.calibration_source} may be another arm's: pass id= or calibration=")
         self.torque(False)
         for i in self.ids:  # the firmware reports Present = Actual - Homing_Offset: read the middle unshifted
             self._write_homing(i, 0)
@@ -203,11 +206,10 @@ class FeetechDriver:
             {n: JointCalibration(i, 0, homing[i], lo[i], hi[i]) for n, i in zip(self.names, self.ids, strict=True)}
         )
         self.calibration, self.calibration_source = cal, "calibrate()"
-        if save:
-            path = self.default_calibration_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(cal.to_json(), indent=4))
-            self.calibration_source = str(path)
+        if save and self._save_to is not None:  # the file it loaded, else <type>/<id>.json: the next connect's file
+            self._save_to.parent.mkdir(parents=True, exist_ok=True)
+            self._save_to.write_text(json.dumps(cal.to_json(), indent=4))
+            self.calibration_source = str(self._save_to)
         return cal
 
     def _write_homing(self, motor_id: int, offset: int) -> None:
