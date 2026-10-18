@@ -10,6 +10,8 @@ import numpy as np
 if TYPE_CHECKING:
     from .robot import Robot
 
+_MJ_MAXVAL = 1e10  # MuJoCo's mjMAXVAL: mj_step resets the whole world when a qpos is NaN or beyond it
+
 
 def make(real: Robot, name: str, position: Any, orientation: Any, keyframe: str | None) -> Robot:
     """``real``'s twin: a simulated body of its description in ``Simulation.default()``, whose ``twin_of`` is ``real``.
@@ -39,12 +41,12 @@ def mirror(robot: Robot, targets: np.ndarray, *, step: bool = False, measured: b
     ``act`` does; ``manual_time()`` still suppresses it. ``measured=True`` (what ``observe`` passes) also
     places the twin's joints AT the measurement, so it shows the measured joints with no step.
 
-    A sample that is not finite is not mirrored (MuJoCo would reset the whole world on its next step), and a twin
-    whose world closed, or that left it, is skipped: the real body goes on without its display.
+    A sample MuJoCo calls bad (NaN, or beyond its 1e10 bound, inf included) is not mirrored: its next step would
+    reset the whole world. A twin whose world closed, or that left it, is skipped: the real body goes on without it.
     """
     twin = robot.twin
     sim = twin.sim if twin is not None else None  # read once: a world that closes sets it to None
-    if twin is None or sim is None or not np.isfinite(targets).all():
+    if twin is None or sim is None or not (np.abs(targets) <= _MJ_MAXVAL).all():  # a NaN fails the test too
         return
     with sim.lock:  # close() takes it too, so inside it the twin is either still in this world or gone
         if sim.robots.get(twin.id) is not twin:

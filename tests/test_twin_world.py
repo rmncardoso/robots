@@ -10,6 +10,7 @@ from test_drivers import FakeLowState, FakeSub, make_driver
 
 from strands_robots import Description, Robot, Simulation
 from strands_robots.robot.drivers.unitree import UnitreeDriver
+from strands_robots.types import JointState
 
 
 def _real_g1(msg):
@@ -24,6 +25,22 @@ def _touching(world, rid):
         if rid in (a, b):
             out.add(b if a == rid else a)
     return out
+
+
+class _MemoryDriver:
+    """A third-party Driver held in memory: it reads ``q``, which the test sets, and its other verbs do nothing."""
+
+    supports_position_hold, calibration, resolution = True, None, None
+
+    def __init__(self, name):
+        self.names = Description.load(name).action_keys
+        self.q = np.zeros(len(self.names))
+        for verb in ("write", "hold", "estop", "calibrate", "close"):
+            setattr(self, verb, lambda *a, **k: None)
+        self.pose, self.images, self.extras = (lambda: None), dict, dict
+
+    def read(self):
+        return JointState(self.names, self.q.copy(), np.zeros_like(self.q), np.zeros_like(self.q))
 
 
 @pytest.mark.parametrize("arm_first", [True, False], ids=["arm_first", "real_first"])
@@ -68,6 +85,22 @@ def test_a_nan_reading_never_resets_the_twins_world():
     msg.motor_state[real.body.index[3]].q = float("nan")  # one bad sample on the bus
     assert np.isnan(real.observe().joints.positions).any()  # the observation still says what was measured
     assert np.isfinite(real.twin.observe().joints.positions).all()
+    arm.act({"shoulder_pan": 0.8})
+    assert arm.sim.time > t and arm.observe()["shoulder_pan"] == pytest.approx(0.8, abs=0.02)  # dev: 0.020 s, 0.0
+    real.close()
+
+
+@pytest.mark.parametrize("value", [1e11, np.inf], ids=["1e11", "inf"])
+def test_a_huge_reading_never_resets_the_twins_world(value):
+    # kinova_gen3's joint_1 has no limit, so nothing clips its reading; MuJoCo resets at a qpos beyond 1e10 (mjMAXVAL)
+    drv = _MemoryDriver("kinova_gen3")
+    real = Robot("kinova_gen3", driver=drv, position=[0.0, -1.5, 0.0])
+    arm = Robot("so101", position=[0.0, 1.5, 0.0], id="sim_arm")  # in the twin's world, clear of the twin
+    for _ in range(50):
+        arm.act({"shoulder_pan": 0.8})
+    t = arm.sim.time
+    drv.q[0] = value  # one bad sample from the driver
+    assert real.observe()["joint_1"] == value  # the observation still says what was read
     arm.act({"shoulder_pan": 0.8})
     assert arm.sim.time > t and arm.observe()["shoulder_pan"] == pytest.approx(0.8, abs=0.02)  # dev: 0.020 s, 0.0
     real.close()
