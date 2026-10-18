@@ -1,5 +1,7 @@
-"""A hardware Robot's twin shares Simulation.default() with simulated bodies, and it never pushes them."""
+"""A hardware Robot's twin shares Simulation.default() with simulated bodies: it never pushes them, and one bad
+sample never resets their world."""
 
+import numpy as np
 import pytest
 from test_drivers import FakeLowState, FakeSub, make_driver
 
@@ -49,4 +51,20 @@ def test_a_twin_rests_on_the_floor_and_touches_nothing_else():
         sim_g1.act(sim_g1.observe().joints)
         touched |= _touching(twin.sim, twin.id)
     assert touched == {"world"} and twin.pose.position[2] > 0.05  # dev: it touches the sim G1 and itself too
+    real.close()
+
+
+def test_a_nan_reading_never_resets_the_twins_world():
+    # a NaN in qpos makes MuJoCo reset the whole world on its next step: its time and every robot in it
+    msg = FakeLowState()
+    real = _real_g1(msg)
+    arm = Robot("so101", position=[0.0, 1.5, 0.0], id="sim_arm")  # in the twin's world, clear of the twin
+    for _ in range(50):
+        arm.act({"shoulder_pan": 0.8})
+    t = arm.sim.time
+    msg.motor_state[real.body.index[3]].q = float("nan")  # one bad sample on the bus
+    assert np.isnan(real.observe().joints.positions).any()  # the observation still says what was measured
+    assert np.isfinite(real.twin.observe().joints.positions).all()
+    arm.act({"shoulder_pan": 0.8})
+    assert arm.sim.time > t and arm.observe()["shoulder_pan"] == pytest.approx(0.8, abs=0.02)  # dev: 0.020 s, 0.0
     real.close()

@@ -38,8 +38,12 @@ def mirror(robot: Robot, targets: np.ndarray, *, step: bool = False, measured: b
     ``step=True`` (what ``act`` passes) then advances the twin's world one control step, as a simulated
     ``act`` does; ``manual_time()`` still suppresses it. ``measured=True`` (what ``observe`` passes) also
     places the twin's joints AT the measurement, so it shows the real pose with no step.
+
+    A sample that is not finite is not mirrored (MuJoCo would reset the whole world on its next step).
     """
     twin = robot.twin
+    if not np.isfinite(targets).all():  # one bad sample: MuJoCo would reset the whole world on its next step
+        return
     if twin is not None and twin.sim is not None:
         with twin.sim.lock:
             if measured:
