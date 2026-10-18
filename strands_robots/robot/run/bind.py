@@ -89,17 +89,19 @@ def bind(robot: Robot, policy: PolicyLike | Callable[[Observation], Any], units:
     return Bound(pol, conv, None if hz is None else float(hz), bool(realtime), gains)
 
 
-def install_gains(bound: Mapping[Robot, Bound]) -> None:
+def install_gains(bound: Mapping[Robot, Bound]) -> list[Robot]:
     """Put each policy's gains on its body, after the loop's last checks (the rate, the step count), before step one.
 
     A latched e-stop on any of these robots ends the run at step 0, so nothing is installed: an e-stopped body keeps
-    the gains it holds with.
+    the gains it holds with. Returns those robots, and the loop ends the run on them: one read of the latches decides
+    both, so a ``resume()`` landing before step one cannot start the run without its policy's gains.
     """
-    if any(r.estopped for r in bound):
-        return
-    for robot, b in bound.items():
-        if b.gains is not None:  # the policy's PD is part of the policy, not of the world
-            robot.set_gains(*b.gains)
+    held = [r for r in bound if r.estopped]
+    if not held:
+        for robot, b in bound.items():
+            if b.gains is not None:  # the policy's PD is part of the policy, not of the world
+                robot.set_gains(*b.gains)
+    return held
 
 
 def release(bound: Bound) -> None:

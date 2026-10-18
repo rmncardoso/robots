@@ -208,6 +208,30 @@ def test_a_run_that_passes_its_checks_acts_under_its_policys_gains_from_step_one
     assert pol.seen == [[33.0] * 6] * 2  # each loop puts them on itself, after its last checks
 
 
+def test_a_run_that_starts_under_a_latched_estop_ends_at_step_zero_even_if_resumed_before_step_one(monkeypatch):
+    import importlib
+
+    from strands_robots.robot.run.bind import install_gains
+
+    def install_then_resume(bound):  # the operator's resume() lands after the gains were held back, before step one
+        held = install_gains(bound)
+        for r in bound:
+            r.resume(approved_by="test")
+        return held
+
+    for name in ("loop", "lockstep"):  # each loop module imports install_gains by name
+        module = importlib.import_module(f"strands_robots.robot.run.{name}")
+        monkeypatch.setattr(module, "install_gains", install_then_resume)
+    arm = Robot("so101")
+    found = _kp(arm)
+    arm.estop()
+    alone = arm.run(_PD(), steps=3)
+    arm.estop()
+    lock = arm.sim.run({arm: _PD()}, steps=3)[arm.id]
+    assert (alone.stopped_by, alone.steps, lock.stopped_by, lock.steps) == ("estop", 0, "estop", 0)
+    assert _kp(arm) == found  # without one read: 3 steps at kp 17.8, a run without its policy's gains
+
+
 def test_the_operator_gate_passes_a_simulated_body():
     arm = Robot("so101")
     assert arm.gate({"shoulder_pan": 0.2})[0] == pytest.approx(0.2)

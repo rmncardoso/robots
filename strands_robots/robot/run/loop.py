@@ -121,7 +121,7 @@ def _loop(
     dt = 1.0 / hz
     sim_steps = max(1, round(dt / robot.sim.physics.timestep)) if robot.sim is not None else None
     max_steps = steps if steps is not None else (int(round(seconds * hz)) if seconds is not None else None)
-    install_gains({robot: bound})  # after the rate and the step count, the loop's last checks
+    held = install_gains({robot: bound})  # after the rate and the step count, the loop's last checks
     n, stops0 = 0, robot.estop_latch.count
     why: str = "steps"
     fault: str | None = None
@@ -129,7 +129,7 @@ def _loop(
     always = robot.sim is None or stop_when is not None or ep.wants_images  # a recorded step keeps its cameras
     write = robot.confirm_act if is_agent() else robot.act  # an agent's run passes the gate on every step
     while True:
-        if robot.estopped or robot.estop_latch.count != stops0:  # an e-stop outranks a plain stop()
+        if held or robot.estopped or robot.estop_latch.count != stops0:  # an e-stop outranks a plain stop()
             why = "estop"
             break
         if stop_event is not None and stop_event.is_set():
