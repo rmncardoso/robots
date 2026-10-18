@@ -81,10 +81,7 @@ class Robot(DeviceVerbs):
             self._body = make_driver(self.description, **hw)
             self.supports_position_hold = position_hold_of(self.description, self._body)
             if twin:
-                self.twin = Robot(
-                    name, position=position, orientation=orientation, keyframe=keyframe, id=f"{self.id}_twin"
-                )
-                self.twin.twin_of = self
+                self.twin = _twin.make(self, name, position, orientation, keyframe)
         elif cameras is not None or calibration is not None:
             raise TypeError("cameras=/calibration= are hardware arguments; in a world: sim.camera(name, attach=robot)")
         else:

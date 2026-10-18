@@ -16,6 +16,7 @@ from ...scene import Scene, SceneCamera, SceneObject, SceneRobot
 ensure_gl()
 import mujoco  # noqa: E402
 
+_TWIN_BIT = 1 << 30  # a twin's own contact bit, far above the 1, 2 and 4 the registry's models use
 _GEOM = {
     "box": mujoco.mjtGeom.mjGEOM_BOX,
     "sphere": mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -67,6 +68,10 @@ def attach_robot(spec: mujoco.MjSpec, r: SceneRobot) -> None:
         rs.delete(g)  # the world owns the floor
     for light in [li for li in rs.lights if li.parent.name == "world"]:
         rs.delete(light)  # and the lighting: a robot's scene light would stack on the world's and wash it out
+    if r._twin:  # a hardware robot's twin touches the floor and nothing else, so it never pushes a body
+        for g in rs.geoms:
+            if g.contype or g.conaffinity:  # a visual-only geom stays visual-only
+                g.contype, g.conaffinity = _TWIN_BIT, 0
     frame = spec.worldbody.add_frame(pos=list(r.position), quat=list(r.orientation))
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # "attach conflict: integrator" — the world's option wins
