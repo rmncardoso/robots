@@ -36,7 +36,7 @@ description to `Simulation.default()`: `real.twin` is `so101_twin`, its `twin_of
 
 **Calibration.** `calibrate(interactive=False)` returns the LeRobot file it found under
 `$HF_LEROBOT_CALIBRATION/robots/`: `so_follower/<id>.json` (LeRobot 0.6 names every SO-10x arm so),
-then `<lerobot_type>/<id>.json`; without an id, `<lerobot_type>.json` or the only file in the directory.
+then `<lerobot_type>/<id>.json`, `<id>` being `Robot(id=)`, which never loads another arm's file (a warning names the files there); without one, `<lerobot_type>.json` or the only file in the directory.
 `Robot("so101", port=..., calibration="my_arm.json")` takes any path; a missing file is an error that
 lists where it looked. `calibrate()` walks a human at a terminal through LeRobot's procedure (middle
 pose, then a sweep) and writes the file; with no terminal it refuses before torque goes off. Without a

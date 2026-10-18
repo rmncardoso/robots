@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,9 +65,18 @@ def _find_lerobot_calibration(
 ) -> tuple[Path | None, list[Path]]:
     """``(found, looked)``: the file holding this arm's LeRobot calibration (None if none does), every file looked at.
 
-    ``path`` (``calibration=<path>``) is the only file looked at, and a missing one is an error."""
+    ``path`` (``calibration=<path>``) is the only file looked at, and a missing one is an error. An id never loads
+    another arm's file: with none of its own, a warning names the files that are there."""
     looked = [Path(path).expanduser()] if path is not None else lerobot_calibration_candidates(robot_type, robot_id)
     found = next((p for p in looked if p.is_file()), None)
-    if found is None and path is not None:
+    if found is not None:
+        return found, looked
+    if path is not None:
         raise FileNotFoundError(f"calibration file not found: {looked[0]}")
-    return found, looked
+    if robot_id is not None and (there := sorted({str(f) for p in looked for f in p.parent.glob("*.json")})):
+        warnings.warn(
+            f"{robot_type}: no calibration file for id {robot_id!r}, only {there}; joints map raw full-turn counts. "
+            "Pass calibration=<path>, or the id LeRobot calibrated this arm with",
+            stacklevel=3,
+        )
+    return None, looked
