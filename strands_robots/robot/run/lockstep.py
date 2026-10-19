@@ -96,7 +96,9 @@ def _lockstep(
                 why = "stopped"
                 break
             if pacer is not None:
-                pacer.start()
+                pacer.start()  # the wait for this tick: a stop that lands in it ends the run before any robot reads
+                if stop_event is not None and stop_event.is_set():
+                    continue  # the checks above name why
             stop = _tick(bound, stops0, instruction, gated, faults)
             if stop is not None:  # a fault, a refusal or an e-stop ended this tick
                 why, ended = stop

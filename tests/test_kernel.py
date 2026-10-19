@@ -7,6 +7,7 @@ logged with its time, and nothing waits for real.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import threading
 import time
 
@@ -36,6 +37,20 @@ class VirtualClock:
         self.t += max(0.0, seconds)
 
     advance = sleep
+
+
+class OperatorClock(VirtualClock):
+    """A ``VirtualClock`` on which someone acts while the run waits: ``during_wait`` runs once, in the next wait."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.during_wait = None
+
+    def sleep(self, seconds: float) -> None:
+        if seconds > 1e-3 and self.during_wait is not None:  # a pacing wait, not a rounding residue
+            act, self.during_wait = self.during_wait, None
+            act()
+        super().sleep(seconds)
 
 
 class CountingDriver:
@@ -452,6 +467,28 @@ def test_k3_estop_during_a_pacing_wait_writes_nothing_more():
     assert time.monotonic() - t0 < 1.5  # it did not wait out the remaining periods
 
 
+def _operated():
+    clock = OperatorClock()
+    drv = CountingDriver(clock)
+    return Robot("so101", driver=drv, twin=False, clock=clock), drv, clock
+
+
+def test_k3_a_stop_during_the_wait_between_ticks_ends_the_run_before_another_read():
+    robot, drv, clock = _operated()
+    ev, calls = threading.Event(), [0]
+
+    def pol(obs):
+        calls[0] += 1
+        if calls[0] == 2:
+            clock.during_wait = ev.set  # Task.stop() lands while the run waits for tick 3 (most of a period)
+        clock.advance(0.002)
+        return {"shoulder_pan": 0.1 * calls[0]}
+
+    res = robot.run(pol, steps=10, hz=50, stop_event=ev)
+    assert (res.stopped_by, res.steps, calls[0], len(drv.writes)) == ("stopped", 2, 2, 2)
+    assert len(drv.reads) == 1 + 2 + 1  # bind's check, two ticks, the final observation: no tick after the stop
+
+
 def test_k5_observation_t_is_capture_time_on_the_body_clock():
     robot, drv = _hw()
     drv.clock.advance(1.5)
@@ -714,6 +751,44 @@ def test_k7_lockstep_honours_a_stop_event():
 
     res = lockstep(sim, {a: pa, b: lambda o: {}}, steps=50, stop_event=ev)
     assert res["a"].stopped_by == "stopped" and res["a"].steps == 4
+    sim.close()
+
+
+class Watched:
+    """A policy that asks for a watched (real-time) world, so lock-step paces its ticks."""
+
+    realtime = True
+
+    def __init__(self, act=None) -> None:
+        self._act = act
+
+    def act(self, obs, *, instruction=None):
+        return {} if self._act is None else self._act(obs)
+
+    def reset(self) -> None: ...
+
+
+def _pace_lockstep_on(clock, monkeypatch) -> None:
+    """Paced lock-step waits on the host's monotonic clock; this test's clock instead, so nothing waits for real."""
+    monkeypatch.setattr(importlib.import_module("strands_robots.robot.run.lockstep"), "MONOTONIC", clock)
+
+
+def test_k7_a_stop_during_the_wait_of_a_paced_lockstep_steps_the_world_no_further(monkeypatch):
+    clock = OperatorClock()
+    _pace_lockstep_on(clock, monkeypatch)
+    sim, a, b = _pair()
+    ev, k = threading.Event(), [0]
+
+    def pa(obs):
+        k[0] += 1
+        if k[0] == 1:
+            clock.during_wait = ev.set  # stop() lands while lock-step waits for tick 2
+        return {}
+
+    t0 = sim.time
+    res = lockstep(sim, {a: Watched(pa), b: Watched()}, hz=10, steps=50, stop_event=ev)
+    assert (res["a"].stopped_by, res["a"].steps, k[0]) == ("stopped", 1, 1)
+    assert sim.time - t0 == pytest.approx(0.1)  # one tick of world time, not two
     sim.close()
 
 

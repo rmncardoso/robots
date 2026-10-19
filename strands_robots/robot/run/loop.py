@@ -156,7 +156,9 @@ def _loop(
         if max_steps is not None and n >= max_steps:
             break
         if pacer is not None:
-            pacer.start()
+            pacer.start()  # the wait for this tick: a stop that lands in it ends the run before the tick reads
+            if stop_event is not None and stop_event.is_set():
+                continue  # the checks above name why
         step = tick(
             robot,
             bound,
