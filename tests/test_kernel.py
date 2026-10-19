@@ -162,6 +162,14 @@ def test_k1_command_never_puts_a_nan_or_an_out_of_limit_target_into_a_world():
     sim.close()
 
 
+@pytest.mark.parametrize("n", [5, 7])
+def test_k1_coerce_refuses_a_measured_vector_that_is_not_one_value_per_action_key(n):
+    robot, drv = _hw()
+    with pytest.raises(ValueError, match=f"measured has {n} values; so101 has 6 action keys"):
+        robot.coerce({"gripper": 0.2}, measured=np.zeros(n))  # 5 used to raise IndexError, 7 to return 7 targets
+    assert drv.reads == [] and drv.writes == []
+
+
 def test_k3_no_catch_up_burst_after_a_stall():
     robot, drv = _hw()
     res = robot.run(_stalls(drv, 5, 0.3, base=0.002), steps=20, hz=50)  # call 5 stalls 15 periods
