@@ -113,3 +113,9 @@ def test_a_callers_norm_never_overrides_the_modes_the_dataset_names(recorded):
     with pytest.raises(ValueError, match="says the joints are in"):
         Policy(spec, norm={"*": "range_m100_100", "gripper": "range_0_100"})
     assert Policy(spec, norm=DEG).units == "lerobot"  # agreeing is fine; so is saying nothing
+
+
+def test_a_norm_key_that_names_no_recorded_joint_is_refused(recorded):
+    # a misspelt joint would take the "*" mode: the gripper's 50 % would be written as 50 degrees
+    with pytest.raises(ValueError, match="norm= names griper, which the dataset does not record"):
+        Policy(recorded("bare", None), norm={"*": "degrees", "griper": "range_0_100"})

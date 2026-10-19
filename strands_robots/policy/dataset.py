@@ -40,6 +40,12 @@ class ReplayPolicy(SequencePolicy):
                 "passed; drop units= (the dataset knows) or replay a dataset recorded in those units"
             )
         given = dict(norm) if norm else None  # an empty norm names no mode
+        self.names = [n.removesuffix(".pos") for n in info["features"]["action"]["names"]]
+        if given is not None and (stray := sorted(set(given) - {"*", *self.names})):
+            raise ValueError(  # a misspelt joint would take the "*" mode on a real arm
+                f"{root}: norm= names {', '.join(stray)}, which the dataset does not record "
+                f"(it recorded {', '.join(self.names)})"
+            )
         units = said.get("units", units or ("lerobot" if given else None))
         if units is None:
             raise ValueError(
@@ -56,7 +62,6 @@ class ReplayPolicy(SequencePolicy):
             )
         self.norm: dict[str, str] | None = modes or given  # joint (or "*") -> LeRobot norm mode; None: unknown
         self.units, self.hz, self.root, self.episode = units, float(info["fps"]), root, episode
-        self.names = [n.removesuffix(".pos") for n in info["features"]["action"]["names"]]
         self.recorded = _episode_actions(root, episode)
         super().__init__(list(self.recorded))
 
