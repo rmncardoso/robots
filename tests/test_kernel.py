@@ -303,6 +303,12 @@ def test_k5_a_world_robot_reads_world_time_and_refuses_a_clock():
     sim.close()
 
 
+@pytest.mark.parametrize("clock", [time.monotonic, lambda: 1.0, type(MONOTONIC)], ids=["function", "lambda", "class"])
+def test_k5_a_hardware_robot_refuses_a_clock_that_is_not_a_clock_instance_and_says_what_to_pass(clock):
+    with pytest.raises(TypeError, match=r"clock= must be a Clock instance.*now\(\).*sleep\(seconds\).*leave clock="):
+        Robot("so101", driver=CountingDriver(), twin=False, clock=clock)  # taken before: act() wrote, then failed
+
+
 def test_a_faulted_hardware_run_still_puts_the_body_in_its_on_disconnect_state():
     robot, drv = _hw()
     k = [0]
