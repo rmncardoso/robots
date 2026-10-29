@@ -25,7 +25,6 @@ from .bus import (
     REG_PRESENT_POSITION,
     RESOLUTION,
     FeetechBus,
-    ProtocolError,
     decode_sm,
     encode_sm,
     word,
@@ -129,19 +128,10 @@ class FeetechDriver:
         f = min(1.0, max(0.0, 1.0 - f if rev else f))
         return int(round(cmin + f * (cmax - cmin)))
 
-    def _present(self) -> dict[int, bytes]:
-        """Present position, velocity and load of every servo; a garbled or missing reply is asked for again."""
-        for _ in range(self.num_read_retries):
-            try:
-                return self.bus.sync_read(REG_PRESENT_POSITION, 6, self.ids)
-            except ProtocolError:
-                continue
-        return self.bus.sync_read(REG_PRESENT_POSITION, 6, self.ids)
-
     # Body
 
     def read(self) -> JointState:
-        raw = self._present()
+        raw = self.bus.sync_read(REG_PRESENT_POSITION, 6, self.ids, retries=self.num_read_retries)
         pos, vel, load = [], [], []
         for name, mid in zip(self.names, self.ids, strict=True):
             r = raw[mid]
