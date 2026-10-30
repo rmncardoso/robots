@@ -7,7 +7,7 @@ import threading
 import time as _time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -45,7 +45,7 @@ def run(
     stop_event: threading.Event | None = None,
     record: str | Path | None = None,
     push: bool = False,
-    on_miss: OnMiss = "skip",
+    on_miss: Literal["skip", "fault"] = "skip",  # spelled out: the tool spec reads this text, not the OnMiss alias
 ) -> RunResult:
     """observe -> policy -> act at ``hz`` (default: the policy's ``hz``, else 30) until a limit or ``stop()``.
 
@@ -207,7 +207,7 @@ def start(
     realtime: bool = False,
     record: str | Path | None = None,
     push: bool = False,
-    on_miss: OnMiss = "skip",
+    on_miss: Literal["skip", "fault"] = "skip",
 ) -> Task:
     """``run`` in a background thread (every ``run`` keyword but ``stop_event``); ``Task.stop()`` / ``.result``."""
     with _CLAIM:  # two threads at once (two tool calls of one model turn): one run, one refusal

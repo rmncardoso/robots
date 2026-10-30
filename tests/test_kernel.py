@@ -425,6 +425,116 @@ def test_k7_a_start_pose_ramps_each_robot_before_the_lockstep_loop():
     sim.close()
 
 
+def _pan_target(sim, robot) -> float:
+    """The shoulder_pan target the world applies to ``robot`` on its next step."""
+    return float(sim.backend.data.ctrl[sim.backend._index[robot.id].actuator_ids[0]])
+
+
+def _b_decides_first(k):
+    def pb(obs):  # tick 1: 0.1, tick 2: 0.2, tick 3: 0.3
+        k["b"] += 1
+        return {"shoulder_pan": 0.1 * k["b"]}
+
+    return pb
+
+
+def test_k7_a_robot_listed_before_the_one_that_faults_writes_nothing_that_tick():
+    sim, a, b = _pair()
+    k = {"a": 0, "b": 0}
+
+    def pa(obs):
+        k["a"] += 1
+        return {"shoulder_pan": float("nan")} if k["a"] == 3 else {}
+
+    res = sim.run({b: _b_decides_first(k), a: pa}, steps=10)  # b has decided tick 3 when a refuses it
+    assert (res["b"].stopped_by, res["b"].steps, k) == ("fault", 2, {"a": 3, "b": 3})
+    assert _pan_target(sim, b) == pytest.approx(0.2)  # tick 2's target: no later step of the world applies 0.3
+    sim.close()
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["pressed", "pressed-and-resumed"])
+def test_k7_an_estop_while_the_robots_decide_leaves_that_tick_unwritten(resumed):
+    sim, a, b = _pair()
+    k = {"a": 0, "b": 0}
+
+    def pa(obs):
+        k["a"] += 1
+        if k["a"] == 3:  # the operator stops a while it decides tick 3, after b decided it
+            a.estop()
+            if resumed:
+                a.resume(approved_by="op")
+        return {}
+
+    res = sim.run({b: _b_decides_first(k), a: pa}, steps=10)
+    assert (res["b"].stopped_by, res["b"].steps, res["b"].fault) == ("estop", 2, "e-stop engaged on a")
+    assert _pan_target(sim, b) == pytest.approx(0.2)
+    sim.close()
+
+
+def test_k7_an_estop_on_a_robot_yet_to_decide_ends_the_tick_before_it_decides():
+    sim, a, b = _pair()
+    k = {"a": 0, "b": 0}
+
+    def pa(obs):  # a decides first
+        k["a"] += 1
+        if k["a"] == 3:
+            b.estop()  # the operator stops b while a decides tick 3
+        return {"shoulder_pan": 0.1 * k["a"]}
+
+    def pb(obs):
+        k["b"] += 1
+        return {}
+
+    res = sim.run({a: pa, b: pb}, steps=10)
+    assert (res["a"].stopped_by, res["a"].fault, k) == ("estop", "e-stop engaged on b", {"a": 3, "b": 2})
+    assert _pan_target(sim, a) == pytest.approx(0.2)
+    sim.close()
+
+
+@pytest.mark.parametrize("confirmed", [False, True], ids=["agent", "dashboard"])
+def test_k7_a_lockstep_tick_the_gate_refuses_for_one_robot_is_written_for_none(confirmed):
+    """An agent's run ends as a fault at the refused step (K6), a dashboard's (one operator yes) raises it: either
+    way the robot listed before the refused one has not written that tick."""
+    from contextlib import nullcontext
+
+    from strands_robots.robot.run.source import from_agent
+    from strands_robots.robot.safety import RequestRefused
+
+    sim, a, b = _pair()
+    k = {"a": 0, "b": 0}
+
+    def third_refused(robot, request):
+        k["a"] += 1
+        if k["a"] == 3:
+            raise RequestRefused(f"{robot.id}: refused at tick 3")
+
+    a.validators.append(third_refused)  # every gated write of a passes it, after b decided the same tick
+    raised = pytest.raises(RequestRefused, match="tick 3") if confirmed else nullcontext()
+    with from_agent(confirmed=confirmed), raised:
+        res = sim.run({b: _b_decides_first(k), a: lambda o: {}}, steps=10)
+    if not confirmed:
+        assert (res["a"].stopped_by, res["a"].steps, res["a"].fault) == ("fault", 2, "a: refused at tick 3")
+    assert _pan_target(sim, b) == pytest.approx(0.2)
+    sim.close()
+
+
+def test_k7_a_robot_that_holds_in_lockstep_writes_nothing_and_the_world_still_steps_once_a_tick():
+    """In lock-step a hold writes nothing and adds no step of its own: the world steps once a tick for every robot."""
+    sim, a, b = _pair()
+    k = {"b": 0}
+
+    def pb(obs):  # ticks 2 to 4 hold: tick 1's target stays in the world
+        k["b"] += 1
+        return None if 2 <= k["b"] <= 4 else {"shoulder_pan": 0.1 * k["b"]}
+
+    t0 = sim.time
+    res = sim.run({a: lambda o: {"shoulder_pan": 0.3}, b: pb}, steps=4, hz=50)
+    assert (res["b"].stopped_by, res["b"].steps, k["b"]) == ("steps", 4, 4)
+    assert sim.time - t0 == pytest.approx(4 / 50, abs=1e-6)
+    assert (_pan_target(sim, a), _pan_target(sim, b)) == pytest.approx((0.3, 0.1))
+    sim.close()
+
+
 def test_k7_lockstep_honours_a_stop_event():
     sim, a, b = _pair()
     ev = threading.Event()
