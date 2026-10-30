@@ -122,6 +122,23 @@ def test_resume_refuses_a_camera_the_dataset_lacks_before_the_robot_moves(tmp_pa
     assert arm.observe(images=False)["shoulder_pan"] == before
 
 
+def _files(root):
+    return {p.relative_to(root): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_runs_that_end_before_their_first_frame_leave_a_resumed_dataset_as_it_was(tmp_path):
+    """The dataset opens before tick 1, so a run that ends before its first frame opens it too: nothing changes."""
+    target, arm = tmp_path / "ds", _arm()
+    arm.run(SequencePolicy([{"shoulder_pan": 0.1}]), hz=20, steps=5, record=target)
+    before = _files(target)
+    arm.estop()
+    assert arm.run(SequencePolicy([{"shoulder_pan": 0.2}]), hz=20, steps=5, record=target).recorded is None
+    arm.resume(approved_by="op")
+    r = arm.run(SequencePolicy([{"shoulder_pan": 0.3}]), hz=20, steps=5, record=target, stop_when=lambda o: True)
+    assert r.recorded is None and _files(target) == before
+    arm.sim.close()
+
+
 def test_non_integer_hz_is_refused_before_step_one(tmp_path):
     with pytest.raises(ValueError, match="integer fps"):
         _arm().run(SequencePolicy([{"shoulder_pan": 0.1}]), hz=12.5, steps=2, record=tmp_path / "x")

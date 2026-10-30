@@ -133,7 +133,7 @@ def test_a_server_drives_the_arm_and_matches_the_local_checkpoint(
         assert _inside_limits(arm, r.final.joints.positions)
         # wall-clock pacing: a late wake can make a miss nearly as late as the host overslept, more than a period on
         # a loaded host, so lateness is pinned on a virtual clock (tests/test_kernel.py k3/k5), not here
-        assert p.execution == execution, (r.deadline_misses, r.worst_late_s)
+        assert p.execution == execution
         if coalesced:
             assert r.deadline_misses >= 1
         if execution == "sequential":  # the startup wait and every refill are holds, not misses
