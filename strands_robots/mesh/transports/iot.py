@@ -26,6 +26,8 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
+from ..iot.direct import reply_ok, rpc_mode
+from . import pkcs11
 from .base import OnAlive, OnQuery, OnSample, RemoteError, Unsubscribe
 from .iot_link import AwsLink, FakeIotBroker, FakeLink, Link
 
@@ -42,6 +44,11 @@ def _filter(key_expr: str) -> str:
 def _link(url: str) -> Link:
     u = urlparse(url)
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    if "pin-value" in q:  # a split or a bare pkcs11: key with its PIN: refused before the URL is kept anywhere
+        raise ValueError(pkcs11.PIN_REFUSED)
+    pkcs11.refuse_pin(q.get("key") or "")
+    if (q.get("key") or "").startswith("pkcs11:") and {"module-path", "module-name"} & q.keys():
+        raise ValueError("percent-encode a pkcs11: key= on an iot:// link (quote(key, safe='')): its '&' split it")
     client = q.get("client") or f"strands-{uuid.uuid4().hex[:12]}"
     if u.netloc == "fake":
         return FakeLink(FakeIotBroker.named(q.get("broker", "default")), client)
@@ -59,6 +66,7 @@ class IotTransport:
         self.url = url
         self.ttl = presence_ttl
         self.link = link or _link(url)
+        self.rpc = rpc_mode({k: v[0] for k, v in parse_qs(urlparse(url).query).items()})
         self._pending: dict[str, Future[bytes]] = {}
         self._clients: dict[str, str] = {}  # presence key's device id -> the client holding it
         self._replies: set[str] = set()
@@ -81,6 +89,8 @@ class IotTransport:
     def queryable(self, key_expr: str, handler: OnQuery, *, inline: bool = False) -> Unsubscribe:
         def answer(key: str, raw: bytes) -> None:
             req = json.loads(raw)
+            if not reply_ok(str(req.get("reply", "")), key.split("/")[1]):
+                return  # a reply address outside this tenant's @reply keys: never answered
             try:
                 out = {"id": req["id"], "ok": handler(key, req["body"].encode()).decode()}
             except Exception as exc:
@@ -111,6 +121,9 @@ class IotTransport:
         self._pending[rid] = fut
         body = json.dumps({"id": rid, "reply": reply, "body": payload.decode()}).encode()
         try:
+            if self.rpc == "mqtt":  # request/response: the device's silence is the offline signal, presence says why
+                self.link.publish(key, body, response_topic=reply, correlation_data=rid)
+                return [fut.result(timeout)]
             status = self.link.send_direct(client, key, body, timeout=timeout)
             if status == 404:
                 raise Offline(f"{did}: its client {client!r} is not connected (404); nothing was queued")

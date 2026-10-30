@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from os import PathLike
 from typing import TYPE_CHECKING, Any
 
 from .bind import Bound
 from .result import RunResult
+from .source import RunPlan
 
 if TYPE_CHECKING:
     from ..robot import Robot
@@ -16,6 +18,28 @@ def emit(robot: Robot, event: str, payload: dict[str, Any]) -> None:
     events = getattr(robot, "events", None)
     if events is not None:
         events.emit(event, {"device_id": robot.id, **payload})
+
+
+def label(policy: object) -> str:
+    """The policy as the operator reads it: a spec as written, a function or a registered handle by its name."""
+    from ...policy.callable import CallablePolicy
+
+    if isinstance(policy, CallablePolicy):
+        return policy.name
+    return str(policy) if isinstance(policy, str | PathLike) else str(getattr(policy, "__name__", None) or repr(policy))
+
+
+def approve_run(robot: Robot, plan: RunPlan) -> None:
+    """The operator's one yes for an agent's run on a real body; ``RequestRefused`` names the fix otherwise (K6)."""
+    from ..safety import RequestRefused
+
+    if robot.approve is None:
+        raise RequestRefused(
+            f"{robot.id} is a real robot and this run came from an agent: pass approve=<callable(RunPlan) -> bool> "
+            "to Robot(...) so an operator can allow it"
+        )
+    if not robot.approve(plan):
+        raise RequestRefused(f"{robot.id}: the operator refused the run {plan}")
 
 
 def announce(robot: Robot, result: RunResult) -> None:

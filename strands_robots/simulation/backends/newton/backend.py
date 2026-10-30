@@ -15,12 +15,16 @@ import numpy as np
 
 from ....types import JointState, Pose
 from ...physics import Contact, Physics
-from ...scene import Scene
+from ...scene import Scene, SceneCamera
 from ..mujoco import MuJoCoBackend
 from .stepper import NewtonStepper
 
 
 class NewtonBackend(MuJoCoBackend):
+    @property
+    def deterministic(self) -> bool:  # type: ignore[override]
+        return self.num_envs == 1  # one GPU world replays bit-exactly; a batch of envs does not
+
     def __init__(self, **cfg: Any) -> None:
         super().__init__(**cfg)
         self._stepper = NewtonStepper(self.device, self.num_envs)
@@ -73,6 +77,16 @@ class NewtonBackend(MuJoCoBackend):
             self._fresh()
             return super().body_pose(body)
 
+    def reach(self, body: str) -> dict[str, Any]:
+        with self._mirror:
+            self._fresh()
+            return super().reach(body)
+
+    def move_camera(self, old: SceneCamera, cam: SceneCamera) -> bool:
+        with self._mirror:
+            self._fresh()
+            return super().move_camera(old, cam)
+
     def set_gains(self, body: str, kp: np.ndarray, kd: np.ndarray) -> None:
         with self._mirror:
             self._fresh()
@@ -95,6 +109,11 @@ class NewtonBackend(MuJoCoBackend):
         with self._mirror:
             self._fresh()
             return super().render(camera)
+
+    def outline(self) -> np.ndarray | None:
+        with self._mirror:
+            self._fresh()
+            return super().outline()
 
     def contacts(self) -> list[Contact]:
         with self._mirror:

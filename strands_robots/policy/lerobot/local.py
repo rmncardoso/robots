@@ -12,6 +12,7 @@ from ...types import Observation
 from ...units import Units
 from ..requirements import Requirements
 from .contract import Contract, lerobot, server_config
+from .quiet import quiet_load
 
 if TYPE_CHECKING:
     from ...description import Description
@@ -22,7 +23,8 @@ class LeRobotPolicy:
 
     ``Policy("lerobot/smolvla_base")`` does that wrapping. The checkpoint, its saved processors and its
     validation come from ``lerobot.remote_inference.deployment.load_deployment``, so a local run and a
-    served run of the same checkpoint are the same computation.
+    served run of the same checkpoint are the same computation. A checkpoint does not record its norm
+    mode, so on a real body ``norm=`` or ``semantics=`` must say it; a simulated body takes the registry's.
     """
 
     def __init__(
@@ -49,13 +51,20 @@ class LeRobotPolicy:
     def attach(self, robot: Any) -> None:
         if self.contract is not None and self.contract.description is robot.description:
             return
+        if robot.is_real and not self._kw["semantics"] and not self._kw["norm"]:
+            raise ValueError(  # a checkpoint stores no norm mode: on a real body the registry's default is a guess
+                f"{self!r} does not say which LeRobot norm mode its data was recorded in, and {robot.id} is a real "
+                "body: pass norm={'*': 'degrees' | 'range_m100_100', ...} (LeRobot's SO arms default to degrees "
+                "since 0.4.4, range_m100_100 before) or semantics= (see units/semantics.json)"
+            )
         lerobot()
         from lerobot.remote_inference.deployment import load_deployment
 
         cfg = server_config(robot.description, self.checkpoint, **self._kw)
         self.contract = Contract(robot.description, tuple(cfg.features), cfg.action_feature, cfg.semantics)
         self.contract.check()
-        self._runner, self.identity = load_deployment(cfg)
+        with quiet_load():
+            self._runner, self.identity = load_deployment(cfg)
 
     def _need(self) -> Contract:
         if self.contract is None:
