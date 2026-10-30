@@ -14,7 +14,10 @@ import numpy as np
 
 from ....description import Description
 from ....types import JointState, Pose
-from ..calibration import Calibration, JointCalibration, _find_lerobot_calibration, lerobot_calibration_path
+from .. import calibration as calib
+from ..calibration import Calibration, JointCalibration, lerobot_calibration_path
+from ..cameras import Cameras
+from ..slew import MAX_SPEED, Slew
 from .bus import (
     REG_GOAL_POSITION,
     REG_HOMING_OFFSET,
@@ -39,14 +42,18 @@ class FeetechDriver:
         description: Description,
         *,
         port: str | None,
-        cameras: Mapping[str, int | str] | None = None,
+        cameras: Mapping[str, Any] | None = None,
         baud: int = 1_000_000,
         calibration: str | Path | Mapping[str, Any] | Calibration | None = None,
         robot_id: str | None = None,
         bus: FeetechBus | None = None,
+        max_speed: float | None = MAX_SPEED,
     ) -> None:
+        """``max_speed`` (rad/s) caps how far one write may move a joint from the last goal (``slew.Slew``);
+        ``None`` writes every goal as given."""
         if port is None and bus is None:
             raise ValueError("FeetechDriver needs port= (e.g. /dev/tty.usbmodem...)")
+        self.slew = Slew(max_speed)
         self.description = description
         self.names = description.action_keys
         # motor ids: the registry labels model joints "1".."6" -> the label; fall back to 1..n in action order
@@ -54,14 +61,14 @@ class FeetechDriver:
             int(description.unlabel(n)) if description.unlabel(n).isdigit() else i + 1 for i, n in enumerate(self.names)
         ]
         self.bus = bus or FeetechBus(port or "", baud=baud)
-        self.cameras_cfg = dict(cameras or {})
-        self._cams: dict[str, Any] = {}
+        self.cameras = Cameras(cameras)
         self._torque_on = False
         self.calibration: Calibration | None = None
         self.calibration_source: str | None = None
         self.calibration_looked: list[str] = []
         self._save_to: Path | None = self.default_calibration_path(robot_id)  # calibrate()'s file; None: no safe one
         self._load_calibration(calibration, robot_id)
+        calib.warn_if_missing(self.calibration, f"{description.name} on {self.bus.port}", self.calibration_looked)
         missing = [i for i in self.ids if not self.bus.ping(i)]
         if missing:
             raise ConnectionError(f"{description.name} on {self.bus.port}: no reply from servo id(s) {missing}")
@@ -73,7 +80,7 @@ class FeetechDriver:
             self.calibration, self.calibration_source = Calibration.from_json(cal), "caller"
         else:
             rtype = str(self.description.hardware.lerobot_type or self.description.name)
-            path, self._save_to, looked = _find_lerobot_calibration(rtype, robot_id, cal)
+            path, self._save_to, looked = calib._find_lerobot_calibration(rtype, robot_id, cal)
             self.calibration_looked = [str(p) for p in looked]
             if path is not None:
                 self.calibration = Calibration.from_json(json.loads(path.read_text()))
@@ -119,10 +126,16 @@ class FeetechDriver:
             cmin, cmax, lo, hi, rev = self._span(name)
             vel.append(decode_sm(r[2:4], 15) * (hi - lo) / (cmax - cmin) * (-1 if rev else 1))
             load.append(decode_sm(r[4:6], 10) / 1000.0)  # fraction of max torque, signed
+        self.slew.seen(np.array(pos))
         return JointState(self.names, np.array(pos), np.array(vel), np.array(load))
 
     def write(self, targets: np.ndarray) -> None:
-        goals = {  # first: a goal that cannot be written (NaN, a wrong length) leaves torque as it was
+        # Every goal is computed (and a non-finite target refused) BEFORE torque comes on, so a refused
+        # write leaves a limp arm limp instead of stiffening it against a stale Goal_Position.
+        if not np.all(np.isfinite(np.asarray(targets, dtype=float))):
+            raise ValueError(f"{self.description.name}: non-finite goal {np.asarray(targets).tolist()}")
+        targets = self.slew.apply(targets, self.read)
+        goals = {
             mid: word(self.rad_to_counts(n, float(t))) for n, mid, t in zip(self.names, self.ids, targets, strict=True)
         }
         if not self._torque_on:
@@ -134,27 +147,25 @@ class FeetechDriver:
         return None
 
     def images(self) -> Mapping[str, np.ndarray]:
-        out: dict[str, np.ndarray] = {}
-        for name, src in self.cameras_cfg.items():
-            cap = self._cams.get(name)
-            if cap is None:
-                try:
-                    import cv2
-                except ImportError as exc:
-                    raise ImportError("cameras need opencv: pip install opencv-python") from exc
-                cap = cv2.VideoCapture(src)
-                self._cams[name] = cap
-            ok, bgr = cap.read()
-            if ok:
-                out[name] = np.ascontiguousarray(bgr[:, :, ::-1])
-        return out
+        return self.cameras.read()
 
     def extras(self) -> Mapping[str, Any]:
-        return {"torque": self._torque_on, "calibration": self.calibration_source or "none (raw full-turn counts)"}
+        return {
+            "torque": self._torque_on,
+            "calibration": self.calibration_source or "none (raw full-turn counts)",
+            "max_speed": self.slew.max_speed,
+            "slewed": self.slew.count,
+        }
 
     def hold(self) -> None:
-        """Goal_Position := Present_Position, under torque (gravity-loaded joints keep their pose)."""
-        self.write(np.array(self.read().positions, dtype=float))
+        """Goal_Position := Present_Position, under torque (gravity-loaded joints keep their pose).
+
+        Written as measured, never through the speed cap: a joint that is blocked, stalled or lagging under load
+        is exactly the one an e-stop is for, and a capped hold would leave its goal out past the present
+        position with the servo still pushing toward it. The cap re-anchors on the held pose."""
+        present = np.array(self.read().positions, dtype=float)
+        self.slew.reset(present)
+        self.write(present)
 
     def estop(self) -> None:
         """Fastest stop that does not drop the arm: a hold if torque is on; a limp arm is left limp."""
@@ -164,6 +175,8 @@ class FeetechDriver:
     def torque(self, on: bool) -> None:
         self.bus.torque(self.ids, on)
         self._torque_on = on
+        if not on:
+            self.slew.release()
 
     def calibrate(
         self, *, interactive: bool = True, save: bool = True, prompt: Any = input, sweep_seconds: float = 20.0
@@ -232,8 +245,6 @@ class FeetechDriver:
 
     def close(self) -> None:
         if self._torque_on:
-            self.bus.torque(self.ids, False)
-            self._torque_on = False
-        for cap in self._cams.values():
-            cap.release()
+            self.torque(False)
+        self.cameras.close()
         self.bus.close()

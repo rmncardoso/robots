@@ -86,3 +86,14 @@ def _find_lerobot_calibration(
             stacklevel=3,
         )
     return None, lerobot_calibration_path(robot_type, robot_id or robot_type), looked
+
+
+def warn_if_missing(found: Calibration | None, who: str, looked: list[str]) -> None:
+    """Warn when a driver found no calibration: its joints then read as a raw full turn."""
+    if found is None:
+        warnings.warn(
+            f"{who}: no calibration found (looked at {', '.join(looked) or 'nothing'}); joints read as a full "
+            "uncalibrated turn and LeRobot degrees will not match the arm's own. Pass calibration=, robot_id= "
+            "(Robot(id=)) or run calibrate().",
+            stacklevel=4,
+        )
