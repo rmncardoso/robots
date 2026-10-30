@@ -331,6 +331,18 @@ def test_k7_a_fault_on_one_robot_stops_both_and_the_other_never_acts_that_tick()
     sim.close()
 
 
+def test_k7_a_start_pose_ramps_each_robot_before_the_lockstep_loop():
+    """Simulation.run takes a start_pose policy to its pose before step one, as Robot.run does; a robot whose policy
+    names no start_pose is left where it is."""
+    sim, a, b = _pair()
+    res = sim.run({a: _FromReady(), b: lambda o: {}}, steps=1)
+    assert res["a"].steps == res["b"].steps == 1
+    q = a.observe().joints.positions
+    assert q[0] == pytest.approx(0.6, abs=0.1) and q[2] == pytest.approx(-0.4, abs=0.1)
+    assert abs(b.observe().joints.positions[0]) < 0.1  # b named no start_pose: not moved
+    sim.close()
+
+
 def test_k7_lockstep_honours_a_stop_event():
     sim, a, b = _pair()
     ev = threading.Event()
@@ -345,3 +357,131 @@ def test_k7_lockstep_honours_a_stop_event():
     res = lockstep(sim, {a: pa, b: lambda o: {}}, steps=50, stop_event=ev)
     assert res["a"].stopped_by == "stopped" and res["a"].steps == 4
     sim.close()
+
+
+def test_k3_a_policy_that_returns_none_holds_without_a_write_or_a_miss():
+    """A remote policy waiting for its chunk returns None: the body keeps its last target, the tick counts as a hold,
+    the pacer's grid moves on and nothing is booked as a deadline miss."""
+    robot, drv = _hw()
+    calls = [0]
+
+    def pol(obs):
+        calls[0] += 1
+        return None if 3 <= calls[0] <= 7 else {"shoulder_pan": 0.1 * calls[0]}  # five ticks of waiting
+
+    res = robot.run(pol, steps=10, hz=50)
+    assert (res.steps, res.holds, res.deadline_misses) == (10, 5, 0)
+    assert len(drv.writes) == 5 and len(drv.reads) == 1 + 10 + 1  # one read per tick, held or not
+    gaps = np.diff([t for t, _ in drv.writes])
+    assert gaps[1] == pytest.approx(6 / 50)  # the five held periods sit between write 2 and write 3
+    assert res.held_seconds == pytest.approx(5 / 50) and res.seconds == pytest.approx(10 / 50)
+    assert res.hz_achieved == pytest.approx(50.0)
+
+
+def test_k3_a_hold_on_the_pacer_moves_the_grid_one_period_without_a_miss():
+    clock, dt = VirtualClock(), 1 / 50
+    p = Pacer(dt, now=clock.now, sleep=clock.sleep)
+    p.start()
+    p.before_write()
+    p.after_write()
+    for _ in range(3):  # three held ticks: each starts at its grid point and writes nothing
+        p.start()
+        clock.advance(0.004)
+        p.hold()
+    p.start()
+    assert clock.now() == pytest.approx(1000.0 + 4 * dt)
+    p.before_write()
+    p.after_write()
+    assert p.misses == 0 and p.span() == pytest.approx(5 * dt)
+
+
+def test_k3_a_slow_hold_does_not_fault_a_run_that_faults_on_a_miss():
+    """``on_miss="fault"`` is how a real run refuses to command a body late. A sequential remote policy holds for a
+    whole WAN round trip (here: ticks longer than the period), and that wait must not end the run."""
+    robot, drv = _hw()
+    calls = [0]
+
+    def pol(obs):
+        calls[0] += 1
+        if 3 <= calls[0] <= 7:
+            time.sleep(0.03)  # the chunk is in flight: this tick outlasts its 20 ms period
+            return None
+        return {"shoulder_pan": 0.1 * calls[0]}
+
+    res = robot.run(pol, steps=10, hz=50, on_miss="fault")
+    assert (res.steps, res.holds, res.stopped_by) == (10, 5, "steps")
+    assert res.deadline_misses == 0 and res.fault is None
+
+
+def test_k3_a_hold_longer_than_a_period_is_still_not_a_miss():
+    """The chunk a sequential run waits for can take longer than one tick to land (a WAN round trip is 20+ periods).
+
+    The waiting is deliberate, so the write that ends it is not late: a hold re-phases the grid onto now rather
+    than leaving the next tick's grid point in the past, which would book the reply as the run's own lateness.
+    """
+    clock, dt = VirtualClock(), 1 / 30
+    p = Pacer(dt, now=clock.now, sleep=clock.sleep)
+    p.start()
+    p.before_write()
+    p.after_write()
+    p.start()
+    clock.advance(2.5 * dt)  # the reply lands mid-tick, two and a half periods after this hold began
+    p.hold()
+    p.start()
+    p.before_write()
+    p.after_write()
+    assert p.misses == 0 and p.worst_late == 0.0
+
+
+def test_k3_a_sim_hold_still_advances_the_world():
+    sim = Simulation()
+    arm = Robot("so101", sim=sim)
+    t0 = sim.time
+    res = arm.run(lambda obs: None, steps=10, hz=50)
+    assert (res.steps, res.holds) == (10, 10) and sim.time - t0 == pytest.approx(10 / 50, abs=1e-6)
+
+
+class _FromReady:
+    """A policy that names where its episodes begin (radians here: no units declared) and then holds there."""
+
+    start_pose = {"shoulder_pan": 0.6, "elbow_flex": -0.4}
+    start_seconds = 1.0
+
+    def act(self, obs, *, instruction=None):
+        return obs.joints.positions
+
+    def reset(self):
+        pass
+
+
+def test_a_policy_with_a_start_pose_is_taken_there_before_step_one():
+    robot, drv = _hw()
+    res = robot.run(_FromReady(), steps=5, hz=50)
+    ramp, steps = drv.writes[:-5], drv.writes[-5:]
+    assert res.steps == 5 and len(ramp) == 30  # 1 s at reach's 30 Hz, then the five policy steps
+    assert ramp[0][1][0] < 0.6 < ramp[-1][1][0] + 1e-9 and ramp[-1][1][0] == pytest.approx(0.6)  # smoothstep ends AT it
+    assert ramp[-1][1][2] == pytest.approx(-0.4) and ramp[-1][1][1] == 0.0  # a joint not named holds its position
+    assert all(w[0] == pytest.approx(0.6) for _, w in steps)  # step one began from the start pose
+    with pytest.raises(KeyError, match="start_pose names \\['elbow'\\]"):
+        bad = _FromReady()
+        bad.start_pose = {"elbow": 0.1}
+        robot.run(bad, steps=1)
+
+
+def test_a_start_pose_is_in_the_policys_units():
+    from strands_robots.policy import Policy as Base
+    from strands_robots.units import lerobot_units
+
+    class Norm(Base):
+        units = "lerobot"
+        start_pose = {"shoulder_pan.pos": 50.0, "gripper.pos": 10.0}  # LeRobot names and units are fine too
+        start_seconds = 0.5
+
+        def act(self, obs, *, instruction=None):
+            return obs.joints.positions
+
+    robot, drv = _hw()
+    robot.run(Norm(), steps=1, hz=50)
+    u = lerobot_units(robot.description)
+    want = u.to_rad(np.array([50.0, 0, 0, 0, 0, 10.0]))
+    assert drv.writes[-1][1][0] == pytest.approx(want[0], abs=1e-6) and drv.writes[-1][1][5] == pytest.approx(want[5])

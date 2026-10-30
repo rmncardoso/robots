@@ -11,7 +11,7 @@ from .requirements import Requirements
 
 @runtime_checkable
 class PolicyLike(Protocol):
-    def act(self, obs: Observation, *, instruction: str | None = None) -> Action: ...
+    def act(self, obs: Observation, *, instruction: str | None = None) -> Action | None: ...
 
     def reset(self) -> None: ...
 
@@ -37,7 +37,9 @@ class Policy(metaclass=_Factory):
     Optional hooks the run loop honours: ``attach(robot)`` before step one (connect, admit, load),
     ``detach()`` after the last step, ``realtime`` (pace in wall time even in a sim), ``hz`` and
     ``needs_observation`` (the loop renders the cameras only for a step that answers True), ``gains``
-    ``(kp, kd)``. The loop reads them once before step one; a hook of the wrong type is a ``TypeError``.
+    ``(kp, kd)``, ``start_pose`` (where its episodes begin, in the policy's units — a mapping or a full
+    vector — reached over ``start_seconds``, default 3, before step one). The loop reads them once before
+    step one; a hook of the wrong type is a ``TypeError``.
     """
 
     units: str | None = None  # a scheme name in strands_robots.units (e.g. "rad", "lerobot") or None = cannot say
@@ -48,7 +50,9 @@ class Policy(metaclass=_Factory):
         if declared is not None and declared not in SCHEMES:
             raise ValueError(f"policy {cls.__name__} declares units {declared!r}; known: {', '.join(sorted(SCHEMES))}")
 
-    def act(self, obs: Observation, *, instruction: str | None = None) -> Action:
+    def act(self, obs: Observation, *, instruction: str | None = None) -> Action | None:
+        """The action for this observation, or ``None`` to hold: the run loop writes nothing that tick, the body
+        keeps its last target, and the tick is a ``RunResult.holds`` entry — never a deadline miss."""
         raise NotImplementedError
 
     def reset(self) -> None:

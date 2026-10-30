@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from typing import TYPE_CHECKING, Any
@@ -12,7 +12,7 @@ import numpy as np
 
 from ...policy import PolicyLike, as_policy
 from ...policy.requirements import Requirements
-from ...types import Observation
+from ...types import JointState, Observation
 from ...units import Units, calibrated, resolve_units
 from .source import refuse_remote_spec
 
@@ -60,9 +60,21 @@ def bind(robot: Robot, policy: PolicyLike | Callable[[Observation], Any], units:
         from ..safety import RequestRefused
 
         raise RequestRefused(f"{robot.id} cannot hold position between ticks, and {pol!r} requires a body that can")
+    if units != "auto":  # a named scheme needs no session: an unknown one is refused before attach opens one
+        resolve_units(pol, units, robot.description)
     attach = getattr(pol, "attach", None)
     if attach is not None:  # connect / load / admit against THIS robot, before units and requirements
         attach(robot)
+    try:
+        return _ready(robot, pol, units)
+    except BaseException:  # a refusal after attach detaches before it propagates: nothing stays open (K2)
+        _detach(pol)
+        raise
+
+
+def _ready(robot: Robot, pol: Any, units: str | None) -> Bound:
+    """What needs ``attach`` and can still refuse (rate, gains, units, requirements, reset); checks that need no
+    session ran before it in ``bind``, so a refusal there opened nothing."""
     hz = _hook(pol, "hz", _rate, "a number > 0")  # after attach: a remote policy learns its rate from the server
     realtime = _hook(pol, "realtime", _flag, "True or False", False)
     gains = _hook(pol, "gains", _pair, "a (kp, kd) pair")
@@ -77,26 +89,54 @@ def bind(robot: Robot, policy: PolicyLike | Callable[[Observation], Any], units:
         need = req()
         if not isinstance(need, Requirements):
             raise TypeError(f"{pol!r}.requirements() must return Requirements, got {need!r}")
+        cameras = getattr(robot.body, "cameras", None)
+        if cameras is not None and need.images:  # a hardware camera that declared no size takes the policy's
+            cameras.fit(need.images)
         need.check(robot.observe(), who=repr(pol))
     pol.reset()
     return Bound(pol, conv, None if hz is None else float(hz), bool(realtime))
 
 
-def release(bound: Bound) -> None:
-    """After the last step: let the policy close what ``attach`` opened (a session, a server)."""
-    detach = getattr(bound.policy, "detach", None)
+def _detach(pol: Any) -> None:
+    detach = getattr(pol, "detach", None)
     if detach is not None:  # bind() refused a detach that is not a method
         detach()
 
 
-def decide(robot: Robot, bound: Bound, obs: Observation, instruction: str | None) -> np.ndarray:
-    """One inference in the policy's units, as full targets in the robot's radians; joints it leaves out hold
-    their position in ``obs`` (no second read)."""
+def release(bound: Bound) -> None:
+    """After the last step: let the policy close what ``attach`` opened (a session, a server)."""
+    _detach(bound.policy)
+
+
+def decide(
+    robot: Robot, bound: Bound, obs: Observation, instruction: str | None, *, clip: bool = True
+) -> np.ndarray | None:
+    """One inference in the policy's units, as full targets in the robot's radians. A vector, or a ``{joint:
+    value}`` mapping converted per key: joints it leaves out hold their position in ``obs`` (no second read).
+    ``clip=False`` (an agent run): an out-of-range target is kept so the safety chain refuses it, instead of being
+    silently moved to the limit (K6). ``None`` when the policy returned ``None``: it holds this tick (nothing to
+    coerce, gate or write)."""
     pol, conv, q = bound.policy, bound.units, np.asarray(obs.joints.positions, dtype=float)
     if conv is None:
-        return robot.coerce(pol.act(obs, instruction=instruction), measured=q)
+        out = pol.act(obs, instruction=instruction)
+        return None if out is None else robot.coerce(out, clip=clip, measured=q)
     seen = obs.with_joints(conv.from_rad(obs.joints.positions))
-    return robot.coerce(conv.to_rad(np.asarray(pol.act(seen, instruction=instruction), dtype=float)), measured=q)
+    out = pol.act(seen, instruction=instruction)
+    if out is None:
+        return None
+    if isinstance(out, JointState):
+        out = out.as_dict()
+    if isinstance(out, Mapping):  # per key, in policy units; an unnamed joint holds q, an unknown one coerce refuses
+        names = list(obs.joints.names)
+        u = np.array(seen.joints.positions, dtype=float)
+        for k, v in out.items():
+            if k in names:
+                u[names.index(k)] = v
+        rad = conv.to_rad(u)
+        return robot.coerce(
+            {k: rad[names.index(k)] if k in names else v for k, v in out.items()}, clip=clip, measured=q
+        )
+    return robot.coerce(conv.to_rad(np.asarray(out, dtype=float)), clip=clip, measured=q)
 
 
 def looks(bound: Bound, instruction: str | None) -> bool:

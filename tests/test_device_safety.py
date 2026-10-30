@@ -130,12 +130,60 @@ def test_hardware_robot_manifest_and_estop_on_a_faked_bus():
     real.close()
 
 
+def _feetech_arm(torque):
+    """A so101 on the fake bus: limp (torque never on), or powered by the developer's own write."""
+    d, s = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    if torque:
+        real.act(real.observe().joints.positions)  # torque on, Goal_Position := Present_Position
+    return real, d, s
+
+
+def _lapse(robot):
+    """One watchdog lapse on a fake clock: 200 ms of silence against a 100 ms timeout."""
+    now = [0.0]
+    dog = Watchdog(robot, timeout_ms=100, clock=lambda: now[0])
+    now[0] = 0.2
+    return dog.poll()
+
+
+@pytest.mark.parametrize("torque", [False, True], ids=["limp", "torque-on"])
+def test_a_hold_while_the_estop_is_latched_is_refused_and_writes_nothing(torque):
+    from test_operator_gate import goal_writes
+
+    from strands_robots.robot.safety import EStopped
+
+    real, d, s = _feetech_arm(torque)
+    real.estop()
+    s.frames.clear()
+    with pytest.raises(EStopped, match="e-stop is engaged"):
+        real.hold()  # the verb an agent tool and a mesh peer call
+    assert goal_writes(s) == [] and d.extras()["torque"] is torque
+    real.resume(approved_by="op")
+    real.hold()  # released: a hold is accepted again
+    real.close()
+
+
+@pytest.mark.parametrize("torque", [False, True], ids=["limp", "torque-on"])
+def test_a_watchdog_lapse_while_the_estop_is_latched_writes_nothing(torque):
+    from test_operator_gate import goal_writes
+
+    real, d, s = _feetech_arm(torque)
+    real.estop()
+    s.frames.clear()
+    assert _lapse(real) is True  # the controller goes quiet after an e-stop: the lapse is seen, and adds nothing
+    assert goal_writes(s) == [] and d.extras()["torque"] is torque
+    real.close()
+
+
 def _narrow_safe(robot, key, safe):
     from dataclasses import replace
 
+    from strands_robots.robot.device.build import manifest_key
+
     m = robot.manifest
     controls = tuple(replace(c, safe=safe) if c.name == f"{key}.pos" else c for c in m.controls)
-    robot.__dict__["manifest"] = replace(m, controls=controls)
+    robot.__dict__["_manifest"] = (manifest_key(robot), replace(m, controls=controls))
 
 
 def test_outside_safe_inside_range_needs_the_operators_yes():
@@ -335,4 +383,17 @@ def test_a_local_press_records_no_operator_and_resume_without_a_pin_is_unchanged
     assert arm.estop_latch.stopped_by is None and arm.estop_latch.engaged_wall is not None
     arm.resume(approved_by="cagatay")  # no stop= pin: clears whatever is latched, as before
     assert not arm.estopped
+    arm.close()
+
+
+def test_k4_latch_release_clears_derived_state():
+    """K4: release left stale reason/engaged_at behind; a resumed latch must read as fully clear."""
+    arm = Robot("so101")
+    arm.estop_latch.engage("test")
+    assert arm.estop_latch.reason == "test" and arm.estop_latch.engaged_at is not None
+    arm.estop_latch.release("operator")
+    assert arm.estop_latch.reason is None
+    assert arm.estop_latch.engaged_at is None
+    assert arm.estop_latch.engaged_wall is None
+    assert arm.estop_latch.resumed_by == "operator"
     arm.close()

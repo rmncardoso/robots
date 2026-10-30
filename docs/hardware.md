@@ -6,6 +6,7 @@ description: The same Robot with a Driver for a body. Feetech STS3215, Unitree D
 
 {{drawing:d04_twin}}
 
+<!-- test: skip, needs a real SO-101 arm on USB -->
 ```python title="needs the arm on USB"
 from strands_robots import Robot
 
@@ -13,6 +14,7 @@ real = Robot("so101", port="/dev/ttyACM0", confirm=lambda action: input(f"move t
 real.calibrate(interactive=False)            # the LeRobot calibration JSON lerobot-calibrate wrote, unchanged
 obs = real.observe()                         # measured joints in radians, also pushed into real.twin
 real.confirm_act(obs.joints)                 # a hold, through the operator gate; the twin mirrors it
+real.confirm_act({"gripper": 1.0}, seconds=1.5)   # reach a pose: one yes, a 30 Hz ramp, the joints read back
 real.twin.sim.render()                       # what the arm is doing, drawn in MuJoCo
 real.close()                                 # torque off, port closed, twin removed
 ```
@@ -22,6 +24,7 @@ real.close()                                 # torque off, port closed, twin rem
 | `feetech` | STS3215 buses: SO-100 / SO-101 (`pip install pyserial`) | read, write, torque, `calibrate()` |
 | `unitree` | DDS `rt/lowstate`: G1 / Go2 / H1 (`unitree_sdk2py`) | observe only |
 | `microduck` | robotd's JSON-RPC socket (`port=` the socket path) | observe only: robotd has no per-joint write |
+| `memory` | no wire: any robot, no arm attached (docs, notebooks, CI) | a write lands at once, the next read returns it |
 
 A `Driver` is `names read() write() pose() images() extras() hold() estop() calibrate() close()` plus
 `supports_position_hold`, `calibration` and `resolution` (None when the bus has none); `driver=` takes a name
@@ -29,6 +32,41 @@ or an instance, and an instance whose `names` are not the description's `action_
 description to `Simulation.default()`: `real.twin` is `so101_twin`, its `twin_of` is `real`, and only
 `real.is_real` is true (`twin=False` to skip). `observe()` places the twin at the measured joints
 (`Backend.set_joints`, no step), so `real.twin.sim.render()` draws the measured joints (a floating base is not placed); `act()` mirrors the targets and steps the twin's world one control step (`manual_time()` stops it). The twin touches the floor as its plain body would, and nothing else, so it never pushes a simulated robot or object standing where it spawns; a NaN reading, or one beyond MuJoCo's 1e10 (inf included), is not mirrored, and if its world closes the real robot carries on without it. `set_pose` raises on hardware; `real.twin.set_pose` works.
+
+**No arm on the desk.** `driver="memory"` is a hardware body with no wire, so the operator gate, `approve=`,
+the e-stop and the watchdog's real-body rule run exactly as they do on an arm. Its `MemoryDriver` logs every
+target in `writes` and counts `holds` and `estops`; it takes no `port=` and no `cameras=`.
+
+```python
+from strands_robots import Robot
+from strands_robots.robot.safety import RequestRefused
+
+real = Robot("so101", driver="memory", twin=False, confirm=lambda targets: False)
+try:
+    real.confirm_act({"shoulder_pan": 0.3})  # what an agent tool or the dashboard sends
+except RequestRefused:
+    pass
+assert real.body.writes == []                # the operator said no: nothing reached the bus
+real.act({"shoulder_pan": 0.3})              # your own code is the operator
+assert len(real.body.writes) == 1
+```
+
+**Driver options.** `Robot(name, port=, **driver_options)` hands any extra keyword to the driver
+unchanged: the `FeetechDriver` takes `robot_id=` (which calibration file to load) and `baud=`, the unitree
+and microduck links take `timeout=`. `make_driver` forwards them and checks each against
+`driver_parameters` for that driver, so a misspelt option (`baudrate=` for `baud=`) raises a `TypeError`
+that names what the driver takes instead of being silently dropped, and a new parameter on a driver with
+no public path fails the pass-through test. A robot in a world has no bus, so it takes no driver options:
+`Robot("so101", baud=...)` with no `port=` is refused the same way. Hardware camera specs are
+`cameras={"wrist": {"index": 1, "width": 640, "height": 480, "fps": 30}}` (LeRobot's `OpenCVCameraConfig`
+field names); a bare index takes the device default, and a camera that delivers another size than asked is
+refused at the first frame, because every checkpoint is trained at one size. Better than an index — which shifts
+whenever a phone or a screen capture joins the machine — is the device's own name: `cameras={"front": "Logi 4K",
+"wrist": "USB2.0_CAM1"}` resolves against what the OS lists (AVFoundation on macOS, V4L2 on Linux; a name that
+matches nothing or two devices is refused listing them), and a camera with no declared size takes the policy's
+own at `run()`. The dict's keys are the policy's image keys; there is nothing to rename.
+
+{{drawing:d17_driver_options}}
 
 {{drawing:d07_twin_steps}}
 
@@ -68,8 +106,19 @@ no `confirm=` it raises and says `pass confirm=`. Every refusal (the gate, a lim
 any write, and ends a `run()` with `stopped_by="fault"`. When a run ends in a fault the body is put in
 its declared `on_disconnect` state (each control's `hold`, `zero`, `safe` or `apply`), so a policy that
 can no longer act safely leaves the arm somewhere declared safe rather than frozen at its last command.
+
+**One yes per run.** An agent's `run()` on a real body is not a single `act`: instead of asking `confirm=`
+on every tick (30 dialogs a second), it asks `Robot(approve=callable(RunPlan) -> bool)` once, with the whole
+plan (robot, policy, instruction, rate, duration), before anything is acquired; without `approve=` the run is
+refused and nothing is written. The safety chain (the e-stop, the joint range, the soft `safe` band, the
+interlocks and the validators) still runs on every step, and a target outside `safe` inside an approved run is
+refused, never re-asked each tick. `confirm=` stays the per-command gate (`confirm_act`, the dashboard).
+
+{{drawing:d16_one_yes_per_run}}
 A remote policy (`Policy("zenoh://host:7447/deployment")`) holds the last target through LeRobot's chunk
-playback and a 1.0 s grace, then raises that fault. Only a real body
+playback and a 1.0 s grace, then raises that fault. Under either execution (`"splice"` or `"sequential"`)
+`policy.calls` lists every chunk the session received: `wall_s` (the round trip), `rows`, the `server` split and the
+`instruction`. Only a real body
 takes `confirm=`:
 
 ```python

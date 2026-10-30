@@ -12,6 +12,7 @@ from ..clock import MONOTONIC
 from ..safety import apply_on_disconnect
 from .bind import Bound, bind, looks, release
 from .common import announce, declared, emit
+from .loop import start_pose
 from .pace import Pacer
 from .result import RunResult, StoppedBy
 from .source import is_agent
@@ -48,7 +49,8 @@ def lockstep(
         for r, p in policies.items():
             bound[r] = bind(r, p, units)
         for r, b in bound.items():
-            emit(r, "run.started", {"policy": repr(b.policy)})
+            if not start_pose(r, b):  # a policy that names where its episodes begin is taken there first
+                emit(r, "run.started", {"policy": repr(b.policy)})
         results = _lockstep(sim, bound, hz, seconds, steps, instruction, stop_event)
     finally:
         for b in bound.values():
@@ -74,7 +76,8 @@ def _lockstep(
     total = steps if steps is not None else int(round(float(seconds or 0.0) / dt))
     paced = any(b.realtime for b in bound.values())
     pacer = Pacer(dt, now=MONOTONIC.now, sleep=MONOTONIC.sleep) if paced else None
-    why: StoppedBy = "steps"
+    limit: StoppedBy = "steps" if steps is not None else "seconds"  # the limit the caller gave
+    why = limit
     faults: dict[str, str] = {}
     ended: list[Robot] = []
     n = 0
@@ -98,7 +101,7 @@ def _lockstep(
                     if step.fault is not None:
                         faults[r.id] = step.fault
                     break
-            if why != "steps":
+            if why != limit:
                 break
             if pacer is not None:
                 pacer.before_write()  # the world's step is lockstep's write: spaced by one period

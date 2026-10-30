@@ -50,7 +50,8 @@ def mirror(robot: Robot, targets: np.ndarray, *, step: bool = False, measured: b
     if twin is None or sim is None or not (np.abs(targets) <= _MJ_MAXVAL).all():  # a NaN fails the test too
         return
     with sim.lock:  # close() takes it too, so inside it the twin is either still in this world or gone
-        if sim.robots.get(twin.id) is not twin:
+        here = sim.robots.get(twin.id) is twin  # a bool, so mypy keeps twin a Robot (a Member compare narrows it)
+        if not here:
             return
         if measured:
             with contextlib.suppress(NotImplementedError):  # an engine that cannot place joints: command only
