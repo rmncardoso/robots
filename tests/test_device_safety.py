@@ -439,6 +439,67 @@ def test_a_latched_lapse_is_left_to_the_estop_so_a_failed_read_is_never_retried_
     real.close()
 
 
+@pytest.mark.parametrize("torque", [False, True], ids=["limp", "torque-on"])
+def test_a_lapse_whose_apply_an_estop_interrupted_is_left_to_it_and_never_applied_after_resume(torque):
+    from test_operator_gate import goal_writes
+
+    real, d, s = _feetech_arm(torque)
+    read, first = d.read, [True]
+
+    def read_as_the_estop_lands():
+        if first[0]:
+            first[0] = False
+            real.estop()  # another thread presses stop while the apply reads, and that read fails
+            raise OSError("servo 6: bad checksum")
+        return read()
+
+    d.read = read_as_the_estop_lands  # type: ignore[method-assign]
+    now = [0.0]
+    dog = Watchdog(real, timeout_ms=100, clock=lambda: now[0])
+    now[0] = 0.2
+    with pytest.raises(OSError, match="bad checksum"):
+        dog.poll()
+    real.resume(approved_by="op")
+    s.frames.clear()
+    now[0] = 0.4  # no beat since: the e-stop took that lapse, as it takes one that starts while latched
+    assert dog.poll() is False and goal_writes(s) == [] and d.extras()["torque"] is torque
+    real.close()
+
+
+def test_a_lapse_whose_write_an_estop_interrupted_is_never_applied_after_resume():
+    from dataclasses import replace
+
+    from test_operator_gate import goal_writes
+
+    from strands_robots.robot.device.build import manifest_key
+
+    real, d, s = _feetech_arm(True)
+    m = real.manifest  # every control zero: the apply is a guarded write, which refuses once a stop lands in it
+    real.__dict__["_manifest"] = (
+        manifest_key(real),
+        replace(m, controls=tuple(replace(c, on_disconnect="zero") for c in m.controls)),
+    )
+    write, first = d.write, [True]
+
+    def write_as_the_estop_lands(targets):
+        if first[0]:
+            first[0] = False
+            real.estop()  # another thread presses stop between the apply's latch check and its write
+        write(targets)
+
+    d.write = write_as_the_estop_lands  # type: ignore[method-assign]
+    now = [0.0]
+    dog = Watchdog(real, timeout_ms=100, clock=lambda: now[0])
+    now[0] = 0.2
+    with pytest.raises(RequestRefused, match="e-stop is engaged"):
+        dog.poll()
+    real.resume(approved_by="op")
+    s.frames.clear()
+    now[0] = 0.4  # no beat since: the stop that won the write keeps the lapse
+    assert dog.poll() is False and goal_writes(s) == []
+    real.close()
+
+
 def test_a_beat_while_on_disconnect_is_applied_is_kept_so_the_next_lapse_applies_too():
     d, _ = make_driver()
     real = Robot("so101", driver=d, twin=False)
@@ -500,14 +561,53 @@ def test_a_watchdog_period_given_as_another_number_type_still_paces_its_retries(
     assert held == 1 and alive and dog.errors == 1
 
 
-def test_an_error_that_cannot_print_itself_does_not_end_the_watchdog_thread():
+def test_an_error_that_cannot_print_itself_does_not_end_the_watchdog_thread_and_is_named_by_its_type():
     class Unprintable(OSError):
         def __str__(self) -> str:
             raise RuntimeError("this error cannot format its own message")
 
     real, s = _held_arm_whose_next_hold_fails(Unprintable())
+    faults: list[dict] = []
+    real.subscribe("fault", faults.append)
     held, alive, dog = _watch_until_it_holds(real, s)
     assert held == 1 and alive and dog.errors == 1
+    assert [f["reason"] for f in faults] == ["watchdog: poll failed (Unprintable); retrying every 0.005 s"]
+
+
+def test_closing_a_robot_while_its_watchdog_applies_a_lapse_reports_no_fault():
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    faults: list[dict] = []
+    real.subscribe("fault", faults.append)
+    holding, closed = threading.Event(), threading.Event()
+
+    def hold_as_the_robot_closes():
+        holding.set()
+        closed.wait(5.0)
+        raise OSError("Attempting to use a port that is not open")  # pyserial, once close() has run
+
+    d.hold = hold_as_the_robot_closes  # type: ignore[method-assign]
+    dog = Watchdog(real, timeout_ms=20).start(period_s=0.005)
+    assert holding.wait(5.0)
+    real.close()
+    closed.set()
+    assert dog._thread is not None
+    dog._thread.join(2.0)
+    assert not dog._thread.is_alive() and dog.errors == 0 and faults == []
+
+
+def test_a_fault_subscriber_can_stop_the_watchdog_whose_thread_it_runs_on():
+    real, s = _held_arm_whose_next_hold_fails(fails=[10**6])
+    box: dict = {}
+    real.subscribe("fault", lambda f: box["dog"].stop())
+    later: list[dict] = []
+    real.subscribe("fault", later.append)
+    box["dog"] = dog = Watchdog(real, timeout_ms=20)
+    dog.start(period_s=0.005)
+    assert dog._thread is not None
+    dog._thread.join(5.0)
+    assert not dog._thread.is_alive() and len(later) == 1 and dog.errors == 1
+    real.close()
 
 
 def test_workspace_bounds_validator_refuses_a_target_whose_tool_leaves_the_box():

@@ -37,7 +37,7 @@ class Watchdog:
         self.clock = clock or robot.clock.now
         self.last = self.clock()
         self.lapsed = False
-        self.errors = 0  # polls that raised on the start() thread; each one is retried the next period
+        self.errors = 0  # polls that raised on the start() thread; the next period polls again
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -46,19 +46,21 @@ class Watchdog:
         self.lapsed = False
 
     def poll(self) -> bool:
-        """True when this call found a fresh lapse and applied ``on_disconnect``.
+        """True when this call found a fresh lapse and applied ``on_disconnect``, or left it to a latched e-stop.
 
         While the e-stop is latched the lapse is left to it, with nothing read or written. An apply that raises
-        propagates, and the lapse stays open for the next poll to retry."""
+        propagates, and the lapse stays open for the next poll to retry, unless an e-stop landed during it."""
         if self.lapsed or self.clock() - self.last <= self.timeout:
             return False
         self.lapsed = True  # claimed before the apply: a beat() that lands during it starts a new heartbeat
-        if self.robot.estopped:  # estop() already stopped the body: a failed read here would be retried after resume()
+        if self.robot.estopped:  # estop() already asked the body to stop: a failed read would be retried after resume()
             return True
+        stops = self.robot.estop_latch.count
         try:
             apply_on_disconnect(self.robot)
         except BaseException:
-            self.lapsed = False
+            if self.robot.estop_latch.count == stops:  # a stop that landed during the apply takes the lapse too
+                self.lapsed = False
             raise
         return True
 
@@ -77,10 +79,16 @@ class Watchdog:
                 try:
                     self.poll()
                 except Exception as e:  # a corrupted reply or an I/O error must not end the watchdog
+                    if self._stop.is_set() or self.robot._body is None:
+                        return  # stopped or closed during the poll: not a fault, as a state stream treats it
                     self.errors += 1
                     if not failing:
-                        with contextlib.suppress(Exception):  # nor may an error that cannot print, or a subscriber
-                            why = f"watchdog: poll failed ({type(e).__name__}: {e}); retrying every {period:g} s"
+                        try:
+                            what = f"{type(e).__name__}: {e}"
+                        except Exception:  # an error whose message cannot be formatted is reported by its type
+                            what = type(e).__name__
+                        why = f"watchdog: poll failed ({what}); retrying every {period:g} s"
+                        with contextlib.suppress(Exception):  # nor may a fault subscriber that raises end the thread
                             self.robot.events.emit("fault", {"device_id": self.robot.id, "reason": why})
                     failing = True
                 else:
@@ -92,8 +100,8 @@ class Watchdog:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(1.0)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(1.0)  # a fault subscriber runs on that thread, and may call stop()
 
 
 def apply_on_disconnect(robot: Robot) -> np.ndarray:
