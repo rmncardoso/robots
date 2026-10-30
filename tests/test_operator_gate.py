@@ -64,6 +64,24 @@ def test_an_allowed_hold_writes_and_the_twin_mirrors_it():
     real.close()
 
 
+def test_a_servo_resting_past_its_limit_can_still_hold_and_return():
+    """A joint that reads a hair past its hard range (no clamp in counts_to_rad) can still be commanded to
+    where it is, or back toward the range; only a target driving it further out is refused (Yin #4774)."""
+    d, s = make_driver()
+    s.actual[d.ids[3]] = 3072 + 40  # wrist_flex encoder past range_max: it reads outside [lo, hi]
+    real = Robot("so101", driver=d, confirm=lambda action: True, twin=False)
+    hold = real.observe().joints
+    assert hold["wrist_flex"] > real.description.limits["wrist_flex"][1]  # genuinely past its hard limit
+    s.frames.clear()
+    real.confirm_act(hold.positions)  # "hold where you are" is allowed, not refused for where the body is
+    assert len(goal_writes(s)) == 2  # torque on, then one Goal_Position write
+    toward = {"wrist_flex": real.description.limits["wrist_flex"][1]}  # moving back toward the range: allowed
+    real.confirm_act(toward)
+    with pytest.raises(PermissionError, match="wrist_flex"):  # driving it further out: refused
+        real.confirm_act({"wrist_flex": float(hold["wrist_flex"]) + 0.2})
+    real.close()
+
+
 def test_confirmed_out_of_band_and_sim_bodies_are_ungated():
     d, _ = make_driver()
     real = Robot("so101", driver=d, twin=False)
@@ -116,4 +134,119 @@ def test_two_threads_on_one_hardware_robot_take_turns_on_the_bus():
     for t in threads:
         t.join()
     assert errors == [] and s.collisions == 0
+    real.close()
+
+
+# --- K6: an agent's run on a real arm asks one approval per run, not confirm= every tick -----------------------
+
+
+def test_k6_agent_run_asks_approve_once_not_confirm_every_tick():
+    """The old path asked confirm() on every tick of an agent run (30 dialogs a second); approve= is asked once."""
+    from strands_robots.robot.run import RunPlan, from_agent
+
+    plans: list = []
+    per_tick: list = []
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False, approve=lambda p: plans.append(p) or True,
+                 confirm=lambda t: per_tick.append(t) or True)  # fmt: skip
+    with from_agent():
+        res = real.run(lambda obs: {}, steps=4, hz=50, instruction="wave")
+    assert res.stopped_by == "steps" and res.steps == 4
+    assert len(plans) == 1 and per_tick == []  # one plan, the per-command confirm never asked
+    assert plans[0] == RunPlan("so101", plans[0].policy, "wave", 50, None, 4)
+    real.close()
+
+
+def test_k6_without_approve_an_agent_run_moves_nothing():
+    from strands_robots.robot.run import from_agent
+    from strands_robots.robot.safety import RequestRefused
+
+    d, s = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    s.frames.clear()
+    with from_agent(), pytest.raises(RequestRefused, match="approve="):
+        real.run(lambda obs: {}, steps=3, hz=50)
+    assert goal_writes(s) == []  # refused before anything was acquired or written
+    real.close()
+
+
+def test_k6_operator_refuses_the_run():
+    from strands_robots.robot.run import from_agent
+    from strands_robots.robot.safety import RequestRefused
+
+    d, s = make_driver()
+    real = Robot("so101", driver=d, twin=False, approve=lambda p: False)
+    s.frames.clear()
+    with from_agent(), pytest.raises(RequestRefused, match="refused the run"):
+        real.run(lambda obs: {}, steps=3, hz=50)
+    assert goal_writes(s) == []
+    real.close()
+
+
+class _LeRobotUnits:
+    """A policy in LeRobot range units: holds what it sees, 99999 on shoulder_pan at tick 4."""
+
+    units = "lerobot"
+
+    def __init__(self):
+        self.k = 0
+
+    def act(self, obs, instruction=None):
+        self.k += 1
+        out = np.array(obs.joints.positions, dtype=float)
+        if self.k == 4:
+            out[0] = 99999.0
+        return out
+
+    def reset(self):
+        pass
+
+
+def _rad_policy():
+    k = [0]
+
+    def pol(obs):
+        k[0] += 1
+        return {"shoulder_pan": 99.0} if k[0] == 4 else {}  # beyond the hard range on tick 4
+
+    return pol
+
+
+@pytest.mark.parametrize("make_policy", [_rad_policy, _LeRobotUnits], ids=["rad", "lerobot_units"])
+def test_k6_every_step_still_passes_limits_and_validators(make_policy):
+    from strands_robots.robot.run import from_agent
+
+    seen: list[np.ndarray] = []
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False, approve=lambda p: True)
+    real.validators.append(lambda r, req: seen.append(req.targets.copy()))
+    pol = make_policy()
+
+    with from_agent():
+        res = real.run(pol, steps=10, hz=50)
+    assert len(seen) == 3  # the validator saw every written step; tick 4 refused before it
+    assert res.stopped_by == "fault" and res.fault is not None and "range" in res.fault
+    real.close()
+
+
+def test_k6_developer_run_is_not_gated():
+    d, s = make_driver()
+    real = Robot("so101", driver=d, twin=False)  # no approve, no confirm: the developer is the operator
+    before = len(goal_writes(s))
+    real.run(lambda obs: {}, steps=3, hz=50)
+    assert len(goal_writes(s)) > before  # the hold wrote goal frames with no gate
+    real.close()
+
+
+def test_k6_start_carries_the_agent_mark_to_its_thread():
+    from strands_robots.robot.run import from_agent
+    from strands_robots.robot.safety import RequestRefused
+
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    with from_agent():
+        task = real.start(lambda obs: {}, steps=3, hz=50)
+    task._thread.join(5)
+    with pytest.raises(RequestRefused, match="approve="):
+        _ = task.result
     real.close()

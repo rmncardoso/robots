@@ -9,8 +9,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 _AGENT: ContextVar[bool] = ContextVar("strands_robots_agent_source", default=False)
+# The operator already said yes once for this run (the dashboard's ``X-Confirm``): the operator step of the chain is
+# pre-satisfied, every other step (e-stop, range, safe, interlocks, validators) still runs on every action.
+_CONFIRMED: ContextVar[bool] = ContextVar("strands_robots_operator_confirmed", default=False)
 # A policy at a network address (``zenoh://host:port/x``) streams the cameras to that host on every step, before the
 # operator gate sees an action: a model never chooses where the frames go. The developer's own ``run("zenoh://...")``
 # is untouched.
@@ -24,13 +28,37 @@ def refuse_remote_spec(spec: object) -> None:
 
 
 @contextmanager
-def from_agent() -> Iterator[None]:
-    token = _AGENT.set(True)
+def from_agent(*, confirmed: bool = False) -> Iterator[None]:
+    """Mark the calls inside as an agent's or a dashboard's. ``confirmed=True`` carries one operator yes into the
+    run: the loop still passes every write through the safety chain, with the operator step pre-satisfied."""
+    token, ok = _AGENT.set(True), _CONFIRMED.set(bool(confirmed))
     try:
         yield
     finally:
+        _CONFIRMED.reset(ok)
         _AGENT.reset(token)
 
 
 def is_agent() -> bool:
     return _AGENT.get()
+
+
+def is_confirmed() -> bool:
+    """The operator already approved this run (``from_agent(confirmed=True)``)."""
+    return _CONFIRMED.get()
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """What the operator approves for an agent's run on a REAL body: who, with what, for how long, at what rate.
+
+    An agent's run on hardware asks ``Robot(approve=callable(RunPlan) -> bool)`` once, with this whole plan, before
+    anything is acquired (K6); every step then still passes the safety chain, without asking the operator again.
+    """
+
+    robot: str
+    policy: str
+    instruction: str | None
+    hz: float | None
+    seconds: float | None
+    steps: int | None
