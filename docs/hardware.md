@@ -31,7 +31,7 @@ A `Driver` is `names read() write() pose() images() extras() hold() estop() cali
 or an instance, and an instance whose `names` are not the description's `action_keys`, in order, is refused. `Robot(name, port=)` picks the driver from the registry entry and adds a twin of the same
 description to `Simulation.default()`: `real.twin` is `so101_twin`, its `twin_of` is `real`, and only
 `real.is_real` is true (`twin=False` to skip). `observe()` places the twin at the measured joints
-(`Backend.set_joints`, no step), so `real.twin.sim.render()` draws the real pose; `act()` mirrors the targets and steps the twin's world one control step (`manual_time()` stops it). `set_pose` raises on hardware; `real.twin.set_pose` works.
+(`Backend.set_joints`, no step), so `real.twin.sim.render()` draws the measured joints (a floating base is not placed); `act()` mirrors the targets and steps the twin's world one control step (`manual_time()` stops it). The twin touches the floor as its plain body would, and nothing else, so it never pushes a simulated robot or object standing where it spawns; a NaN reading, or one beyond MuJoCo's 1e10 (inf included), is not mirrored, and if its world closes the real robot carries on without it. `set_pose` raises on hardware; `real.twin.set_pose` works.
 
 **No arm on the desk.** `driver="memory"` is a hardware body with no wire, so the operator gate, `approve=`,
 the e-stop and the watchdog's real-body rule run exactly as they do on an arm. Its `MemoryDriver` logs every
