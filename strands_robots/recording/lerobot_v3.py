@@ -97,7 +97,31 @@ def _same_units(ep: Episode, root: Path, said: dict[str, Any]) -> None:
     if have is not None and have != said:
         raise ValueError(
             f"{ep.target}: the dataset there is stored in units {have['units']!r}; this run records {said['units']!r}"
+            + (_differences(have, said) if have["units"] == said["units"] else "")  # one scheme: say what differs
         )
+
+
+def _differences(have: dict[str, Any], said: dict[str, Any]) -> str:
+    """Each entry the dataset's ``meta/units.json`` states otherwise than this run's, with both values; ``none``
+    where one has no such entry (every ``mode``, in a dataset recorded before ``record=`` named them)."""
+    there, here = _entries(have), _entries(said)
+    keys = [k for k in dict.fromkeys([*here, *there]) if (k in there, there.get(k)) != (k in here, here.get(k))]
+    told = [f"{k.removeprefix('joints ')} {_shown(there, k)} (this run: {_shown(here, k)})" for k in keys]
+    return f", but meta/units.json there has {', '.join(told)}" if told else ""
+
+
+def _entries(value: Any, at: str = "") -> dict[str, Any]:
+    """A JSON value as one entry per leaf, keyed by its path: ``{"joints gripper.pos mode": "range_0_100", ...}``."""
+    if not isinstance(value, dict) or not value:
+        return {at: value}
+    flat: dict[str, Any] = {}
+    for key, sub in value.items():
+        flat.update(_entries(sub, f"{at} {key}".lstrip()))
+    return flat
+
+
+def _shown(entries: dict[str, Any], key: str) -> str:
+    return repr(entries[key]) if key in entries else "none"
 
 
 def _hub_cache(repo_id: str) -> Path:
