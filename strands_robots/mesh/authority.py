@@ -46,6 +46,16 @@ class Lockout:
     def to_dict(self) -> dict[str, Any]:
         return {"engaged": self.engaged, "epoch": self.epoch, "by": self.by, "at": self.at}
 
+    def synced(self, robot: Any) -> Lockout:
+        """This lockout as the robot's latch says it is: a local ``robot.estop()`` (a button, a fault handler) opens
+        one too, and a local resume closes it. Every surface that shows the lockout reads it through here."""
+        engaged = bool(getattr(robot, "estopped", False))
+        if engaged and not self.engaged:
+            self.engaged, self.epoch, self.by, self.at = True, new_epoch(), None, time.time()
+        elif not engaged:
+            self.engaged, self.epoch, self.by, self.at = False, None, None, None
+        return self
+
 
 def fingerprint(public_key: str) -> str:
     """A short, stable id for an operator's public key: what the audit records next to the name."""
@@ -83,7 +93,8 @@ class Authority:
     public_keys: tuple[str, ...] = ()
     max_age: float = 60.0
     trust_names: bool | None = None
-    """Accept claimed names without keys. ``None``: only when every transport is loopback or in-process."""
+    """Accept claimed names without keys. ``None``: only when every transport is in-process (``mem://`` or the
+    fake IoT broker); a zenoh mesh, even loopback-only, needs ``trust_names=True`` or operator keys."""
     _seen: dict[str, float] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -102,7 +113,7 @@ class Authority:
         self, device_id: str, lockout: Lockout, approved_by: str | None, assertion: Any, *, local: bool = False
     ) -> str:
         """The name to record as the approver, or ``RequestRefused`` with the reason. ``local``: every transport the
-        request could have come over is loopback or in-process."""
+        request could have come over is in-process (``mem://`` or the fake IoT broker)."""
         if not approved_by or not str(approved_by).strip():
             raise RequestRefused(f"{device_id}: resume needs approved_by=<the operator who cleared the stop>")
         if self.public_keys:

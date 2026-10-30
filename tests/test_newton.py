@@ -151,3 +151,17 @@ def test_a_scene_change_puts_the_kept_gains_on_the_device_in_one_upload(monkeypa
         ids = [sim.backend.model.actuator(f"{a.id}/{k}").id for a in arms for k in a.description.actuators]
         assert len(uploads) == n + 1  # one per scene change, not one more per robot with gains
         assert np.allclose(uploads[-1][ids], 33.0)  # dev: the MJCF's kp 17.8 went to the device
+
+
+@pytest.mark.parametrize(("verb", "args"), [("reach", ("so101",)), ("move_camera", (None, None))])
+def test_a_view_read_takes_the_mirror_lock_and_syncs_first(verb, args, monkeypatch):
+    # reach() / move_camera() run mj_* on the shared MjData; the e-stop syncs it under _mirror only (no GPU needed)
+    from strands_robots.simulation.backends.mujoco.view import View
+    from strands_robots.simulation.backends.newton.backend import NewtonBackend
+
+    b = object.__new__(NewtonBackend)
+    b._mirror, seen = threading.RLock(), []
+    monkeypatch.setattr(b, "_fresh", lambda: seen.append("fresh"), raising=False)
+    monkeypatch.setattr(View, verb, lambda self, *a: seen.append(b._mirror._is_owned()))
+    getattr(b, verb)(*args)
+    assert seen == ["fresh", True]

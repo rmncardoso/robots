@@ -32,6 +32,11 @@ class Task:
             raise TimeoutError(f"the run is still going after {timeout} s; its policy has not returned")
         return self.result
 
+    def _wait(self) -> RunResult | None:
+        """Wait for the run to end on its own (a limit, ``stop()`` from another thread, an e-stop): ``result``."""
+        self._thread.join()
+        return self.result
+
     def halt(self, timeout: float | None = 5.0) -> None:
         """Stop and join without reading ``result``, so teardown never re-raises the task's error."""
         self._stop.set()

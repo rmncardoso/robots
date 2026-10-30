@@ -20,13 +20,14 @@ try:
 except ImportError as exc:  # the extra the first snippet needs, so the error says how to get it
     raise ImportError(f"Simulation() needs MuJoCo: {hint('mujoco')} ({exc})") from exc
 
-from ...._gl import ensure_gl, gl_thread, on_gl_thread
+from ...._gl import close_on_gl_thread_at_exit, gl_in_effect, gl_thread, on_gl_thread, release_before_gl_teardown
 from ....types import JointState, Pose
 from ...backend import Backend
 from ...physics import Contact, Physics
 from ...scene import Scene, SceneRobot
 from . import build
-from .state import Gains, place, restore, rewrite_gains, snapshot, write_gains
+from .state import Gains, check_gains, place, restore, rewrite_gains, snapshot, write_gains
+from .view import View, add_lights
 
 
 @dataclass
@@ -40,19 +41,19 @@ class _RobotIndex:
     root_body: int  # the robot's root body id
 
 
-class MuJoCoBackend(Backend):
+class MuJoCoBackend(View, Backend):
     """Builds the world from a Scene; every ``load`` recompiles and carries joint state by name."""
 
     def __init__(self, **cfg: Any) -> None:
         super().__init__(**cfg)
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
-        self.spec: mujoco.MjSpec | None = None
         self._scene: Scene = Scene()
         self._gains: Gains = {}  # what set_gains wrote, per robot: load writes it again after every compile
         self._index: dict[str, _RobotIndex] = {}
         self._renderers: dict[tuple[int, int], mujoco.Renderer] = {}
         self._gl_failed: str | None = None
+        close_on_gl_thread_at_exit(self._close_renderers)
 
     def load(self, scene: Scene) -> None:
         carried = snapshot(self.model, self.data)
@@ -64,33 +65,25 @@ class MuJoCoBackend(Backend):
         spec.nkey = sum(len(r.description.keyframes) for r in scene.robots)  # else attach warns "nkey conflict"
         spec.visual.global_.offwidth = max(self.render_size[0], *(c.size[0] for c in scene.cameras), 640)
         spec.visual.global_.offheight = max(self.render_size[1], *(c.size[1] for c in scene.cameras), 480)
-        spec.visual.headlight.diffuse = [0.6 * scene.light_scale] * 3
-        spec.visual.headlight.ambient = [0.3 * scene.light_scale] * 3
-        if scene.ground:
-            spec.worldbody.add_geom(
-                name="ground", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.05], rgba=[0.75, 0.78, 0.82, 1]
-            )
-        spec.worldbody.add_light(pos=[0.5, -1.0, 3.0], dir=[-0.2, 0.4, -1.0], diffuse=[0.8 * scene.light_scale] * 3)
+        build.add_ground(spec, scene.ground)
+        add_lights(spec, scene)
         for r in scene.robots:
             build.attach_robot(spec, r)
         for o in scene.objects:
             build.add_object(spec, o)
         for c in scene.cameras:
             build.add_camera(spec, c, scene)
+        if hasattr(spec, "dedup_assets"):  # MuJoCo 3.17+: N copies of a robot share one mesh, not one each
+            spec.dedup_assets()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = spec.compile()
-        if scene.friction_scale != 1.0:
-            model.geom_friction[:, 0] *= scene.friction_scale
-        if scene.mass_scale != 1.0:
-            model.body_mass[:] *= scene.mass_scale
-            model.body_inertia[:] *= scene.mass_scale
+        build.scale_bodies(model, scene)
         data = mujoco.MjData(model)
-        self.spec, self.model, self.data = spec, model, data
+        self.model, self.data = model, data  # the spec is not kept: it holds every mesh again (~250 MB per so101)
         self._scene = scene
         self._index = {r.id: self._make_index(model, r) for r in scene.robots}
-        if self._renderers:  # a context is freed on the thread that made it
-            on_gl_thread(self._renderers.clear)
+        self._close_renderers()  # built for the old model; freed on the GL thread, never by the collector elsewhere
         build.apply_keyframes(model, data, scene, {rid: idx.joint_ids for rid, idx in self._index.items()})
         self._gains = rewrite_gains(model, self._gains, {rid: idx.actuator_ids for rid, idx in self._index.items()})
         restore(model, data, carried)
@@ -109,6 +102,15 @@ class MuJoCoBackend(Backend):
         joint_ids = [j for j in range(m.njnt) if m.joint(j).name.startswith(f"{rid}/")]
         root = next(b for b in range(1, m.nbody) if m.body_parentid[b] == 0 and m.body(b).name.startswith(f"{rid}/"))
         return _RobotIndex(act_ids, jq, jd, joint_ids, root)
+
+    def links(self, body: str) -> list[str]:
+        if self.model is None or body not in self._index:  # not built yet (inside sim.editing())
+            return []
+        return build.link_names(self.model, self._index[body].root_body)
+
+    def outline(self) -> np.ndarray | None:
+        roots = [i.root_body for i in self._index.values()]
+        return build.outline(self.model, self.data, roots) if self.model is not None and roots else None
 
     def _body_id(self, name: str) -> int:
         if name in self._index:
@@ -177,16 +179,9 @@ class MuJoCoBackend(Backend):
         """Make this robot's position actuators the PD law ``tau = kp·(target − q) − kd·q̇`` (no recompile)."""
         assert self.model is not None
         ids = self._index[body].actuator_ids
-        kp, kd = np.asarray(kp, dtype=float).reshape(-1), np.asarray(kd, dtype=float).reshape(-1)
-        if kp.shape != (len(ids),) or kd.shape != (len(ids),):
-            raise ValueError(f"{body}: kp {kp.shape} / kd {kd.shape} for {len(ids)} actuators")
-        if not np.all(np.isfinite(np.r_[kp, kd]) & (np.r_[kp, kd] >= 0)):  # a NaN kp: MuJoCo resets the whole world
-            raise ValueError(f"{body}: kp and kd must be finite and >= 0, got kp {kp.tolist()} / kd {kd.tolist()}")
-        if -1 in ids:  # an actuator without a name: index -1 is the world's last actuator, another robot's
-            key = self._scene.robot(body).description.action_keys[ids.index(-1)]
-            raise KeyError(f"{body}: action key {key!r} has no named actuator in the compiled world; nothing was set")
+        kp, kd = check_gains(body, ids, kp, kd, self._scene.robot(body).description.action_keys)
         write_gains(self.model, ids, kp, kd)
-        self._gains[body] = (kp.copy(), kd.copy())  # load writes these again after every compile
+        self._gains[body] = (kp, kd)  # load writes these again after every compile
 
     def set_joints(self, body: str, positions: np.ndarray) -> None:
         assert self.model is not None and self.data is not None
@@ -194,7 +189,7 @@ class MuJoCoBackend(Backend):
         place(self.model, self.data, idx.joint_qadr, idx.joint_dadr, positions)
 
     def set_pose(self, body: str, pose: Pose, *, zero_velocity: bool = True) -> None:
-        assert self.model is not None and self.data is not None and self.spec is not None
+        assert self.model is not None and self.data is not None
         m, d = self.model, self.data
         b = self._body_id(body)
         j = int(m.body_jntadr[b])
@@ -220,9 +215,10 @@ class MuJoCoBackend(Backend):
             try:
                 r = mujoco.Renderer(self.model, height=size[1], width=size[0])
             except Exception as exc:  # noqa: BLE001 — no GL on this host
-                self._gl_failed = f"{type(exc).__name__}: {exc} (MUJOCO_GL={ensure_gl() or 'default'})"
+                self._gl_failed = f"{type(exc).__name__}: {exc} ({gl_in_effect()})"
                 raise RuntimeError(f"rendering unavailable: {self._gl_failed}") from exc
             self._renderers[size] = r
+            release_before_gl_teardown()
         r.update_scene(self.data, camera=camera)
         return r.render().copy()
 
@@ -242,8 +238,10 @@ class MuJoCoBackend(Backend):
         assert self.model is not None
         return Physics("mujoco", float(self.model.opt.timestep), 1)
 
+    def _close_renderers(self) -> None:
+        if self._renderers:
+            on_gl_thread(lambda: [self._renderers.pop(k).close() for k in list(self._renderers)])
+
     def close(self) -> None:
-        if self._renderers:  # never start the GL thread for a world that did not render
-            on_gl_thread(lambda: [r.close() for r in self._renderers.values()])
-        self._renderers.clear()
-        self.model = self.data = self.spec = None
+        self._close_renderers()
+        self.model = self.data = None

@@ -23,7 +23,10 @@ _FAKES: dict[str, FakeIotBroker] = {}
 class Link(Protocol):
     client_id: str
 
-    def publish(self, topic: str, payload: bytes) -> None: ...
+    def publish(self, topic: str, payload: bytes, **props: str) -> None:
+        """``props`` are MQTT5 request/response properties (``response_topic``, ``correlation_data``); a link
+        without MQTT5 ignores them (the body carries the same addressing)."""
+        ...
 
     def subscribe(self, topic_filter: str, handler: Handler) -> Callable[[], None]: ...
 
@@ -102,7 +105,7 @@ class FakeLink:
         with broker.lock:
             broker.clients[client_id] = self
 
-    def publish(self, topic: str, payload: bytes) -> None:
+    def publish(self, topic: str, payload: bytes, **props: str) -> None:
         if not self.closed:
             self.broker.publish(topic, payload)
 
@@ -120,6 +123,19 @@ class FakeLink:
             if self.broker.clients.get(self.client_id) is self:
                 self.broker.clients.pop(self.client_id)
         self.subs.close()
+
+
+def _device_client(cert: str, key: str, **kw: Any) -> Any:
+    """The MQTT5 client for a device certificate: a ``pkcs11:`` key is a token (mTLS with PKCS#11), any other key
+    is a PEM file on disk (mTLS from path)."""
+    from awsiot import mqtt5_client_builder
+
+    from .pkcs11 import client as pkcs11_client
+    from .pkcs11 import is_pkcs11
+
+    if is_pkcs11(key):
+        return pkcs11_client(cert, key, **kw)
+    return mqtt5_client_builder.mtls_from_path(cert_filepath=cert, pri_key_filepath=key, **kw)
 
 
 class AwsLink:
@@ -157,7 +173,7 @@ class AwsLink:
             on_lifecycle_stopped=lambda *_: self._down.set(),
         )
         if cert and key:
-            self.client = mqtt5_client_builder.mtls_from_path(cert_filepath=cert, pri_key_filepath=key, **kw)
+            self.client = _device_client(cert, key, **kw)
         else:
             creds = auth.AwsCredentialsProvider.new_default_chain()
             self.client = mqtt5_client_builder.websockets_with_default_aws_signing(
@@ -167,8 +183,12 @@ class AwsLink:
         if not self._up.wait(timeout):
             raise TimeoutError(f"iot: {client_id} did not connect to {endpoint} within {timeout}s ({self._why})")
 
-    def publish(self, topic: str, payload: bytes) -> None:
-        self.client.publish(self._m.PublishPacket(topic=topic, payload=payload, qos=self._m.QoS.AT_MOST_ONCE))
+    def publish(self, topic: str, payload: bytes, **props: str) -> None:
+        pkt = self._m.PublishPacket(topic=topic, payload=payload, qos=self._m.QoS.AT_MOST_ONCE)
+        if props.get("response_topic"):
+            pkt.response_topic = props["response_topic"]
+            pkt.correlation_data_bytes = str(props.get("correlation_data", "")).encode()
+        self.client.publish(pkt)
 
     def subscribe(self, topic_filter: str, handler: Handler) -> Callable[[], None]:
         m = self._m

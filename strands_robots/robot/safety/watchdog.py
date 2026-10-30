@@ -1,13 +1,12 @@
 """The watchdog: a heartbeat on the command path. When it lapses, every control applies its ``on_disconnect``.
 
-The clock is the world's time for a simulated body (so ``manual_time`` tests are exact) and the monotonic
-clock on hardware. ``poll()`` checks once; ``start()`` polls on a thread until ``stop()``.
+The clock is ``robot.clock``: the world's time for a simulated body (so ``manual_time`` tests are exact),
+the body's clock on hardware. ``poll()`` checks once; ``start()`` polls on a thread until ``stop()``.
 """
 
 from __future__ import annotations
 
 import threading
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -32,8 +31,7 @@ class Watchdog:
             )
         self.robot = robot
         self.timeout = timeout_ms / 1000.0
-        sim = robot.sim
-        self.clock = clock or ((lambda: sim.time) if sim is not None else time.monotonic)
+        self.clock = clock or robot.clock.now
         self.last = self.clock()
         self.lapsed = False
         self._stop = threading.Event()
@@ -67,10 +65,15 @@ class Watchdog:
 
 
 def apply_on_disconnect(robot: Robot) -> np.ndarray:
-    """Write each control's declared disconnect target (hold / zero / safe / apply) straight to the body."""
+    """Write each control's declared disconnect target (hold / zero / safe / apply) straight to the body.
+
+    While the e-stop is latched it writes nothing and returns the measured positions: ``estop()`` already asked
+    the body for its own stop (``Body.estop``), and only ``resume`` lifts the latch."""
     body = robot.body
     with robot._lock:
         q = np.array(body.read().positions, dtype=float)
+        if robot.estopped:
+            return q
         out = q.copy()
         for i, c in enumerate(robot.manifest.controls):
             if c.on_disconnect == "zero":
@@ -81,6 +84,7 @@ def apply_on_disconnect(robot: Robot) -> np.ndarray:
                 out[i] = min(max(q[i], c.safe[0]), c.safe[1])
         if all(c.on_disconnect == "hold" for c in robot.manifest.controls):
             body.hold()
+            robot._held = None
         else:
             from .estop import guarded_write
 

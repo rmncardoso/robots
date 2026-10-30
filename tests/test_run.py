@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from strands_robots import JointState, Robot, Simulation
+from strands_robots import JointState, Policy, Robot, Simulation
 from strands_robots.policy import Requirements, SequencePolicy
 from strands_robots.robot import RunResult
 
@@ -17,12 +17,22 @@ def test_robot_is_a_class_and_a_body_in_the_default_world():
     assert arm.sim is None and "so101" not in Simulation.default().robots
 
 
+@pytest.mark.parametrize("limit", [{"steps": 6}, {"seconds": 0.2}])
+@pytest.mark.parametrize("world", [False, True])
+def test_a_run_reports_the_limit_its_caller_gave(limit, world):
+    arm = Robot("so101")
+    hold = lambda o: o.joints.positions  # noqa: E731
+    res = arm.sim.run({arm: hold}, hz=30, **limit)[arm.id] if world else arm.run(hold, hz=30, **limit)
+    assert (res.stopped_by, res.steps) == (next(iter(limit)), 6)
+
+
 def test_run_for_steps_reaches_target_and_measures():
     arm = Robot("so101")
     res = arm.run(lambda o: {"shoulder_pan": 0.4, "gripper": 0.8}, hz=50, steps=60)
     assert isinstance(res, RunResult) and res.steps == 60 and res.stopped_by == "steps"
     assert res.seconds == pytest.approx(60 / 50)  # sim time, not wall time
-    assert res.hz_achieved > 50  # faster than real time
+    assert res.hz_achieved == pytest.approx(50)  # the rate the body saw, on its clock (sim time)
+    assert res.steps / res.wall_seconds > 50  # and the host ran it faster than real time
     assert res.final is not None and res.final["shoulder_pan"] == pytest.approx(0.4, abs=0.02)
 
 
@@ -57,16 +67,44 @@ def test_run_needs_a_bound_and_valid_hz():
 
 def test_start_stop_background_task():
     arm = Robot("so101")
-    task = arm.start(lambda o: {"wrist_roll": 0.5}, hz=200, seconds=30)
+    task = arm.start(lambda o: {"wrist_roll": 0.5}, hz=200, seconds=30, realtime=True)  # paced: still running at 0.2 s
     assert task.status == "running"
     time.sleep(0.2)
     res = arm.stop()
-    assert res is not None and res.stopped_by == "stopped" and res.steps > 5
+    assert res is not None and res.stopped_by == "stopped" and 5 < res.steps < 6000
     assert task.status == "done" and not task.running
     arm.start(lambda o: o.joints.positions, seconds=5)
     with pytest.raises(RuntimeError, match="already has a running task"):
         arm.start(lambda o: o.joints.positions, seconds=5)
     arm.stop()
+
+
+def test_two_threads_starting_one_robot_at_once_start_one_run():
+    """``start`` checked for a running task and then stored its own: two threads released together both started a
+    run on one bus (the fake Feetech bus), as two tool calls from one model turn do."""
+    import threading
+
+    from test_drivers import make_driver
+
+    d, _ = make_driver()
+    real = Robot("so101", driver=d, twin=False)
+    together, got = threading.Barrier(2), []
+
+    def start() -> None:
+        together.wait()
+        try:
+            got.append(type(real.start(lambda o: {}, steps=20, hz=20)).__name__)
+        except RuntimeError as e:
+            got.append(str(e))
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    real.stop(timeout=5)
+    assert sorted(got) == ["Task", "robot 'so101' already has a running task; call stop() first"], got
+    real.close()
 
 
 def test_background_task_error_surfaces_in_result():
@@ -372,9 +410,11 @@ def _zero_on_disconnect(robot, joint="shoulder_pan.pos"):
     """Give one of a sim body's controls on_disconnect='zero' so a fault's effect is observable."""
     import dataclasses as dc
 
+    from strands_robots.robot.device.build import manifest_key
+
     m = robot.manifest
     controls = tuple(dc.replace(c, on_disconnect="zero") if c.name == joint else c for c in m.controls)
-    robot.__dict__["manifest"] = dc.replace(m, controls=controls)
+    robot.__dict__["_manifest"] = (manifest_key(robot), dc.replace(m, controls=controls))
 
 
 def test_a_faulted_run_puts_the_body_in_its_declared_on_disconnect_state():
@@ -413,3 +453,31 @@ def test_lockstep_applies_on_disconnect_only_to_the_robot_that_faulted():
     ib = sim.backend._index[b.id].actuator_ids[0]
     assert sim.backend.data.ctrl[ia] == pytest.approx(0.0)  # a faulted: on_disconnect='zero' applied
     assert sim.backend.data.ctrl[ib] != pytest.approx(0.0)  # b kept running, no disconnect applied
+
+
+@pytest.mark.parametrize(
+    ("spec", "says"),
+    [
+        ("hold", "use robot.hold() to stand still, robot.act(..., seconds=) to reach a pose"),
+        ("nope", "known presets: holosoma, microduck;"),  # hold is not offered as a preset
+    ],
+)
+def test_hold_is_not_a_policy_spec_and_the_refusal_names_the_verbs(spec, says):
+    with pytest.raises(ValueError) as err:
+        Policy(spec)
+    assert says in str(err.value) and "stand still at the pose" not in str(err.value)
+
+
+def test_act_seconds_reaches_the_pose_in_one_call_and_one_plain_act_is_one_step_along():
+    one, ramp = Robot("so101", sim=Simulation()), Robot("so101", sim=Simulation())
+    home = {"shoulder_lift": 0.8, "elbow_flex": -0.8, "gripper": 1.0}
+    stepped = one.act(home).joints.as_dict()
+    t0, reached = ramp.sim.time, ramp.act(home, seconds=1.0).joints.as_dict()
+    assert ramp.sim.time - t0 == pytest.approx(1.0, abs=0.04)  # the world advanced the seconds asked for
+    for j, q in home.items():
+        assert reached[j] == pytest.approx(q, abs=0.05), j
+        assert abs(stepped[j] - q) > 0.1, j  # one step of a far target is still on its way
+    with pytest.raises(ValueError, match="not both"):
+        ramp.act(home, steps=2, seconds=1.0)
+    with pytest.raises(ValueError, match="> 0"):
+        ramp.act(home, seconds=0)
