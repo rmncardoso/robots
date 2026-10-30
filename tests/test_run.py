@@ -187,7 +187,8 @@ class _PDForFive(_PD):
         (lambda a, b: a.run(_PD(), units="bogus", steps=1), "unknown units"),
         (lambda a, b: a.run(_PDNeedsFront(), steps=1), "needs camera"),
         (lambda a, b: a.run(_PDAt50(), hz=100, steps=1), "runs at 50 Hz; hz=100"),
-        (lambda a, b: a.run(_PD(), seconds=float("nan")), "NaN"),  # the step count, the loop's last check
+        (lambda a, b: a.run(_PD(), seconds=float("nan")), "NaN"),  # the step count
+        (lambda a, b: a.run(_PD(), steps=1, realtime=True, on_miss="bogus"), "on_miss"),  # the pacer, the last check
         (lambda a, b: a.sim.run({a: _PDNeedsFront()}, steps=1), "needs camera"),
         (lambda a, b: a.sim.run({a: _PDAt50()}, hz=100, steps=1), "runs at 50 Hz; hz=100"),
         (lambda a, b: a.sim.run({a: _PDAt50(), b: _At30([{"shoulder_pan": 0.1}])}, steps=1), "different rates"),
@@ -199,6 +200,7 @@ class _PDForFive(_PD):
         "requirements",
         "rate",
         "steps",
+        "on_miss",
         "lockstep_requirements",
         "lockstep_rate",
         "lockstep_two_rates",

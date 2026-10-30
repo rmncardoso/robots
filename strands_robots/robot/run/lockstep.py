@@ -74,9 +74,9 @@ def _lockstep(
     dt = sim.physics.control_dt if rate is None else 1.0 / rate
     per = max(1, round(dt / sim.physics.timestep))
     total = steps if steps is not None else int(round(float(seconds or 0.0) / dt))
-    held = install_gains(bound)  # after the rate and the step count, the loop's last checks
     paced = any(b.realtime for b in bound.values())
     pacer = Pacer(dt, now=MONOTONIC.now, sleep=MONOTONIC.sleep) if paced else None
+    held = install_gains(bound)  # after the rate, the step count and the pacer, the loop's last checks
     limit: StoppedBy = "steps" if steps is not None else "seconds"  # the limit the caller gave
     why = limit
     faults: dict[str, str] = {}
