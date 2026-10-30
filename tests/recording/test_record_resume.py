@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 
@@ -63,6 +64,37 @@ def test_a_second_run_in_a_new_process_resumes_the_same_directory(tmp_path):
         assert after[k][:9] == before[k], f"episode 0 {k} changed on resume"
     assert after["tasks"][9:] == ["back"] * 7 and after["action"][-1][0] == pytest.approx(-0.3)
     print(f"[measured] resume: episodes {before['episodes']} -> {after['episodes']}, frames 9 -> {len(after['tasks'])}")
+
+
+def test_resume_refuses_other_units_naming_what_differs_before_the_robot_moves(tmp_path):
+    from test_replay_units import Degrees  # declares LeRobot degrees, as a checkpoint run under norm= does
+
+    target, arm = tmp_path / "ds", _arm()
+    arm.run(SequencePolicy([{"shoulder_pan": 10.0}]), hz=20, steps=3, record=target, units="lerobot")
+    before = arm.observe(images=False).joints.positions.tolist()
+    in_degrees = (  # only what differs: shoulder_lift's travel is 100 deg either side, so only its mode is named
+        "this run records 'lerobot', but meta/units.json there has shoulder_pan.pos range [-100.0, 100.0] (this run: "
+        "[-110.0, 110.0]), shoulder_pan.pos mode 'range_m100_100' (this run: 'degrees'), shoulder_lift.pos mode "
+    )
+    with pytest.raises(ValueError, match=re.escape(in_degrees)):
+        arm.run(Degrees(), hz=20, steps=3, record=target)
+    path = target / "meta" / "units.json"
+    said = json.loads(path.read_text())
+    for joint in said["joints"].values():
+        del joint["mode"]  # as record= wrote it before it named each joint's norm mode
+    path.write_text(json.dumps(said))
+    with pytest.raises(ValueError) as refused:
+        arm.run(SequencePolicy([{"shoulder_pan": 60.0}]), hz=20, steps=3, record=target, units="lerobot")
+    assert str(refused.value) == (
+        f"{target}: the dataset there is stored in units 'lerobot'; this run records 'lerobot', but meta/units.json "
+        "there has shoulder_pan.pos mode none (this run: 'range_m100_100'), shoulder_lift.pos mode none (this run: "
+        "'range_m100_100'), elbow_flex.pos mode none (this run: 'range_m100_100'), wrist_flex.pos mode none (this run: "
+        "'range_m100_100'), wrist_roll.pos mode none (this run: 'range_m100_100'), gripper.pos mode none (this run: "
+        "'range_0_100')"
+    )
+    with pytest.raises(ValueError, match=r"stored in units 'lerobot'; this run records 'rad'$"):  # the scheme says it
+        arm.run(SequencePolicy([{"shoulder_pan": 0.6}]), hz=20, steps=3, record=target)
+    assert arm.observe(images=False).joints.positions.tolist() == before
 
 
 def test_resume_refuses_a_different_fps_or_robot_before_the_robot_moves(tmp_path):
