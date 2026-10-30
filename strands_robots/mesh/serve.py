@@ -16,6 +16,7 @@ from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from ..robot.safety import RequestRefused
 from . import wire
 from .authority import Authority, Lockout, new_epoch
 from .codec import observation_to_dict
@@ -25,11 +26,17 @@ from .watchdog import MOTION_RPCS
 AUDIT = logging.getLogger("strands_robots.audit")
 MAX_STEPS = 10_000
 """The most world steps one ``act`` may ask for: every robot in the world waits on its lock meanwhile."""
+MAX_SECONDS = 10.0
+"""The longest reach one ``act(seconds=)`` may ask for: the rpc holds a worker (and its invoker) that long."""
+
+WRITE_RPCS = ("act", "hold")
+"""The rpcs that physically move a body: an observe-only device (a hardware body mounted without a watchdog)
+refuses them by name, so a mover can never leave an arm commanded with nothing to recall it."""
 
 ARGS: dict[str, tuple[str, ...]] = {
     "describe": (),
     "observe": ("images",),
-    "act": ("action", "steps", "by"),
+    "act": ("action", "steps", "seconds", "by"),
     "hold": ("by",),
     "stop": ("by",),
     "estop": ("by", "epoch"),
@@ -58,22 +65,30 @@ def _observe(robot: Any, images: bool) -> Any:
     return observation_to_dict(obs, images=True)
 
 
-def _act(robot: Any, action: Any = None, steps: int | None = None) -> Any:
+def act_wait(args: dict[str, Any]) -> float:
+    """How much longer than one control step an ``act`` reply may take: its ``seconds``, if it is one we serve."""
+    s = args.get("seconds")
+    if isinstance(s, (int, float)) and not isinstance(s, bool) and 0 < s <= MAX_SECONDS:
+        return float(s)
+    return 0.0
+
+
+def _act(robot: Any, action: Any = None, steps: int | None = None, seconds: float | None = None) -> Any:
+    """``seconds``: reach the pose over that long (``Robot.act``'s ramp), not one control step toward it."""
     if action is None:
         raise TypeError("act needs action=")
     if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= MAX_STEPS):
         raise ValueError(f"act steps= must be an integer in [1, {MAX_STEPS}], got {steps!r}")
-    return observation_to_dict(robot.confirm_act(action, steps=steps))
+    if seconds is not None and steps is not None:  # before the operator is asked about a call that cannot run
+        raise ValueError("act takes steps= or seconds=, not both")
+    if seconds is not None and not act_wait({"seconds": seconds}):
+        raise ValueError(f"act seconds= must be a number in (0, {MAX_SECONDS}], got {seconds!r}")
+    return observation_to_dict(robot.confirm_act(action, steps=steps, seconds=seconds))
 
 
 def _lockout(robot: Any, lockout: Lockout) -> Lockout:
     """The lockout as the robot's latch says it is (a local ``robot.estop()`` opens one too)."""
-    engaged = bool(getattr(robot, "estopped", False))
-    if engaged and not lockout.engaged:
-        lockout.engaged, lockout.epoch, lockout.by, lockout.at = True, new_epoch(), None, time.time()
-    elif not engaged:
-        lockout.engaged, lockout.epoch, lockout.by, lockout.at = False, None, None, None
-    return lockout
+    return lockout.synced(robot)
 
 
 def estop(robot: Any, lockout: Lockout, by: str | None = None, epoch: str | None = None) -> None:
@@ -121,7 +136,7 @@ def _handlers(
     return {
         "describe": lambda: robot.describe(),
         "observe": lambda images=False: _observe(robot, bool(images)),
-        "act": lambda action=None, steps=None, by=None: _act(robot, action, steps),
+        "act": lambda action=None, steps=None, seconds=None, by=None: _act(robot, action, steps, seconds),
         "hold": lambda by=None: _hold(robot),
         "stop": lambda by=None: None if robot.stop() is None else "stopped",
         "estop": lambda by=None, epoch=None: estop(robot, lockout, by, epoch),
@@ -132,22 +147,16 @@ def _handlers(
     }
 
 
-def is_local(url: str) -> bool:
-    """In-process (``mem://``, the fake IoT broker), or zenoh listening only on loopback with no ``connect=``.
+def in_process(url: str) -> bool:
+    """True only when no peer outside this process can reach the transport: ``mem://`` and the fake IoT broker.
 
-    A ``connect=`` to loopback is no evidence: the router or peer there may route for the whole network.
+    A zenoh endpoint is never in-process, even one that only listens on loopback: a listener accepts connections
+    from any other local process (another user, a container, an ``ssh -L`` tunnel), so a name claimed over it is
+    not trusted without operator keys.
     """
-    from urllib.parse import parse_qs, urlparse
+    from urllib.parse import urlparse
 
-    if url.startswith("mem://") or (url.startswith("iot://") and urlparse(url).netloc == "fake"):
-        return True
-    if not url.startswith("zenoh://") or "?" not in url:
-        return False
-    q = parse_qs(url.split("?", 1)[1])
-    if "connect" in q:
-        return False
-    hosts = [e.split("/", 1)[-1].rsplit(":", 1)[0] for e in q.get("listen", [])]
-    return bool(hosts) and all(h in ("127.0.0.1", "localhost", "[::1]") for h in hosts)
+    return url.startswith("mem://") or (url.startswith("iot://") and urlparse(url).netloc == "fake")
 
 
 def _error(exc: BaseException) -> dict[str, str]:
@@ -161,31 +170,44 @@ def serve(
     device_id: str,
     lockout: Lockout,
     authority: Callable[[], Authority],
-    on_rpc: Callable[[str, str | None], None] | None = None,
+    on_rpc: Callable[[str, str | None], Callable[[], None] | None] | None = None,
 ) -> Unsubscribe:
     """Answer ``strands/<tenant>/<device_id>/rpc/<name>`` for ``robot``; ``on_rpc(name, peer)`` sees every call
-    before it runs (the watchdog). Returns the undo."""
-    handlers = _handlers(robot, device_id, lockout, authority, is_local(transport.url))
+    before it runs (the watchdog) and may return a callable run once the call ends. Returns the undo."""
+    handlers = _handlers(robot, device_id, lockout, authority, in_process(transport.url))
     counter = itertools.count(1)
+    # a hardware body with no mesh watchdog (on_rpc is None) is served observe-only: a mover that vanishes
+    # must never leave an arm commanded with nothing to recall it; a simulated body is harmless, unchanged
+    observe_only = on_rpc is None and bool(getattr(robot, "is_real", False))
 
     def answer(key: str, payload: bytes) -> bytes:
         name = key.rsplit("/", 1)[-1]
         seq = next(counter)
         env: dict[str, Any] = {}
         args: dict[str, Any] = {}
+        done: Callable[[], None] | None = None
         try:
             env = wire.decode_envelope(payload)
+            seq = int(env.get("seq", seq))  # M3: echo the request's seq so the caller can match the reply
             args = env.get("args") or {}
+            if observe_only and name in WRITE_RPCS:
+                raise RequestRefused(
+                    f"{device_id} is mounted observe-only (a hardware device with watchdog_ms=None); "
+                    f"{name} is refused. Mount it with watchdog_ms= so a vanished mover recalls it."
+                )
             if on_rpc is not None and name in MOTION_RPCS and env.get("peer") is None:
                 raise TypeError(f"{device_id}.{name} needs the caller's peer id: the watchdog arms on whoever moves it")
             if on_rpc is not None and name != "estop":
-                on_rpc(name, env.get("peer"))
+                done = on_rpc(name, env.get("peer"))
             extra = sorted(set(args) - set(ARGS[name]))
             if extra:
                 raise TypeError(f"{device_id}.{name} takes {list(ARGS[name]) or 'no arguments'}, not {extra}")
             body = {"result": handlers[name](**args)}
         except Exception as exc:
             body = {"error": _error(exc)}
+        finally:
+            if done is not None:  # the watchdog's quiet clock restarts when the motion ends, not when it began
+                done()
         outcome = "ok" if "result" in body else body["error"]["type"]
         who = (args.get("by") or args.get("approved_by")) if isinstance(args, dict) else None
         AUDIT.info(

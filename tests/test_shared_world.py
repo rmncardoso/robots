@@ -1,6 +1,9 @@
 """The thesis: two robots, one world. A control step is one control step, a teleport lands, one render shows both."""
 
+import importlib.util
 import json
+import subprocess
+import sys
 import threading
 import time
 
@@ -12,6 +15,23 @@ from strands_robots import Robot, Simulation
 ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 
 
+@pytest.mark.parametrize(
+    "written, id_, name",
+    [
+        ("g1", "g1", "unitree_g1"),
+        ("Unitree-G1", "unitree_g1", "unitree_g1"),
+        ("so101_follower", "so101_follower", "so101"),
+    ],
+)
+def test_a_robot_is_addressed_by_the_name_it_was_written_with(written, id_, name):
+    # Robot("g1").id was "unitree_g1": the URL, the card, sim.run maps and the agent tool all wanted the other name
+    sim = Simulation()
+    r = Robot(written, sim=sim)
+    assert (r.id, r.name, list(sim.robots)) == (id_, name, [id_])
+    assert Robot(written, sim=sim, id="mine").id == "mine"  # a given id still wins
+    sim.close()
+
+
 @pytest.fixture
 def pair():
     return Robot("so101"), Robot("g1", position=[1, 0, 0])
@@ -20,9 +40,9 @@ def pair():
 def test_two_robots_share_the_default_world(pair):
     arm, g1 = pair
     assert arm.sim is g1.sim is Simulation.default()
-    assert list(arm.sim.robots) == ["so101", "unitree_g1"]
+    assert list(arm.sim.robots) == ["so101", "g1"]
     assert Robot("so101", position=[0, -0.5, 0]).id == "so101_2"
-    assert json.loads(json.dumps(arm.sim.describe()))["robots"]["unitree_g1"]["position"] == [1, 0, 0]
+    assert json.loads(json.dumps(arm.sim.describe()))["robots"]["g1"]["position"] == [1, 0, 0]
 
 
 def test_each_robot_reads_its_own_joints_and_pose(pair):
@@ -141,6 +161,45 @@ def test_one_render_shows_both_bodies(pair):
     assert diff.sum() < 0.25 * h * w
 
 
+def _robot_pixels(sim):
+    """Where the robots are in ``sim.render()``: the pixels that differ from the same camera over an empty world."""
+    img, cam = sim.render(), sim.scene.cameras[-1]
+    with Simulation(ground=False) as empty:
+        empty.camera("overview", position=cam.position, target=cam.target)
+        return np.abs(img.astype(int) - empty.render("overview").astype(int)).sum(axis=2) > 30
+
+
+@pytest.mark.parametrize(("robots", "min_height"), [((("so101", None),), 0.6), ((("g1", None),), 0.8)])
+def test_the_overview_frames_the_robots_not_the_floor(robots, min_height):
+    """A lone 30 cm arm filled 68 of 480 rows (a 28 x 68 px box at 1.8 m); the overview now fits the bodies."""
+    with Simulation(ground=False) as sim:
+        for name, position in robots:
+            Robot(name, sim=sim, position=position)
+        ys, xs = np.nonzero(_robot_pixels(sim))
+    h, w = 480, 640
+    assert (ys.max() - ys.min()) / h >= min_height, (ys.min(), ys.max())
+    assert ys.min() > 0 and ys.max() < h - 1 and xs.min() > 0 and xs.max() < w - 1  # in view, not cropped
+
+
+@pytest.mark.parametrize(
+    "outline",
+    [np.array([[0, -0.4, 0], [0.1, 0.1, 0.3]]), np.array([[-1, 0, 0], [1.2, 0.2, 1.3]]), np.zeros((1, 3))],
+    ids=["a reaching arm", "two bodies a metre apart", "a point"],
+)
+def test_overview_keeps_every_outline_point_in_view(outline):
+    from strands_robots.simulation.scene import Scene
+
+    cam = Scene().overview(outline, aspect=4 / 3)
+    pos, fwd = np.array(cam["position"]), np.subtract(cam["target"], cam["position"])
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0, 0, 1]) / np.linalg.norm(np.cross(fwd, [0, 0, 1]))
+    up, t = np.cross(right, fwd), np.tan(np.radians(22.5))
+    q = outline - pos
+    x, y = q @ right / (q @ fwd) / (t * 4 / 3), q @ up / (q @ fwd) / t
+    assert np.abs(x).max() <= 1 and np.abs(y).max() <= 1
+    assert max(np.abs(x).max(), np.abs(y).max()) > 0.85 or len(outline) == 1  # fills the view, not a speck
+
+
 def test_render_without_a_camera_is_the_overview_even_after_user_cameras(pair):
     arm, _ = pair
     sim = arm.sim
@@ -150,6 +209,52 @@ def test_render_without_a_camera_is_the_overview_even_after_user_cameras(pair):
     assert sim.render("wrist").shape == (48, 64, 3)
     with pytest.raises(KeyError, match="no camera 'nope'"):
         sim.render("nope")
+
+
+def test_any_live_thread_can_render_after_another_did(pair):
+    """A GL context is bound to the thread that made it current; renders from a script, a run loop and a server
+    thread that all stay alive must share the world's cameras (EGL_BAD_ACCESS before, a hang on macOS)."""
+    sim = pair[0].sim
+    sim.camera("eye", position=[1.0, -1.0, 0.8], target=[0.3, 0, 0.3], size=(64, 48))
+    first = sim.render("eye")  # this thread renders first and stays alive
+    out: dict[str, object] = {}
+    go, done = threading.Event(), threading.Event()
+
+    def worker() -> None:
+        try:
+            out["img"] = sim.render("eye")
+        except Exception as exc:  # noqa: BLE001 - the failure is the assertion
+            out["img"] = exc
+        done.set()
+        go.wait(5)  # still alive while the first thread renders again
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert done.wait(10)
+    again = sim.render("eye")
+    go.set()
+    t.join(5)
+    assert isinstance(out["img"], np.ndarray), out["img"]
+    assert out["img"].shape == first.shape == again.shape == (48, 64, 3)
+
+
+def test_a_script_that_rendered_exits_cleanly_without_closing_its_world(tmp_path):
+    """The renderers live on the GL thread; a context the collector frees from the main thread at interpreter
+    exit is a segfault (exit code -11) once torch is loaded, as it is by every LeRobot policy and by record=.
+    They are freed on that thread before the interpreter goes."""
+    if importlib.util.find_spec("torch") is None:  # only the script imports it; this process never does
+        pytest.skip("needs torch")
+    script = tmp_path / "render_and_leave.py"
+    script.write_text(
+        "import torch  # noqa: F401\n"
+        "from strands_robots import Robot\n"
+        "arm = Robot('so101')\n"
+        "arm.sim.camera('eye', size=(64, 48), attach=arm)\n"
+        "print(arm.sim.render('eye').shape)\n"  # the renderer is still alive when the script ends
+    )
+    out = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-800:]
+    assert "(48, 64, 3)" in out.stdout
 
 
 def test_state_survives_add_object_and_remove(pair):
@@ -178,6 +283,56 @@ def test_world_time_survives_every_scene_change(pair):
     sim.randomize(friction=1.2)
     sim.remove(g1)
     assert t > 0 and sim.time == t
+
+
+def _gains(robot):
+    """(kp, kd) per actuator, read from the compiled world (a position servo's biasprm is [0, -kp, -kd])."""
+    m = robot.sim.backend.model
+    ids = [m.actuator(f"{robot.id}/{a}").id for a in robot.description.actuators]
+    return m.actuator_gainprm[ids, 0].copy(), -m.actuator_biasprm[ids, 2]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda sim, arm: sim.render(),  # the first render adds the overview camera
+        lambda sim, arm: sim.add_object("box", shape="box", position=[0.3, 0, 0.1]),
+        lambda sim, arm: sim.camera("cam", position=[1, -1, 1], target=[0, 0, 0.2]),
+        lambda sim, arm: Robot("so101", sim=sim, position=[0, 0.5, 0]),
+        lambda sim, arm: sim.remove(arm),
+        lambda sim, arm: sim.remove("crate"),  # by name
+        lambda sim, arm: sim.randomize(friction=1.2),
+        lambda sim, arm: sim.set_pose(arm, position=[0, -0.5, 0]),  # a fixed base is rebuilt where it lands
+    ],
+    ids=[
+        "first_render",
+        "add_object",
+        "camera",
+        "a_robot_joins",
+        "a_robot_leaves",
+        "an_object_leaves",
+        "randomize",
+        "fixed_base_teleport",
+    ],
+)
+def test_the_gains_set_gains_wrote_survive_every_scene_change(pair, change):
+    arm, g1 = pair
+    arm.sim.add_object("crate", shape="box", position=[-0.6, 0.6, 0.1])  # there before the gains: one case removes it
+    n = g1.description.dof
+    g1.set_gains(np.full(n, 40.0), np.full(n, 1.0))  # what run() does with a policy's PD (#4749 decision 6)
+    change(arm.sim, arm)
+    kp, kd = _gains(g1)
+    assert np.allclose(kp, 40.0) and np.allclose(kd, 1.0)  # dev: back to the MJCF's, kp 500
+
+
+def test_a_removed_robots_gains_leave_with_it(pair):
+    arm, _ = pair
+    sim = arm.sim
+    mjcf = _gains(arm)
+    arm.set_gains(np.full(6, 5.0), np.full(6, 0.1))
+    sim.remove(arm)
+    again = Robot("so101", sim=sim)  # the same id, a new body: it starts from its MJCF
+    assert again.id == "so101" and all(np.allclose(a, b) for a, b in zip(_gains(again), mjcf, strict=True))
 
 
 def test_revision_bumps_on_every_scene_change_and_not_on_motion(pair):
@@ -258,7 +413,7 @@ def test_contacts_name_both_bodies_and_reset_stands_a_teleported_g1_on_its_keyfr
     sim = g1.sim
     sim.step(50)
     feet = [c for c in sim.contacts() if "ground" in (c.body_a, c.body_b) or c.body_a == "world"]
-    assert any(c.body_b.startswith("unitree_g1/") and c.force > 0 for c in feet), sim.contacts()[:3]
+    assert any(c.body_b.startswith("g1/") and c.force > 0 for c in feet), sim.contacts()[:3]
     sim.set_pose(g1, position=[2, 0, 0.8])
     sim.add_object("box", shape="box", position=[0.3, 0, 0.1])  # a reload keeps the teleported base where it is
     assert np.allclose(g1.pose.position, [2, 0, 0.8], atol=1e-9)
@@ -301,7 +456,7 @@ def test_lockstep_run_drives_both_robots_one_control_step_at_a_time(pair):
     arm, g1 = pair
     t0 = arm.sim.time
     res = arm.sim.run({arm: lambda o: {"shoulder_pan": 0.3}, g1: lambda o: o.joints.positions}, steps=20)
-    assert set(res) == {"so101", "unitree_g1"} and res["so101"].steps == 20
+    assert set(res) == {"so101", "g1"} and res["so101"].steps == 20
     assert arm.sim.time == pytest.approx(t0 + 20 * arm.sim.physics.control_dt)
     assert res["so101"].final["shoulder_pan"] == pytest.approx(0.3, abs=0.03)
     with Simulation() as other, pytest.raises(ValueError, match="not in this world"):

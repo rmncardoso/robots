@@ -21,6 +21,7 @@ Every refusal (the operator said no, a limit, the e-stop) raises ``RequestRefuse
 
 from __future__ import annotations
 
+from . import _gl as _gl  # first: picks MUJOCO_GL before anything imports mujoco, which reads it once
 from .description import Description
 from .mesh import Mesh
 from .policy import Policy
@@ -29,6 +30,8 @@ from .robot.safety import RequestRefused
 from .simulation import Simulation
 from .types import Action, JointState, Observation, Pose
 
+# The one copy of the version: the wheel is built with it (pyproject [tool.hatch.version]), `hatch version X` sets
+# it, and the publish workflow refuses a release tag that is not v<this>.
 __version__ = "1.0.0.dev0"
 
 __all__ = [
