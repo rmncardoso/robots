@@ -111,6 +111,17 @@ def test_resume_refuses_a_different_fps_or_robot_before_the_robot_moves(tmp_path
     g1.sim.close()
 
 
+def test_resume_refuses_a_camera_the_dataset_lacks_before_the_robot_moves(tmp_path):
+    """The features come from an observation, so they were checked at the first frame, after tick 1's write."""
+    target, arm = tmp_path / "ds", Robot("so101")
+    arm.run(SequencePolicy([{"shoulder_pan": 0.1}]), hz=20, steps=3, record=target)
+    arm.sim.camera("wrist", position=[0.3, -0.3, 0.3], target=[0, 0, 0.1], size=(64, 48), attach=arm)
+    before = arm.observe(images=False)["shoulder_pan"]
+    with pytest.raises(ValueError, match="features"):
+        arm.run(SequencePolicy([{"shoulder_pan": 0.6}]), hz=20, steps=3, record=target)
+    assert arm.observe(images=False)["shoulder_pan"] == before
+
+
 def test_non_integer_hz_is_refused_before_step_one(tmp_path):
     with pytest.raises(ValueError, match="integer fps"):
         _arm().run(SequencePolicy([{"shoulder_pan": 0.1}]), hz=12.5, steps=2, record=tmp_path / "x")

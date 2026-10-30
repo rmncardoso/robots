@@ -142,8 +142,9 @@ def _loop(
         clock = robot.clock if robot.sim is None else MONOTONIC
         sleep = robot.estop_latch.wait if clock is MONOTONIC else clock.sleep  # an e-stop never waits out a period
         pacer = Pacer(dt, on_miss=on_miss, now=clock.now, sleep=sleep)
-    held = install_gains({robot: bound})  # after the rate, the step count and the pacer, the loop's last checks
     t0, wall0 = robot.clock.now(), _time.monotonic()
+    ep.open(lambda: robot.observe(images=True))  # before tick 1: a dataset's setup is no tick's lateness
+    held = install_gains({robot: bound})  # after the rate, the step count, the pacer and the dataset: the last checks
     gated = is_agent()  # an agent's run passes the gate on every step
     while True:
         if held or stopped(robot, stops0):

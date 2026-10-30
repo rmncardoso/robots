@@ -6,6 +6,7 @@ logged with its time, and nothing waits for real.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 
@@ -321,6 +322,99 @@ def test_k3_sleeps_that_wake_late_never_cost_a_run_its_rate_or_a_gap_more_than_o
         if p.misses == 0:
             spans.append(abs(p.span() - len(work) * dt) / dt)
     assert len(spans) > 30 and max(spans) <= 1 + 1e-9, f"a run with no miss was {max(spans):.2f} periods off its rate"
+
+
+class _Dataset:
+    """What a run's recording calls on LeRobot's dataset, with no LeRobot: frames counted, the directory made."""
+
+    def __init__(self, root) -> None:
+        from types import SimpleNamespace
+
+        self.root, self.frames, self.meta = root, 0, SimpleNamespace(total_episodes=0)
+        root.mkdir(parents=True)
+
+    def add_frame(self, frame) -> None:
+        self.frames += 1
+
+    def save_episode(self, parallel_encoding: bool = True) -> None:
+        self.meta.total_episodes += 1
+
+    def finalize(self) -> None: ...
+
+    def clear_episode_buffer(self) -> None: ...
+
+
+def _no_lerobot(monkeypatch, open_dataset) -> None:
+    """A recording whose dataset ``open_dataset`` opens: no LeRobot, PyAV or ``datasets`` imported."""
+    from strands_robots.recording import lerobot_v3
+
+    monkeypatch.setattr(lerobot_v3, "require_lerobot", lambda: None)
+    monkeypatch.setattr(lerobot_v3, "open_dataset", open_dataset)
+    monkeypatch.setattr(lerobot_v3, "quiet", contextlib.nullcontext)
+
+
+def _slow_dataset(monkeypatch, clock, seconds: float) -> list:
+    """Open a recording's dataset in ``seconds`` of the body's clock (LeRobot took 0.3-1 s in a fresh process)."""
+    made: list = []
+
+    def open_dataset(ep, first):
+        clock.advance(seconds)
+        made.append(_Dataset(ep.root))
+        return made[-1], True
+
+    _no_lerobot(monkeypatch, open_dataset)
+    return made
+
+
+def test_k3_a_recording_opens_its_dataset_before_tick_one_so_its_setup_is_no_deadline_miss(tmp_path, monkeypatch):
+    """The dataset used to open at the first frame, after tick 1's write: its setup made tick 2 late, so
+    ``on_miss="fault"`` ended a process's first recording there."""
+    robot, drv = _hw()
+    made = _slow_dataset(monkeypatch, drv.clock, 0.5)
+    res = robot.run(lambda obs: {"shoulder_pan": 0.1}, steps=30, hz=30, record=tmp_path / "ds", on_miss="fault")
+    assert (res.stopped_by, res.steps, res.deadline_misses, res.fault) == ("steps", 30, 0, None)
+    assert made[0].frames == 30 and res.recorded == str(made[0].root) and len(drv.writes) == 30
+
+
+def test_k3_a_recording_that_ends_before_its_first_frame_leaves_no_dataset(tmp_path, monkeypatch):
+    robot, drv = _hw()
+    made = _slow_dataset(monkeypatch, drv.clock, 0.5)
+    res = robot.run(lambda obs: {}, steps=30, hz=30, record=tmp_path / "ds", stop_when=lambda obs: True)
+    assert res.stopped_by == "stop_when" and res.recorded is None and drv.writes == []
+    assert not (tmp_path / "ds").exists() and all(d.frames == 0 for d in made)
+
+
+class _WithGains:
+    """A policy that carries its own PD gains (kp 33), as holosoma's checkpoint does."""
+
+    gains = ([33.0] * 6, [1.0] * 6)
+
+    def act(self, obs, *, instruction=None):
+        return {"shoulder_pan": 0.6}
+
+    def reset(self) -> None: ...
+
+
+def test_k3_a_dataset_the_run_cannot_extend_is_refused_before_a_write_or_the_policys_gains(tmp_path, monkeypatch):
+    """Opening the dataset is one of the run's checks: refused, the arm has not moved and keeps the gains it had (a
+    policy's go on after the last check). It used to open at tick 1's frame, after both."""
+
+    def refuse(ep, first):
+        raise ValueError(f"{ep.target}: the dataset there has other features")
+
+    _no_lerobot(monkeypatch, refuse)
+    arm = Robot("so101")
+
+    def body():  # shoulder_pan's position and kp
+        m = arm.sim.backend.model
+        kp = m.actuator_gainprm[m.actuator(f"{arm.id}/{arm.description.actuators[0]}").id, 0]
+        return arm.observe(images=False)["shoulder_pan"], float(kp)
+
+    found = body()
+    with pytest.raises(ValueError, match="other features"):
+        arm.run(_WithGains(), steps=3, hz=20, record=tmp_path / "ds")
+    assert body() == found  # dev: the arm moved, under kp 33
+    arm.sim.close()
 
 
 def test_k3_writes_stay_one_period_apart_across_runs_estops_and_resumes():
