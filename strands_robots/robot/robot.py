@@ -7,25 +7,28 @@ The Body is the only thing that differs between a simulated robot (``SimBody``, 
 from __future__ import annotations
 
 import threading
-import time as _time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ..description import Description
-from ..types import Action, JointState, Observation, Pose
+from ..description import Description, default_id
+from ..types import Action, Observation, Pose
 from . import gate as _gate
+from . import reach as _reach
+from . import targets as _targets
 from . import twin as _twin
 from .body import Body, SimBody
+from .clock import MONOTONIC, Clock, WorldClock
 from .device import DeviceVerbs, Emitter, position_hold_of
 from .run import loop as _run
-from .safety import Latch, NonFiniteTarget, Validator, guarded_write
+from .safety import Latch, Validator, guarded_write
 
 if TYPE_CHECKING:
     from ..simulation import Simulation
     from .drivers.calibration import Calibration
     from .run.result import RunResult
+    from .run.source import RunPlan
     from .run.task import Task
 
 
@@ -48,22 +51,29 @@ class Robot(DeviceVerbs):
         confirm: Callable[[np.ndarray], bool] | None = None,
         calibration: Any = None,
         mesh: Any = None,
+        clock: Clock | None = None,
+        approve: Callable[[RunPlan], bool] | None = None,
+        **driver_options: Any,  # feetech robot_id=/baud=, unitree timeout=... reach the driver unchanged (D3)
     ) -> None:
         from ..simulation import Simulation
 
         self.description: Description = Description.load(name)
         self.name = self.description.name
         self.is_real = port is not None or driver is not None
-        if confirm is not None and not self.is_real:
-            raise TypeError("confirm= is the operator gate of a hardware Robot; a simulated body is never gated")
-        self.confirm = confirm
+        hw_only = [n for n, v in (("confirm", confirm), ("approve", approve), ("clock", clock)) if v is not None]
+        if hw_only and not self.is_real:  # the operator gates and a bus clock are hardware's; a world owns its time
+            raise TypeError(f"{', '.join(hw_only)}= are hardware Robot arguments; a simulated body takes none")
+        self.confirm = confirm  # one command from an agent/dashboard: asked for exactly these targets
+        self.approve = approve  # one RUN from an agent on a real body: asked once with its RunPlan (K6)
         self.sim: Simulation | None = None
         self.twin: Robot | None = None  # on a hardware Robot: the simulated body that mirrors it
         self.twin_of: Robot | None = None  # on that twin: the hardware Robot it mirrors
         self._task: Task | None = None
+        self._held: np.ndarray | None = None  # the last targets written: what a joint an Action omits keeps
         self._body: Body | None = None
         self._bus_lock = threading.RLock()  # a hardware body: one half-duplex bus shared by every thread
-        self.estop_latch, self.events = Latch(), Emitter(self)
+        self.clock: Clock = clock or MONOTONIC  # a world's robot reads its world's time, set below
+        self.estop_latch, self.events = Latch(lambda: self.clock.now()), Emitter(self)
         self.validators: list[Validator] = []  # extra checks on every agent/dashboard write, after the interlocks
         self.interlocks: list[Validator] = []  # append a Validator to either list; it sees every target, in order
 
@@ -72,20 +82,22 @@ class Robot(DeviceVerbs):
                 raise TypeError("a hardware Robot takes port=/driver=, not sim=: its twin is in Simulation.default()")
             from .drivers import make_driver
 
-            self.id = id or self.name
+            self.id = id or default_id(name)  # the name as written: Robot("g1").id == "g1"
             hw = {"port": port, "driver": driver, "cameras": cameras, "calibration": calibration}
-            self._body = make_driver(self.description, **hw)
+            self._body = make_driver(self.description, **hw, options=driver_options, id=id)
             self.supports_position_hold = position_hold_of(self.description, self._body)
             if twin:
-                self.twin = Robot(
-                    name, position=position, orientation=orientation, keyframe=keyframe, id=f"{self.id}_twin"
-                )
-                self.twin.twin_of = self
-        elif cameras is not None or calibration is not None:
-            raise TypeError("cameras=/calibration= are hardware arguments; in a world: sim.camera(name, attach=robot)")
+                self.twin = _twin.make(self, name, position, orientation, keyframe)
         else:
+            if driver_options:
+                raise TypeError(f"{sorted(driver_options)} are hardware driver options; a world's robot takes none")
+            if cameras is not None or calibration is not None:
+                raise TypeError(
+                    "cameras=/calibration= are hardware arguments; in a world: sim.camera(name, attach=robot)"
+                )
             world = sim if sim is not None else Simulation.default()
-            self.sim, self.id = world, world.unique_id(id or self.name)
+            self.sim, self.id = world, world.unique_id(id or default_id(name))
+            self.clock = WorldClock(world)
             world.add(self, position=position, orientation=orientation, keyframe=keyframe)
             self._body = SimBody(world, self.id, self.description.action_keys)
             self.supports_position_hold = True  # a simulated actuator keeps its last target
@@ -104,8 +116,7 @@ class Robot(DeviceVerbs):
         return self.sim.lock if self.sim is not None else self._bus_lock
 
     def detached(self) -> None:
-        self._body = None
-        self.sim = None
+        self._body = self.sim = None
 
     @property
     def action_keys(self) -> tuple[str, ...]:
@@ -137,31 +148,50 @@ class Robot(DeviceVerbs):
             self.sim.backend.set_gains(self.id, kp, kd)
 
     def observe(self, *, images: bool = True) -> Observation:
-        body = self.body
+        """One read of the body; ``t`` is the capture time on the robot's clock."""
         with self._lock:
+            body = self.body  # under the lock: a world that closed meanwhile has detached it, and this says so
+            t = self.clock.now()
             js = body.read()
             obs = Observation(
-                t=self.sim.time if self.sim is not None else _time.time(),
+                t=t,
                 joints=js,
                 pose=body.pose(),
                 images=body.images() if images else {},
                 extras=body.extras(),
             )
         if self.twin is not None:  # the twin shows what the real body measured
-            _twin.mirror(self, self._full_targets(js.positions), measured=True)
+            _twin.mirror(self, _targets.clip_to_limits(self.description, js.positions), measured=True)
         return obs
 
-    def gate(self, action: Action, *, confirmed: bool = False) -> np.ndarray:
+    def gate(
+        self, action: Action, *, confirmed: bool = False, approved_run: bool = False, measured: np.ndarray | None = None
+    ) -> np.ndarray:
         """The operator gate for commands from an agent tool or dashboard (see ``robot.gate``)."""
-        return _gate.gate(self, action, confirmed=confirmed)
+        return _gate.gate(self, action, confirmed=confirmed, approved_run=approved_run, measured=measured)
 
-    def confirm_act(self, action: Action, *, steps: int | None = None, confirmed: bool = False) -> Observation:
-        """``act`` through the operator gate: what an agent tool and the dashboard call."""
-        return _gate.confirm_act(self, action, steps=steps, confirmed=confirmed)
+    def confirm_act(
+        self, action: Action, *, steps: int | None = None, seconds: float | None = None, confirmed: bool = False
+    ) -> Observation:
+        """``act`` through the operator gate (asked once, for the target): what an agent tool and the dashboard call."""
+        return _gate.confirm_act(self, action, steps=steps, seconds=seconds, confirmed=confirmed)
 
-    def act(self, action: Action, *, steps: int | None = None) -> Observation:
-        """Write targets for THIS body and advance its world (a real body: its twin's) one control step."""
-        targets = self.coerce(action)
+    def act(self, action: Action, *, steps: int | None = None, seconds: float | None = None) -> Observation:
+        """Write targets for THIS body and advance its world (a real body: its twin's) one control step.
+
+        ``seconds``: reach the pose instead, ramping there from the measured one over that long (``robot.reach``).
+        Returns what the body reports after (one read); a run loop calls ``command`` instead.
+        """
+        if seconds is None:
+            self.command(self.coerce(action), steps=steps)
+        elif steps is not None:
+            raise ValueError("act takes steps= or seconds=, not both")
+        else:
+            _reach.reach(self, self.coerce(action), seconds)
+        return self.observe(images=False)
+
+    def command(self, targets: np.ndarray, *, steps: int | None = None) -> None:
+        """Write already-coerced full ``targets`` and advance the world, with no read: the run loop's write."""
         with self._lock:
             guarded_write(self, targets)
             if self.sim is not None:
@@ -171,7 +201,6 @@ class Robot(DeviceVerbs):
                     self.sim.step(steps)
         if self.twin is not None:  # the twin's world advances one control step too
             _twin.mirror(self, targets, step=True)
-        return self.observe(images=False)
 
     def calibrate(self, *, interactive: bool = True) -> Calibration:
         """Read (or, at the arm, record) the bus calibration: LeRobot's calibration JSON, unchanged."""
@@ -179,42 +208,12 @@ class Robot(DeviceVerbs):
 
         if not isinstance(self.body, Driver):
             raise RuntimeError("calibrate() is for hardware; a simulated body needs no calibration")
+        self._held = None  # torque goes off and the arm is moved by hand: no old target survives it
         return self.body.calibrate(interactive=interactive)
 
-    def coerce(self, action: Action, *, clip: bool = True) -> np.ndarray:
-        """Any accepted Action -> a full target vector in ``action_keys`` order, clipped to limits.
-
-        A joint a mapping does not name holds its measured position, clipped into its limits even when
-        ``clip=False``: only the caller's own values reach the safety chain unclipped.
-        """
-        keys = self.description.action_keys
-        if isinstance(action, JointState):
-            action = action.as_dict()
-        if isinstance(action, Mapping):
-            unknown = [k for k in action if k not in keys]
-            if unknown:
-                raise KeyError(f"unknown joint(s) {unknown} for {self.id}; action_keys are {list(keys)}")
-            with self._lock:
-                targets = self._full_targets(np.array(self.body.read().positions, dtype=float))
-            for k, v in action.items():
-                targets[keys.index(k)] = float(v)
-        else:
-            targets = np.asarray(action, dtype=float).reshape(-1)
-            if targets.shape != (len(keys),):
-                raise ValueError(
-                    f"action has {targets.size} values; {self.id} has {len(keys)} action keys {list(keys)}"
-                )
-        if not np.isfinite(targets).all():  # NaN survives min/max: a policy's NaN would reach the bus
-            raise NonFiniteTarget(f"{self.id}: non-finite target {dict(zip(keys, targets.tolist(), strict=True))}")
-        return self._full_targets(targets) if clip else targets
-
-    def _full_targets(self, targets: np.ndarray) -> np.ndarray:
-        out = np.array(targets, dtype=float)
-        for i, k in enumerate(self.description.action_keys):
-            lim = self.description.limits.get(k)
-            if lim is not None:
-                out[i] = min(max(out[i], lim[0]), lim[1])
-        return out
+    def coerce(self, action: Action, *, clip: bool = True, measured: np.ndarray | None = None) -> np.ndarray:
+        """Any accepted Action -> full targets in ``action_keys`` order (see ``robot.targets.coerce``)."""
+        return _targets.coerce(self, action, clip=clip, measured=measured)
 
     run = _run.run  # the run loop's own signature, robot first: one place spells every keyword
     start = _run.start
@@ -244,5 +243,5 @@ class Robot(DeviceVerbs):
             self.twin = None
 
     def __repr__(self) -> str:
-        where = "hardware" if self.is_real else (self.sim.backend_name if self.sim else "detached")
-        return f"Robot({self.name!r}, id={self.id!r}, {where}, dof={self.description.dof})"
+        at = getattr(self._body, "where", "hardware") if self.is_real else getattr(self.sim, "backend_name", "detached")
+        return f"Robot({self.name!r}, id={self.id!r}, {at}, dof={self.description.dof})"
