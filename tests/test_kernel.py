@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 import pytest
-from test_drivers import make_driver, writes
+from test_drivers import FakeSerial, make_driver, writes
 
 from strands_robots import JointState, Robot, Simulation
 from strands_robots.description import Description
@@ -226,11 +226,13 @@ def test_k3_a_write_that_takes_time_or_a_sleep_that_overshoots_is_not_a_miss():
     assert p.misses == 1 and p.worst_late == pytest.approx(0.3 - dt, abs=0.002)
 
 
-@pytest.mark.parametrize(("eps", "healthy"), [(100e-6, 2000), (1.5e-3, 500)])
-def test_k3_lateness_is_measured_from_the_write_that_landed_not_a_grid_the_writes_left_behind(eps, healthy):
+@pytest.mark.parametrize(("eps", "healthy", "misses"), [(100e-6, 2000, 0), (1.5e-3, 500, 1)])
+def test_k3_lateness_is_measured_from_the_write_that_landed_not_a_grid_the_writes_left_behind(eps, healthy, misses):
     """One tick that nearly fills its period (17.95 ms + 2 ms write at 50 Hz, sleeps overshooting by ``eps``) used
     to tip the pacer into a regime where every later write was held to its floor and the grid stayed one overshoot
-    further behind each tick, so a 1 ms overrun hundreds of ticks later was reported as hundreds of ms late."""
+    further behind each tick, so a 1 ms overrun hundreds of ticks later was reported as hundreds of ms late. The
+    last tick's 19 ms of inference start within one late wake (``eps``) of its grid point, as on a fresh pacer:
+    late only when that wake is over 1 ms (``misses``), and by no more than the excess."""
     clock, dt = VirtualClock(), 1 / 50
     p = Pacer(dt, now=clock.now, sleep=lambda s: clock.advance(s + eps))
     writes: list[float] = []
@@ -245,11 +247,80 @@ def test_k3_lateness_is_measured_from_the_write_that_landed_not_a_grid_the_write
 
     for k in range(healthy + 2):
         tick(0.01795 if k == 0 else 0.005)  # one tick that almost saturates its period, then healthy ticks
-    tick(0.019)  # a 1 ms overrun of dt - write
-    assert p.misses == 1
-    late_ms = f"{p.worst_late * 1e3:.1f} ms reported for a 1 ms overrun"
-    assert p.worst_late == pytest.approx(0.001, abs=eps + 1e-9), late_ms
+    tick(0.019)  # 19 ms of inference: 1 ms before its deadline, less how late the tick started
+    assert p.misses == misses
+    late_ms = f"{p.worst_late * 1e3:.2f} ms reported for 19 ms of inference after a {eps * 1e3:g} ms late wake"
+    assert p.worst_late <= max(0.0, 0.019 + eps - dt) + 1e-9, late_ms
     assert min(np.diff(writes)) >= dt - 1e-9
+
+
+class LateWaking(VirtualClock):
+    """Every sleep wakes ``late`` seconds late, as a real one does; ``advance`` (inference) stays exact."""
+
+    def __init__(self, late: float) -> None:
+        super().__init__()
+        self.late = late
+
+    def sleep(self, seconds: float) -> None:
+        self.t += max(0.0, seconds) + self.late
+
+
+@pytest.mark.parametrize("late", [0.1e-3, 1.5e-3, 6e-3])
+def test_k3_a_paced_run_keeps_its_rate_and_fresh_observations_when_every_sleep_wakes_late(late):
+    """50 Hz on the fake Feetech bus, 3-8 ms of inference, every sleep waking ``late``: no miss, so the writes span
+    their periods to within one (as ``RunResult`` says), each acts on an observation one inference old (not one
+    period), and no two are closer than a period less that lateness."""
+    clock, stamps, seen = LateWaking(late), [], []
+
+    class Stamped(FakeSerial):  # each Goal_Position write stamped on the body's clock as it reaches the bus
+        def write(self, data):
+            if data[4] == ft.SYNC_WRITE and data[5] == ft.REG_GOAL_POSITION:
+                stamps.append(clock.now())
+            super().write(data)
+
+    d, _ = make_driver(serial=Stamped())
+    arm = Robot("so101", driver=d, twin=False, clock=clock)
+    work = iter(np.random.default_rng(0).uniform(0.003, 0.008, 300))
+
+    def pol(obs):
+        seen.append(obs.t)
+        clock.advance(next(work))
+        return {"shoulder_pan": 0.1}
+
+    res = arm.run(pol, steps=300, hz=50)
+    w = np.array(stamps)
+    assert res.deadline_misses == 0 and len(w) == len(seen) == 300
+    rate = f"{res.hz_achieved:.2f} Hz achieved, the bus written at {299 / (w[-1] - w[0]):.2f} Hz"
+    assert abs(res.seconds - 300 / 50) <= 1 / 50 and abs(w[-1] - w[0] - 299 / 50) <= 1 / 50, rate
+    age = w - np.array(seen)
+    assert age.max() <= 0.008 + late + 1e-9, f"writes act on observations up to {age.max() * 1e3:.1f} ms old"
+    assert np.diff(w).min() >= 1 / 50 - late - 1e-9
+
+
+@pytest.mark.parametrize("hz", [10.0, 50.0, 200.0])
+def test_k3_sleeps_that_wake_late_never_cost_a_run_its_rate_or_a_gap_more_than_one_wake(hz):
+    """100 random histories per rate (inference up to 1.2 periods, some stalls, every sleep 0..max_late late): with
+    no miss the span is n periods to within one, and no two writes are closer than a period less ``max_late``."""
+    rng, dt = np.random.default_rng(int(hz)), 1 / hz
+    spans = []
+    for _ in range(100):
+        clock, max_late = VirtualClock(), rng.uniform(0, dt / 2)
+        p = Pacer(dt, now=clock.now, sleep=lambda s, c=clock, m=max_late: c.advance(max(0.0, s) + rng.uniform(0, m)))
+        work = rng.uniform(0, rng.uniform(0.2, 1.2) * dt, rng.integers(2, 80))
+        if rng.random() < 0.25:
+            work[rng.integers(0, len(work))] = rng.uniform(0, 0.5)
+        writes = []
+        for w in work:
+            p.start()
+            clock.advance(w)
+            p.before_write()
+            writes.append(clock.now())
+            clock.advance(rng.uniform(0, dt / 10))  # the write itself
+            p.after_write()
+        assert np.diff(writes).min() >= dt - max_late - 1e-9
+        if p.misses == 0:
+            spans.append(abs(p.span() - len(work) * dt) / dt)
+    assert len(spans) > 30 and max(spans) <= 1 + 1e-9, f"a run with no miss was {max(spans):.2f} periods off its rate"
 
 
 def test_k3_writes_stay_one_period_apart_across_runs_estops_and_resumes():
