@@ -418,7 +418,8 @@ def test_k3_a_dataset_the_run_cannot_extend_is_refused_before_a_write_or_the_pol
 
 
 def test_k3_writes_stay_one_period_apart_across_runs_estops_and_resumes():
-    """A random history of runs, stalls, e-stops and resumes on one body: no two writes < one period apart."""
+    """A random history of runs, stalls, e-stops and resumes on one body whose sleeps are exact: no two writes < one
+    period apart (when the wait before a write wakes late, the next one may come that much closer)."""
     rng = np.random.default_rng(0)
     robot, drv = _hw()
     for _ in range(40):

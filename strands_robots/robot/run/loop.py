@@ -51,9 +51,9 @@ def run(
 
     ``record=dir | "hf://owner/name"`` appends this run as one episode of a LeRobot v3 dataset;
     ``push=True`` (an ``hf://`` target only) then uploads it. Nothing leaves the machine otherwise.
-    A paced body (hardware, or ``realtime``) spaces its writes one period apart (less a sleep's late wake, which
-    never slows the rate); a write past the next tick's start is a deadline miss, counted and re-phased
-    (``on_miss="skip"``) or the end (``"fault"``).
+    A paced body (hardware, or ``realtime``) spaces its writes one period apart, less how late the wait before the
+    previous write woke (a late wake costs no rate unless it makes a write miss); a write past the next tick's
+    start is a deadline miss, counted and re-phased (``on_miss="skip"``) or the end (``"fault"``).
     A policy that returns ``None`` holds that tick: nothing is written, the body keeps its last target, the tick
     counts (``RunResult.holds``) and is never a miss — how a sequential remote policy waits for its chunk.
     """

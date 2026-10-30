@@ -86,5 +86,5 @@ class Pacer:
         self._next = max(start + self.dt, self._now())
 
     def span(self) -> float:
-        """The time the body was commanded: first write to one period after the last (n * dt with no miss)."""
+        """The time the body was commanded: first write to one period after the last (no miss: n * dt, within dt)."""
         return 0.0 if self._first is None or self._last is None else self._last - self._first + self.dt
