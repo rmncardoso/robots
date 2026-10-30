@@ -191,7 +191,9 @@ class Robot(DeviceVerbs):
         return self.observe(images=False)
 
     def command(self, targets: np.ndarray, *, steps: int | None = None) -> None:
-        """Write already-coerced full ``targets`` and advance the world, with no read: the run loop's write."""
+        """The run loop's write, no read: full ``targets`` checked as ``act`` checks them (NaN/inf or a wrong
+        length refused, clipped into the limits) before the body, then the world advances."""
+        targets = self.coerce(np.asarray(targets, dtype=float))
         with self._lock:
             guarded_write(self, targets)
             if self.sim is not None:
