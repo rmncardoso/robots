@@ -19,7 +19,7 @@ from . import reach as _reach
 from . import targets as _targets
 from . import twin as _twin
 from .body import Body, SimBody
-from .clock import MONOTONIC, Clock, WorldClock
+from .clock import Clock, WorldClock, checked
 from .device import DeviceVerbs, Emitter, position_hold_of
 from .run import loop as _run
 from .safety import Latch, Validator, guarded_write
@@ -72,7 +72,7 @@ class Robot(DeviceVerbs):
         self._held: np.ndarray | None = None  # the last targets written: what a joint an Action omits keeps
         self._body: Body | None = None
         self._bus_lock = threading.RLock()  # a hardware body: one half-duplex bus shared by every thread
-        self.clock: Clock = clock or MONOTONIC  # a world's robot reads its world's time, set below
+        self.clock: Clock = checked(clock)  # before the bus opens; a world's robot reads its world's time, below
         self.estop_latch, self.events = Latch(lambda: self.clock.now()), Emitter(self)
         self.validators: list[Validator] = []  # extra checks on every agent/dashboard write, after the interlocks
         self.interlocks: list[Validator] = []  # append a Validator to either list; it sees every target, in order
@@ -87,10 +87,7 @@ class Robot(DeviceVerbs):
             self._body = make_driver(self.description, **hw, options=driver_options, id=id)
             self.supports_position_hold = position_hold_of(self.description, self._body)
             if twin:
-                self.twin = Robot(
-                    name, position=position, orientation=orientation, keyframe=keyframe, id=f"{self.id}_twin"
-                )
-                self.twin.twin_of = self
+                self.twin = _twin.make(self, name, position, orientation, keyframe)
         else:
             if driver_options:
                 raise TypeError(f"{sorted(driver_options)} are hardware driver options; a world's robot takes none")
@@ -152,8 +149,8 @@ class Robot(DeviceVerbs):
 
     def observe(self, *, images: bool = True) -> Observation:
         """One read of the body; ``t`` is the capture time on the robot's clock."""
-        body = self.body
         with self._lock:
+            body = self.body  # under the lock: a world that closed meanwhile has detached it, and this says so
             t = self.clock.now()
             js = body.read()
             obs = Observation(
@@ -194,7 +191,9 @@ class Robot(DeviceVerbs):
         return self.observe(images=False)
 
     def command(self, targets: np.ndarray, *, steps: int | None = None) -> None:
-        """Write already-coerced full ``targets`` and advance the world, with no read: the run loop's write."""
+        """The run loop's write, no read: full ``targets`` checked as ``act`` checks them (NaN/inf or a wrong
+        length refused, clipped into the limits) before the body, then the world advances."""
+        targets = self.coerce(np.asarray(targets, dtype=float))
         with self._lock:
             guarded_write(self, targets)
             if self.sim is not None:
