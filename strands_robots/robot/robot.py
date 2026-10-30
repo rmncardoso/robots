@@ -19,7 +19,7 @@ from . import reach as _reach
 from . import targets as _targets
 from . import twin as _twin
 from .body import Body, SimBody
-from .clock import MONOTONIC, Clock, WorldClock
+from .clock import Clock, WorldClock, checked
 from .device import DeviceVerbs, Emitter, position_hold_of
 from .run import loop as _run
 from .safety import Latch, Validator, guarded_write
@@ -72,7 +72,7 @@ class Robot(DeviceVerbs):
         self._held: np.ndarray | None = None  # the last targets written: what a joint an Action omits keeps
         self._body: Body | None = None
         self._bus_lock = threading.RLock()  # a hardware body: one half-duplex bus shared by every thread
-        self.clock: Clock = clock or MONOTONIC  # a world's robot reads its world's time, set below
+        self.clock: Clock = checked(clock)  # before the bus opens; a world's robot reads its world's time, below
         self.estop_latch, self.events = Latch(lambda: self.clock.now()), Emitter(self)
         self.validators: list[Validator] = []  # extra checks on every agent/dashboard write, after the interlocks
         self.interlocks: list[Validator] = []  # append a Validator to either list; it sees every target, in order
