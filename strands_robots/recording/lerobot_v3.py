@@ -39,7 +39,7 @@ def quiet() -> Iterator[None]:
 
     logging.getLogger("lerobot").setLevel(logging.ERROR)
     svt, bars, libav = os.environ.get("SVT_LOG"), hf.is_progress_bar_enabled(), logging.getLogger("libav")
-    level = libav.level
+    level, pyav = libav.level, av.logging.get_level()  # PyAV's own level: None, its default, drops libav's log
     os.environ["SVT_LOG"] = svt or "1"  # read by the encoder when it opens: errors only
     libav.setLevel(logging.ERROR)
     hf.disable_progress_bar()
@@ -50,7 +50,8 @@ def quiet() -> Iterator[None]:
         if svt is None:
             del os.environ["SVT_LOG"]
         libav.setLevel(level)
-        av.logging.set_libav_level(av.logging.INFO)  # libav's own default
+        av.logging.set_libav_level(av.logging.INFO)  # libav's own default: PyAV has no getter for it
+        av.logging.set_level(pyav)  # and PyAV's callback back in place of that printer, at the caller's level
         (hf.enable_progress_bar if bars else hf.disable_progress_bar)()
 
 
