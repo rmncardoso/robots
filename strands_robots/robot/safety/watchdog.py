@@ -2,7 +2,8 @@
 
 The clock is ``robot.clock``: the world's time for a simulated body (so ``manual_time`` tests are exact),
 the body's clock on hardware. ``poll()`` checks once; ``start()`` polls on a thread until ``stop()`` or the
-robot is closed. An apply that raises leaves the lapse open: the next poll retries it.
+robot is closed. An apply that raises leaves the lapse open: the next poll retries it. A lapse while the e-stop
+is latched is the e-stop's.
 """
 
 from __future__ import annotations
@@ -47,10 +48,13 @@ class Watchdog:
     def poll(self) -> bool:
         """True when this call found a fresh lapse and applied ``on_disconnect``.
 
-        An apply that raises propagates, and the lapse stays open for the next poll to retry."""
+        While the e-stop is latched the lapse is left to it, with nothing read or written. An apply that raises
+        propagates, and the lapse stays open for the next poll to retry."""
         if self.lapsed or self.clock() - self.last <= self.timeout:
             return False
         self.lapsed = True  # claimed before the apply: a beat() that lands during it starts a new heartbeat
+        if self.robot.estopped:  # estop() already stopped the body: a failed read here would be retried after resume()
+            return True
         try:
             apply_on_disconnect(self.robot)
         except BaseException:

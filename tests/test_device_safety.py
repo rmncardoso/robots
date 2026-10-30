@@ -409,6 +409,36 @@ def test_a_poll_after_a_failed_on_disconnect_retries_it_in_the_same_lapse():
     real.close()
 
 
+@pytest.mark.parametrize("torque", [False, True], ids=["limp", "torque-on"])
+def test_a_latched_lapse_is_left_to_the_estop_so_a_failed_read_is_never_retried_after_resume(torque):
+    from test_operator_gate import goal_writes
+
+    real, d, s = _feetech_arm(torque)
+    real.estop()
+    read, garbled = d.read, [True]
+
+    def read_garbled():
+        if garbled[0]:
+            raise OSError("servo 6: bad checksum")
+        return read()
+
+    d.read = read_garbled  # type: ignore[method-assign]
+    now = [0.0]
+    dog = Watchdog(real, timeout_ms=100, clock=lambda: now[0])
+    s.frames.clear()
+    now[0] = 0.2
+    assert dog.poll() is True  # seen, and left to the e-stop: nothing read that could fail and be retried
+    garbled[0] = False
+    real.resume(approved_by="op")
+    now[0] = 0.4  # no beat since: that lapse was the e-stop's, so resume() lets nothing land
+    assert dog.poll() is False and goal_writes(s) == [] and d.extras()["torque"] is torque
+    dog.beat()
+    now[0] = 0.7  # the commander came back, then went quiet again: this lapse is the watchdog's
+    assert dog.poll() is True and len(goal_writes(s)) == (1 if torque else 2)  # a limp arm's hold enables torque first
+    assert d.extras()["torque"] is True
+    real.close()
+
+
 def test_a_beat_while_on_disconnect_is_applied_is_kept_so_the_next_lapse_applies_too():
     d, _ = make_driver()
     real = Robot("so101", driver=d, twin=False)
