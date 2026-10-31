@@ -489,6 +489,70 @@ def test_k3_a_stop_during_the_wait_between_ticks_ends_the_run_before_another_rea
     assert len(drv.reads) == 1 + 2 + 1  # bind's check, two ticks, the final observation: no tick after the stop
 
 
+def test_k3_an_estop_in_the_wait_between_ticks_ends_the_run_before_another_read_even_once_resumed():
+    robot, drv, clock = _operated()
+    calls = [0]
+
+    def pol(obs):
+        calls[0] += 1
+        if calls[0] == 2:
+            clock.during_wait = robot.estop  # pressed while the run waits for tick 3
+        if robot.estopped:
+            robot.resume(approved_by="op")  # and cleared while tick 3 decides
+        clock.advance(0.002)
+        return {"shoulder_pan": 0.1 * calls[0]}
+
+    res = robot.run(pol, steps=10, hz=50)
+    assert (res.stopped_by, calls[0], len(drv.writes)) == ("estop", 2, 2)
+    assert len(drv.reads) == 1 + 2 + 1  # bind's check, two ticks, the final observation: no tick after the press
+
+
+@pytest.mark.parametrize("where", ["inference", "floor wait"])
+def test_k3_an_estop_pressed_and_resumed_before_a_tick_writes_ends_the_run_with_that_tick_unwritten(where):
+    robot, drv, clock = _operated()
+    calls, pressed = [0], []
+
+    def press_and_resume() -> None:
+        pressed.append(clock.now())  # resume() clears the latch's engaged_at
+        robot.estop()
+        robot.resume(approved_by="op")
+
+    def pol(obs):
+        calls[0] += 1
+        if calls[0] == 3 and where == "inference":
+            press_and_resume()  # while tick 3 decides
+        elif calls[0] == 3:
+            clock.during_wait = press_and_resume  # while tick 3's write waits a period after tick 2's (8 ms)
+        clock.advance(0.010 if calls[0] == 2 else 0.002)
+        return {"shoulder_pan": 0.1 * calls[0]}
+
+    res = robot.run(pol, steps=10, hz=50)
+    assert res.stopped_by == "estop" and len(drv.writes) == 2
+    assert all(t < pressed[0] for t, _ in drv.writes)  # nothing decided after the press
+
+
+def test_k3_an_estop_pressed_and_resumed_as_a_tick_writes_still_writes_nothing():
+    """Where acceptance check 13 presses: in Robot.command, after its coerce, before the bus lock and the write."""
+    robot, drv, clock = _operated()
+    calls, inner = [0], robot.coerce
+
+    def pol(obs):
+        calls[0] += 1
+        clock.advance(0.002)
+        return {"shoulder_pan": 0.1 * calls[0]}
+
+    def coerce(action, **kw):
+        out = inner(action, **kw)
+        if calls[0] == 3 and not kw:  # command()'s coerce (decide() passes clip= and measured=)
+            robot.estop()
+            robot.resume(approved_by="op")
+        return out
+
+    robot.coerce = coerce  # type: ignore[method-assign]
+    res = robot.run(pol, steps=10, hz=50)
+    assert (res.stopped_by, len(drv.writes)) == ("estop", 2)
+
+
 def test_k5_observation_t_is_capture_time_on_the_body_clock():
     robot, drv = _hw()
     drv.clock.advance(1.5)
@@ -789,6 +853,46 @@ def test_k7_a_stop_during_the_wait_of_a_paced_lockstep_steps_the_world_no_furthe
     res = lockstep(sim, {a: Watched(pa), b: Watched()}, hz=10, steps=50, stop_event=ev)
     assert (res["a"].stopped_by, res["a"].steps, k[0]) == ("stopped", 1, 1)
     assert sim.time - t0 == pytest.approx(0.1)  # one tick of world time, not two
+    sim.close()
+
+
+def test_k7_an_estop_resumed_in_the_wait_of_a_paced_lockstep_ends_it_before_any_robot_decides(monkeypatch):
+    clock = OperatorClock()
+    _pace_lockstep_on(clock, monkeypatch)
+    sim, a, b = _pair()
+    k = [0]
+
+    def pa(obs):
+        k[0] += 1
+        if k[0] == 1:  # pressed and cleared while lock-step waits for tick 2
+            clock.during_wait = lambda: (a.estop(), a.resume(approved_by="op"))
+        return {}
+
+    t0 = sim.time
+    res = lockstep(sim, {a: Watched(pa), b: Watched()}, hz=10, steps=50)
+    assert (res["a"].stopped_by, res["a"].steps, k[0]) == ("estop", 1, 1)  # a, listed first, did not decide tick 2
+    assert sim.time - t0 == pytest.approx(0.1)  # one tick of world time, not two
+    sim.close()
+
+
+def test_k7_a_robot_pressed_and_resumed_while_another_writes_that_tick_writes_nothing():
+    sim, a, b = _pair()
+    k, inner = [0], a.command
+
+    def pb(obs):  # tick 1: 0.1, tick 2: 0.2, tick 3: 0.3
+        k[0] += 1
+        return {"shoulder_pan": 0.1 * k[0]}
+
+    def command(targets, **kw) -> None:  # a writes first: b's stop is pressed and cleared in a's tick-3 write
+        inner(targets, **kw)  # what commit() passes: steps= and stops0=
+        if k[0] == 3:
+            b.estop()
+            b.resume(approved_by="op")
+
+    a.command = command  # type: ignore[method-assign]
+    res = sim.run({a: lambda o: {}, b: pb}, steps=10)
+    assert (res["b"].stopped_by, res["b"].steps, res["b"].fault) == ("estop", 2, "e-stop engaged on b")
+    assert _pan_target(sim, b) != pytest.approx(0.3)  # b's tick-3 target, decided before the press, never went out
     sim.close()
 
 
