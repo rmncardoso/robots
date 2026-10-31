@@ -20,6 +20,7 @@ from strands_robots.units import lerobot_units
 
 DEG = {"*": "degrees", "gripper": "range_0_100"}
 ROW = [45.0] * 5 + [50.0]  # 45 degrees on every arm joint, the gripper half open
+AT_ROW = [2560, 2560, 2560, 2560, 2560, 2048]  # ROW in DEG on the fake bus: what the degrees run itself writes
 
 
 class Degrees:
@@ -42,11 +43,11 @@ def _arm():
     return arm, serial
 
 
-def _goals(policy):
+def _goals(policy, units="auto"):
     """The Goal_Position counts one step of ``policy`` writes to a hardware so101 on the fake bus."""
     arm, serial = _arm()
     try:
-        arm.run(policy, steps=1)
+        arm.run(policy, steps=1, units=units)
     finally:
         arm.close()
     at = slice(ft.REG_GOAL_POSITION, ft.REG_GOAL_POSITION + 2)
@@ -119,3 +120,23 @@ def test_a_norm_key_that_names_no_recorded_joint_is_refused(recorded):
     # a misspelt joint would take the "*" mode: the gripper's 50 % would be written as 50 degrees
     with pytest.raises(ValueError, match="norm= names griper, which the dataset does not record"):
         Policy(recorded("bare", None), norm={"*": "degrees", "griper": "range_0_100"})
+
+
+@pytest.mark.parametrize("policy", ["replay", "checkpoint"])
+def test_run_units_lerobot_keeps_the_norm_modes_the_policy_declares(recorded, policy):
+    # units="lerobot" took the registry's range modes over the policy's degrees: 4.5 degrees off on four joints,
+    # 85.5 on wrist_roll ([2509, 2509, 2509, 2509, 1587, 2048])
+    spec = recorded("deg", _units_json(DEG))
+    make = (lambda: Policy(spec)) if policy == "replay" else Degrees
+    assert _goals(make(), units="lerobot") == _goals(make()) == AT_ROW
+
+
+@pytest.mark.parametrize("units", ["rad", None])
+def test_run_units_that_contradict_the_policy_are_refused_before_the_bus(recorded, units):
+    # 45 degrees read as 45 rad drove every joint to its stop ([3072, 3072, 3072, 3072, 1024, 3072]), the hazard
+    # Policy(dataset, units=) already refuses
+    arm, serial = _arm()
+    with pytest.raises(ValueError, match=f"declares units 'lerobot', but units={units!r} was passed"):
+        arm.run(Policy(recorded("deg", _units_json(DEG))), steps=1, units=units)
+    arm.close()
+    assert serial.frames == []

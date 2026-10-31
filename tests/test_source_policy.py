@@ -41,13 +41,14 @@ class FakeLeader:
         return a
 
 
+@pytest.mark.parametrize("units", ["auto", "lerobot"])  # "lerobot" names the scheme the leader declares: its modes
 @pytest.mark.parametrize("use_degrees", [False, True])
-def test_d2_arm_run_leader_is_one_line_and_converts_exactly(use_degrees):
+def test_d2_arm_run_leader_is_one_line_and_converts_exactly(use_degrees, units):
     clock = VirtualClock()
     drv = CountingDriver(clock)
     arm = Robot("so101", driver=drv, twin=False, clock=clock)
     leader = FakeLeader(use_degrees)
-    res = arm.run(leader, hz=30, steps=10)  # the whole teleop program
+    res = arm.run(leader, hz=30, steps=10, units=units)  # the whole teleop program
     assert res.steps == 10 and res.deadline_misses == 0
     norm = {k: ("range_0_100" if k == "gripper" else ("degrees" if use_degrees else "range_m100_100")) for k in KEYS}
     units = lerobot_units(D, norm)

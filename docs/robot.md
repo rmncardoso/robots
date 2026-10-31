@@ -54,7 +54,9 @@ missing camera or a wrong state length is refused by name. The policy's optional
 `gains`, `attach`, `detach`, `requirements`, `needs_observation`) are read once there too, and one of the
 wrong type is a `TypeError` naming it. Once `attach` has run, any refusal calls `detach` before it reaches you. `stop(timeout=)` raises `TimeoutError` while the run is still
 going, and the error of a run whose policy raised, once. `units="auto"` converts joints between the
-robot's radians and the units the policy declares (`policy.units`, for example `lerobot_so10x`).
+robot's radians and the units the policy declares (`policy.units`, for example `"lerobot"`, or `units_for`).
+`units="rad"` or a scheme name says what a policy that declares nothing speaks; against one that declares its
+units, a scheme that agrees keeps the policy's own norm modes and any other is refused, naming both.
 
 {{drawing:d08_policy_hooks}}
 
