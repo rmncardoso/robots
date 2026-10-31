@@ -51,8 +51,9 @@ def run(
 
     ``record=dir | "hf://owner/name"`` appends this run as one episode of a LeRobot v3 dataset;
     ``push=True`` (an ``hf://`` target only) then uploads it. Nothing leaves the machine otherwise.
-    A paced body (hardware, or ``realtime``) spaces its writes at least one period apart; a write past the next
-    tick's start is a deadline miss, counted and re-phased (``on_miss="skip"``) or the end (``"fault"``).
+    A paced body (hardware, or ``realtime``) spaces its writes one period apart, less how late the wait before the
+    previous write woke (a late wake costs no rate unless it makes a write miss); a write past the next tick's
+    start is a deadline miss, counted and re-phased (``on_miss="skip"``) or the end (``"fault"``).
     A policy that returns ``None`` holds that tick: nothing is written, the body keeps its last target, the tick
     counts (``RunResult.holds``) and is never a miss — how a sequential remote policy waits for its chunk.
     """
@@ -141,8 +142,9 @@ def _loop(
         clock = robot.clock if robot.sim is None else MONOTONIC
         sleep = robot.estop_latch.wait if clock is MONOTONIC else clock.sleep  # an e-stop never waits out a period
         pacer = Pacer(dt, on_miss=on_miss, now=clock.now, sleep=sleep)
-    held = install_gains({robot: bound})  # after the rate, the step count and the pacer, the loop's last checks
     t0, wall0 = robot.clock.now(), _time.monotonic()
+    ep.open(lambda: robot.observe(images=True))  # before tick 1: a dataset's setup is no tick's lateness
+    held = install_gains({robot: bound})  # after the rate, the step count, the pacer and the dataset: the last checks
     gated = is_agent()  # an agent's run passes the gate on every step
     while True:
         if held or stopped(robot, stops0):
@@ -179,7 +181,7 @@ def _loop(
         if pacer is not None and not pacer.after_write():
             why, fault = "deadline", f"tick {n} ended {pacer.worst_late * 1e3:.1f} ms past its deadline"
             break
-    if pacer is not None and n:  # the last write owns its period: the body's next write (any run) is >= dt later
+    if pacer is not None and n:  # the last write owns its period: the body's next write (any run) waits it out
         pacer.before_write()
     if why == "fault":  # the policy can no longer act safely: put the body in its declared on_disconnect state
         apply_on_disconnect(robot)
