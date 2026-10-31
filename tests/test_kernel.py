@@ -7,6 +7,7 @@ logged with its time, and nothing waits for real.
 from __future__ import annotations
 
 import contextlib
+import dataclasses as dc
 import importlib
 import threading
 import time
@@ -18,6 +19,7 @@ from test_drivers import FakeSerial, make_driver, writes
 from strands_robots import JointState, Robot, Simulation
 from strands_robots.description import Description
 from strands_robots.robot.clock import MONOTONIC
+from strands_robots.robot.device.build import manifest_key
 from strands_robots.robot.drivers import feetech as ft
 from strands_robots.robot.run import lockstep
 from strands_robots.robot.run.pace import Pacer
@@ -639,6 +641,61 @@ def test_a_faulted_hardware_run_still_puts_the_body_in_its_on_disconnect_state()
 
     res = robot.run(nan_at_3, steps=10, hz=50)
     assert res.stopped_by == "fault" and len(drv.writes) == 2 and drv.holds == 1  # so101: every control holds
+
+
+def _stall_then_nan(clock, seen, then=None):
+    """Tick 2's inference stalls 300 ms (a miss: tick 3 starts at once); tick 3's policy returns NaN, at a time
+    appended to ``seen``, and ``then`` runs in the first wait after it."""
+    k = [0]
+
+    def pol(obs):
+        k[0] += 1
+        clock.advance(0.3 if k[0] == 2 else 0.002)
+        if k[0] < 3:
+            return {"shoulder_pan": 0.8}
+        seen.append(clock.now())
+        if then is not None:
+            clock.during_wait = then
+        return {"shoulder_pan": float("nan")}
+
+    return pol
+
+
+def test_a_faulted_paced_run_holds_the_body_when_the_fault_is_seen_not_a_period_later():
+    robot, drv = _hw()
+    held, seen = [], []
+    drv.hold = lambda: held.append(drv.clock.now())  # type: ignore[method-assign]  # so101: every control holds
+    res = robot.run(_stall_then_nan(drv.clock, seen), steps=10, hz=50)
+    assert (res.stopped_by, res.deadline_misses) == ("fault", 1)
+    assert held == seen  # not when the period of tick 2's late write runs out
+
+
+def test_an_estop_right_after_a_fault_leaves_the_run_its_fault_and_finds_the_on_disconnect_target_sent():
+    robot, drv, clock = _operated()
+    m = robot.manifest  # shoulder_pan's on_disconnect is 'zero': a write, and nothing is written while latched
+    zero = tuple(dc.replace(c, on_disconnect="zero") if c.name == "shoulder_pan.pos" else c for c in m.controls)
+    robot.__dict__["_manifest"] = (manifest_key(robot), dc.replace(m, controls=zero))
+    seen: list[float] = []
+    res = robot.run(_stall_then_nan(clock, seen, then=robot.estop), steps=10, hz=50)  # pressed just after the fault
+    assert (res.stopped_by, robot.estopped) == ("fault", True)
+    assert drv.writes[-1][0] == seen[0] and drv.writes[-1][1][0] == 0.0  # the zero went out before the press
+
+
+def test_a_faulted_paced_run_whose_on_disconnect_raises_still_waits_out_its_last_write_period():
+    robot, drv = _hw()
+    seen: list[float] = []
+
+    def bus_down() -> None:
+        raise ConnectionError("the bus did not answer")
+
+    drv.hold = bus_down  # type: ignore[method-assign]  # so101: every control holds, so on_disconnect is a hold
+    with pytest.raises(ConnectionError):
+        robot.run(_stall_then_nan(drv.clock, seen), steps=10, hz=50)
+    last = drv.writes[-1][0]  # tick 2's write, 300 ms late: the floor of its period is 18 ms after tick 3's NaN
+    assert drv.clock.now() - seen[0] == pytest.approx(0.018)  # it raised once that period ran out, not at the NaN
+    drv.hold = lambda: None  # type: ignore[method-assign]  # the bus answers again
+    robot.run(lambda obs: {"shoulder_pan": 0.1}, steps=1, hz=50)
+    assert drv.writes[-1][0] - last == pytest.approx(0.02)  # the next run's first write: a period after it, not 2 ms
 
 
 def _pair():
