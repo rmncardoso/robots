@@ -96,9 +96,10 @@ def resolve_units(policy: Any, requested: str | None, description: Description) 
     said, own = _own(policy, description)
     if not said:
         return want
-    if (own.name if own else RAD) != (want.name if want else RAD):
+    said_as = RAD if own is None else own.name
+    if said_as != (RAD if want is None else want.name):
         raise ValueError(
-            f"{policy!r} declares units {own.name if own else RAD!r}, but units={requested!r} was passed; drop "
+            f"{policy!r} declares units {said_as!r}, but units={requested!r} was passed; drop "
             "units= (the policy says what it speaks)"
         )
     return own

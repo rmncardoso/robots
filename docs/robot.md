@@ -69,8 +69,7 @@ joint's LeRobot norm mode as recorded (a dataset without that file needs `units=
 refuses a `units=` or `norm=` that disagrees; a real body refuses LeRobot units whose modes neither the file nor
 `norm=` names, where the registry's would be a guess; a `norm=` names each joint the registry gives a mode of its
 own, an SO arm's gripper in `range_0_100`, unless its `"*"` is that mode: `norm={"*": "degrees"}` alone is refused).
-`episode` is the query's
-only key: `?ep=1` or `?episode` is refused by name, never episode 0 by default. A path that exists is never sent
-to the Hub: a directory with neither `config.json` nor `meta/info.json` is a `ValueError`.
+`episode` is the query's only key: `?ep=1` or `?episode` is refused by name, never episode 0 by default. A path that
+exists is never sent to the Hub: a directory with neither `config.json` nor `meta/info.json` is a `ValueError`.
 
 {{drawing:d09_record_replay}}
